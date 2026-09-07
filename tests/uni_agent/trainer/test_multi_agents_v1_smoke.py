@@ -380,8 +380,8 @@ def _v1_policy_config(policy_name: str) -> ConfigNode:
         ),
         trainer=ConfigNode(
             v1=ConfigNode(
-                trainer_mode="uniagent_smoke",
-                uniagent_smoke=ConfigNode(parameter_sync_step=1),
+                trainer_mode="sync",
+                sync=ConfigNode(parameter_sync_step=1),
             )
         ),
         actor_rollout_ref=ConfigNode(
@@ -391,11 +391,10 @@ def _v1_policy_config(policy_name: str) -> ConfigNode:
     )
 
 
-def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes(monkeypatch):
+def test_multi_agents_trainer_initializes_v1_policy_runtimes(monkeypatch):
     trainer_base = _load_v1_trainer_base(monkeypatch)
     RecordingAgentLoopManager.create_calls.clear()
 
-    @trainer_base.register_trainer("uniagent_smoke")
     class SmokeV1PPOTrainer(trainer_base.PPOTrainer):
         instances = []
 
@@ -432,6 +431,9 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes(monkeypa
             )
             self.val_dataloader = SmokeDataloader([])
 
+        def init_runtime(self):
+            self._setup()
+
         def on_init_end(self):
             self.on_init_end_calls += 1
 
@@ -445,12 +447,37 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes(monkeypa
             self.fit_calls += 1
             raise AssertionError("MultiAgentsPPOTrainer must not call per-policy PPOTrainer.fit()")
 
+    single_trainer_module = _module(
+        "uni_agent.trainer.single_ppo_trainer",
+        SinglePPOTrainer=SmokeV1PPOTrainer,
+    )
+    monkeypatch.setitem(sys.modules, "uni_agent.trainer.single_ppo_trainer", single_trainer_module)
+
     from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+    class TestableMultiAgentsPPOTrainer(MultiAgentsPPOTrainer):
+        def _compose_policy_ppo_config(self, *, policy_name, config_name, policy_entry):
+            from omegaconf import OmegaConf
+
+            return OmegaConf.create(_v1_policy_config(policy_name))
+
+        def _build_dataloader(self):
+            source = self.policy_trainers["policy_1"]
+            self.train_dataset = source.train_dataset
+            self.val_dataset = source.val_dataset
+            self.train_dataloader = source.train_dataloader
+            self.val_dataloader = source.val_dataloader
+
+        def _build_replay_buffer(self):
+            self.replay_buffer = SmokeReplayBuffer("outer")
+
+        def _load_checkpoint(self):
+            self.global_steps = 0
 
     config = ConfigNode(
         policies=ConfigNode(
-            first=ConfigNode(name="policy_1", ppo_trainer_config=_v1_policy_config("policy_1")),
-            second=ConfigNode(name="policy_2", ppo_trainer_config=_v1_policy_config("policy_2")),
+            policy_1=ConfigNode(ppo_trainer_config_name="ppo_trainer"),
+            policy_2=ConfigNode(ppo_trainer_config_name="ppo_trainer"),
         ),
         actor_rollout_ref=ConfigNode(
             rollout=ConfigNode(
@@ -469,25 +496,24 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes(monkeypa
         trainer=ConfigNode(
             total_training_steps=0,
             v1=ConfigNode(
-                trainer_mode="uniagent_smoke",
-                uniagent_smoke=ConfigNode(parameter_sync_step=1),
+                trainer_mode="sync",
+                sync=ConfigNode(parameter_sync_step=1),
             ),
         ),
         data=ConfigNode(train_batch_size=1),
     )
 
-    trainer = MultiAgentsPPOTrainer(config=config)
+    trainer = TestableMultiAgentsPPOTrainer(config=config)
 
     assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
     assert all(isinstance(policy_trainer, trainer_base.PPOTrainer) for policy_trainer in trainer.policy_trainers.values())
 
-    trainer._init_policy_runtimes()
+    trainer.init()
     assert [(item.policy_name, item.setup_calls, item.on_init_end_calls) for item in SmokeV1PPOTrainer.instances] == [
         ("policy_1", 1, 1),
         ("policy_2", 1, 1),
     ]
     assert [item.fit_calls for item in SmokeV1PPOTrainer.instances] == [0, 0]
-    assert trainer.outer_data_source_policy_name == "policy_1"
     assert trainer.train_dataloader is trainer.policy_trainers["policy_1"].train_dataloader
 
     agent_loop_manager = RecordingAgentLoopManager.create(
@@ -498,7 +524,7 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes(monkeypa
     )
     assert agent_loop_manager.kind == "agent_loop_manager"
     create_kwargs = RecordingAgentLoopManager.create_calls[0]
-    assert create_kwargs["reward_loop_worker_handles"] == ["reward:policy_1"]
+    assert create_kwargs["reward_loop_worker_handles"] == ["reward:policy_1", "reward:policy_2"]
     assert create_kwargs["gateway_actor_kwargs"] == {
         "tokenizer": "tokenizer:policy_1",
         "processor": "processor:policy_1",
@@ -530,7 +556,7 @@ def _ensure_flashinfer_workspace_writable():
     os.environ["FLASHINFER_WORKSPACE_BASE"] = tempfile.mkdtemp(prefix="flashinfer_ws_")
 
 
-def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_verl():
+def test_multi_agents_trainer_initializes_v1_policy_runtimes_real_verl(monkeypatch):
     """End-to-end smoke against the REAL verl v1 PPOTrainer.
 
     Unlike the stub-based variant above, this test imports the actual verl
@@ -541,11 +567,10 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
     _ensure_flashinfer_workspace_writable()
 
     try:
-        from verl.trainer.ppo.v1 import get_trainer_cls, register_trainer, trainer_base  # noqa: F401
+        from verl.trainer.ppo.v1 import trainer_base
     except Exception as exc:  # pragma: no cover - environment-dependent
         pytest.skip(f"real verl is not importable in this environment: {exc}")
 
-    @register_trainer("uniagent_smoke_real")
     class SmokeV1PPOTrainer(trainer_base.PPOTrainer):
         instances = []
 
@@ -582,6 +607,9 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
             )
             self.val_dataloader = SmokeDataloader([])
 
+        def init_runtime(self):
+            self._setup()
+
         def on_init_end(self):
             self.on_init_end_calls += 1
 
@@ -605,7 +633,7 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
     with initialize_config_dir(config_dir=verl_config_dir, version_base=None):
         base_cfg = compose(
             config_name="ppo_trainer",
-            overrides=["trainer.v1.trainer_mode=uniagent_smoke_real"],
+            overrides=["trainer.v1.trainer_mode=sync"],
         )
     base_policy = OmegaConf.create(OmegaConf.to_container(base_cfg, resolve=True))
 
@@ -616,11 +644,32 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
 
     from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
+    import uni_agent.trainer.single_ppo_trainer as single_ppo_module
+
+    monkeypatch.setattr(single_ppo_module, "SinglePPOTrainer", SmokeV1PPOTrainer)
+
+    class TestableMultiAgentsPPOTrainer(MultiAgentsPPOTrainer):
+        def _compose_policy_ppo_config(self, *, policy_name, config_name, policy_entry):
+            return _policy_config(policy_name)
+
+        def _build_dataloader(self):
+            source = self.policy_trainers["policy_1"]
+            self.train_dataset = source.train_dataset
+            self.val_dataset = source.val_dataset
+            self.train_dataloader = source.train_dataloader
+            self.val_dataloader = source.val_dataloader
+
+        def _build_replay_buffer(self):
+            self.replay_buffer = SmokeReplayBuffer("outer")
+
+        def _load_checkpoint(self):
+            self.global_steps = 0
+
     config = OmegaConf.create(
         {
             "policies": {
-                "first": {"name": "policy_1", "ppo_trainer_config": _policy_config("policy_1")},
-                "second": {"name": "policy_2", "ppo_trainer_config": _policy_config("policy_2")},
+                "policy_1": {"ppo_trainer_config_name": "ppo_trainer"},
+                "policy_2": {"ppo_trainer_config_name": "ppo_trainer"},
             },
             "actor_rollout_ref": {
                 "rollout": {
@@ -638,16 +687,18 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
             },
             "trainer": {
                 "total_training_steps": 0,
+                "save_freq": -1,
+                "resume_mode": "disable",
                 "v1": {
-                    "trainer_mode": "uniagent_smoke_real",
-                    "uniagent_smoke_real": {"parameter_sync_step": 1},
+                    "trainer_mode": "sync",
+                    "sync": {"parameter_sync_step": 1},
                 },
             },
             "data": {"train_batch_size": 1},
         }
     )
 
-    trainer = MultiAgentsPPOTrainer(config=config)
+    trainer = TestableMultiAgentsPPOTrainer(config=config)
 
     assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
     assert all(
@@ -655,7 +706,7 @@ def test_multi_agents_trainer_initializes_registered_v1_policy_runtimes_real_ver
         for policy_trainer in trainer.policy_trainers.values()
     )
 
-    trainer._init_policy_runtimes()
+    trainer.init()
     assert [
         (item.policy_name, item.setup_calls, item.on_init_end_calls)
         for item in SmokeV1PPOTrainer.instances

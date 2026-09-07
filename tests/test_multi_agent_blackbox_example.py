@@ -141,6 +141,45 @@ def test_multi_agent_blackbox_yaml_exposes_framework_and_policy_mapping():
     assert cfg["policies"]["policy_2"]["ppo_trainer_config_name"] == "ppo_trainer"
 
 
+def test_external_multi_agent_recipe_exposes_command_runner_contract():
+    cfg = yaml.safe_load(
+        (EXAMPLE_DIR / "config" / "multi_agent_blackbox_external.yaml").read_text(encoding="utf-8")
+    )
+    runner_cfg = cfg["actor_rollout_ref"]["rollout"]["custom"]["agent_framework"]
+    kwargs = runner_cfg["multi_agent_runner_kwargs"]
+
+    assert runner_cfg["multi_agent_runner_fqn"].endswith(
+        "external_mas_runner.external_mas_runner"
+    )
+    assert kwargs["execution"]["backend"] == "local_process"
+    assert kwargs["execution"]["ray"]["num_cpus"] == 1
+    assert kwargs["execution"]["ray"]["scheduling_strategy"] == "SPREAD"
+    assert kwargs["command"]["argv"][2] == (
+        "examples.multi_agent_blackbox.scripts.three_agent_external_mas"
+    )
+    assert kwargs["config"]["injection"]["agent_model_path"] == "model"
+
+
+def test_external_mas_training_script_selects_external_recipe_without_callable_config():
+    script_path = EXAMPLE_DIR / "scripts" / "run_external_mas_train.sh"
+    content = script_path.read_text(encoding="utf-8")
+
+    assert "--config-name=multi_agent_blackbox_external" in content
+    assert "python -m examples.multi_agent_blackbox.scripts.three_agent_external_mas" not in content
+    assert "multi_agent_runner_kwargs.mas_config_path" not in content
+    assert "MAS_CONFIG_PATH" not in content
+    assert "POLICY_1_MODEL_PATH" in content
+    assert "POLICY_2_MODEL_PATH" in content
+    assert "data.train_files" in content
+    assert "data.val_files" in content
+    assert "for var in POLICY_1_MODEL_PATH POLICY_2_MODEL_PATH; do" in content
+    assert "--config-name=multi_agent_blackbox_external" in content
+    assert "--config-path=\"${REPO_ROOT}/examples/multi_agent_blackbox/config\"" in content
+    assert 'data.train_files="[\'${TRAIN_DATA}\']"' in content
+    assert 'data.val_files="[\'${VAL_DATA}\']"' in content
+    assert "actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.config.template_path=${MAS_TEMPLATE_PATH}" in content
+
+
 def test_multi_agent_blackbox_yaml_uses_public_ppo_trainer_base_per_policy():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 

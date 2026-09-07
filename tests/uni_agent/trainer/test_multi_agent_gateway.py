@@ -1109,6 +1109,74 @@ class TestMultiAgentFrameworkTQ:
         assert recorded_tq.batch_puts[1]["keys"] == ["prompt-uid_1_0", "prompt-uid_1_1"]
         assert recorded_tq.batch_puts[2]["keys"] == ["prompt-uid_2_0", "prompt-uid_2_1"]
 
+    def test_multi_agent_rollout_annotation_starts_before_sibling_rollout_finishes(self):
+        asyncio.run(self._run_multi_agent_rollout_annotation_starts_before_sibling_rollout_finishes())
+
+    async def _run_multi_agent_rollout_annotation_starts_before_sibling_rollout_finishes(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.framework import framework as framework_module
+        from uni_agent.trainer.framework.framework import MultiAgentFramework
+        from uni_agent.trainer.framework.types import Trajectory
+
+        first_annotation_started = asyncio.Event()
+        second_rollout_timed_out_waiting_for_annotation = False
+        written_sample_indices = []
+
+        class TimingFramework(MultiAgentFramework):
+            async def run_rollout(self, *, rollout_id=None, **kwargs):
+                nonlocal second_rollout_timed_out_waiting_for_annotation
+                sample_idx = int(rollout_id.split("-")[4])
+                if sample_idx == 1:
+                    try:
+                        await asyncio.wait_for(first_annotation_started.wait(), timeout=0.1)
+                    except asyncio.TimeoutError:
+                        second_rollout_timed_out_waiting_for_annotation = True
+                return SimpleNamespace(
+                    rollout_id=rollout_id,
+                    trajectories=[
+                        Trajectory(
+                            prompt_ids=[1],
+                            response_ids=[2],
+                            response_mask=[1],
+                            extra_fields={"role": "agent_1", "policy_name": "policy_1"},
+                        )
+                    ],
+                    reward_info={"reward_score": 1.0},
+                )
+
+            async def _annotate_rollout_trajectories(self, **kwargs):
+                first_annotation_started.set()
+                return kwargs["rollout_result"].trajectories
+
+            async def _write_multi_agent_rollout_to_tq(self, *, sample_idx, **kwargs):
+                written_sample_indices.append(sample_idx)
+
+        original_tq = framework_module.tq
+        framework_module.tq = RecordingTQ()
+        try:
+            framework = TimingFramework(
+                session_runtime=object(),
+                multi_agent_runner=lambda **_: None,
+                role_policy_mapping={"agent_1": "policy_1"},
+                rollout_config={"n": 2, "val_kwargs": {"n": 1}},
+                max_concurrent_rollouts=2,
+            )
+
+            result = await framework._run_prompt_rollouts_to_tq(
+                raw_prompt=[{"role": "user", "content": "solve"}],
+                sample_fields={"uid": "prompt-uid"},
+                sample_index=0,
+                global_steps=1,
+                partition_id="train",
+                num_rollouts=2,
+            )
+        finally:
+            framework_module.tq = original_tq
+
+        assert second_rollout_timed_out_waiting_for_annotation is False
+        assert written_sample_indices == [0, 1]
+        assert result["num_success_rollouts"] == 2
+
 
 class TestMultiAgentGateway:
     def test_single_agent_chat_turn_keeps_existing_private_interface(self):

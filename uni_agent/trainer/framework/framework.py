@@ -937,6 +937,8 @@ class MultiAgentFramework(AgentFramework):
                 raw_prompt=raw_prompt,
                 rollout_id=f"multi-agent-rollout-{sample_index}-{sample_idx}-{uuid4().hex}",
                 sample_index=sample_index,
+                sample_fields=sample_fields,
+                sample_idx=sample_idx,
                 runner_kwargs={
                     key: sample_fields[key]
                     for key in ("tools_kwargs", "agent_name")
@@ -956,21 +958,17 @@ class MultiAgentFramework(AgentFramework):
                 failed_rollouts += 1
                 failure_reasons.append(_short_failure_reason(outcome))
                 continue
-            if not outcome.trajectories:
+            rollout_result, trajectories = outcome
+            if not trajectories:
                 failed_rollouts += 1
                 failure_reasons.append(f"empty trajectories for uid={uid} sample_idx={sample_idx}")
                 continue
 
             success_rollouts += 1
-            trajectories = await self._annotate_rollout_trajectories(
-                rollout_result=outcome,
-                sample_fields=sample_fields,
-                sample_idx=sample_idx,
-            )
             await self._write_multi_agent_rollout_to_tq(
                 uid=uid,
                 sample_idx=sample_idx,
-                rollout_id=outcome.rollout_id,
+                rollout_id=rollout_result.rollout_id,
                 trajectories=trajectories,
                 sample_fields=sample_fields,
                 global_steps=global_steps,
@@ -999,26 +997,34 @@ class MultiAgentFramework(AgentFramework):
         raw_prompt,
         rollout_id: str,
         sample_index: int,
+        sample_fields: dict[str, object],
+        sample_idx: int,
         runner_kwargs: dict[str, object] | None = None,
-    ):
-        if self._max_concurrent_rollouts <= 0:
-            return await self.run_rollout(
+    ) -> tuple[object, list[Trajectory]]:
+        async def run_and_annotate() -> tuple[object, list[Trajectory]]:
+            rollout_result = await self.run_rollout(
                 raw_prompt=raw_prompt,
                 rollout_id=rollout_id,
                 sample_index=sample_index,
                 runner_kwargs=runner_kwargs,
             )
+            if not rollout_result.trajectories:
+                return rollout_result, []
+            trajectories = await self._annotate_rollout_trajectories(
+                rollout_result=rollout_result,
+                sample_fields=sample_fields,
+                sample_idx=sample_idx,
+            )
+            return rollout_result, trajectories
+
+        if self._max_concurrent_rollouts <= 0:
+            return await run_and_annotate()
         loop = asyncio.get_running_loop()
         if self._semaphore is None or self._semaphore_loop is not loop:
             self._semaphore = asyncio.Semaphore(self._max_concurrent_rollouts)
             self._semaphore_loop = loop
         async with self._semaphore:
-            return await self.run_rollout(
-                raw_prompt=raw_prompt,
-                rollout_id=rollout_id,
-                sample_index=sample_index,
-                runner_kwargs=runner_kwargs,
-            )
+            return await run_and_annotate()
 
     async def run_rollout(
         self,

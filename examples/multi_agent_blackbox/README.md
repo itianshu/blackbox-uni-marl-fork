@@ -6,8 +6,9 @@ training.
 - `framework.py` provides the example-specific `RemoteMultiAgentFramework`.
 - `remote_runner.py` executes each MAS rollout runner as an independent Ray
   remote task.
-- `multi_agent_runner.py` is the external MAS entry point loaded inside that
-  remote task.
+- `multi_agent_runner.py` is the in-process Python MAS entry point.
+- `scripts/three_agent_external_mas.py` is the command-driven standalone MAS
+  entry point used by the external recipe.
 - `config/mas_config.yaml` defines abstract MAS roles such as `agent_1`,
   `agent_2`, and `agent_3`.
 - `config/multi_agent_blackbox.yaml` maps roles to trainable policies. Each
@@ -17,6 +18,85 @@ training.
 The runner uses one rollout-level Gateway URL. Each OpenAI-compatible
 `/chat/completions` request sets `model` to the MAS role name, and the Gateway
 routes that role to the policy configured in `role_policy_mapping`.
+
+## Command-Driven External MAS
+
+`config/multi_agent_blackbox_external.yaml` is an opt-in recipe for an MAS
+that is launched as a command instead of imported as a Python callable. Each
+rollout remains one Ray remote task. On the node selected by Ray, that task:
+
+1. copies the configured MAS YAML template;
+2. injects the rollout-scoped Gateway URL into the global and per-agent LLM
+   settings;
+3. sets each agent model to its role name;
+4. starts the configured MAS child process;
+5. waits for its result and removes the temporary config.
+
+The bundled recipe is directly runnable and starts the migrated three-agent
+example:
+
+```yaml
+command:
+  argv:
+    - python
+    - -m
+    - examples.multi_agent_blackbox.scripts.three_agent_external_mas
+    - --config
+    - "{config_path}"
+    - --prompt
+    - "{prompt}"
+```
+
+The same interface can launch any external MAS by replacing the module with a
+user-provided command. The command receives a rollout-local YAML file and the
+current task as separate arguments.
+
+`argv` is preferred to `shell: true`: placeholders containing spaces or shell
+characters remain individual arguments. The external MAS must print a JSON
+object on its last stdout line when `result.mode: stdout_json`; the object can
+contain `final_result` and `reward_info`.
+
+All agents normally receive the same dynamic `rollout.base_url`. They select
+different trainable policies by sending their role as the request model:
+
+```yaml
+llm:
+  base_url: <injected rollout Gateway URL>
+agents:
+  planner:
+    model: planner
+  reviewer:
+    model: reviewer
+```
+
+Do not expose the underlying vLLM server addresses to the MAS. The Gateway
+maps `model=<role>` through `role_policy_mapping` and records the corresponding
+trajectory. Request temperature is intentionally ignored by the Gateway so
+generation uses each policy's rollout temperature; `top_p`, `top_k`, and
+`max_tokens` may still be supplied by the MAS.
+
+The external recipe requests one Ray CPU and uses `SPREAD`, so concurrent MAS
+tasks tend to distribute across worker nodes. To exclude the head node or cap
+per-node concurrency, advertise a custom Ray resource such as
+`mas_runner_slot` only on eligible workers and configure:
+
+```yaml
+execution:
+  ray:
+    resources:
+      mas_runner_slot: 1
+```
+
+The bundled three-agent MAS preserves the callable example's sequential
+topology (`agent_1 -> agent_2 -> agent_3`), per-agent prompts and token limits;
+each later agent receives the outputs produced by earlier agents. The script
+prints one JSON object containing `final_result`, `agent_outputs`, and
+`reward_info`.
+
+The first implementation supports `execution.backend: local_process`.
+`sandbox` is a reserved backend boundary for Docker or OpenYuanRong execution;
+selecting it currently raises `NotImplementedError` rather than silently
+running in the wrong environment.
 
 The example uses verl's standard `reward.custom_reward_function` path. The
 runner returns rollout-level `final_result` and `agent_outputs`; before
@@ -131,15 +211,24 @@ sizes, rollout memory settings, and checkpoint directories in the overrides.
 
 ## Launch
 
-The example is wired to the multi-agent PPO entrypoint. The user-facing
-launcher is `run_example.sh` (all settings can be overridden via same-name
-environment variables; defaults are defined inside the script):
+The command-driven external MAS example has a dedicated launcher:
 
 ```bash
-bash examples/multi_agent_blackbox/scripts/run_example.sh
+bash examples/multi_agent_blackbox/scripts/run_external_mas_train.sh
 ```
 
-It drives:
+It selects `multi_agent_blackbox_external`, which starts
+`three_agent_external_mas.py` inside one Ray task per rollout. All settings can
+be overridden via same-name environment variables; defaults are defined inside
+the script.
+
+The original in-process callable example can still use its existing launcher:
+
+```bash
+bash examples/multi_agent_blackbox/scripts/run_e2e_train.sh
+```
+
+Both launchers drive:
 
 ```bash
 python -m uni_agent.trainer.main_multi_agents_ppo
@@ -166,10 +255,10 @@ export POLICY_1_TENSOR_PARALLEL_SIZE=2
 export POLICY_2_TENSOR_PARALLEL_SIZE=4
 ```
 
-`run_train.sh` in `scripts/` is an equivalent internal launcher; use
-`run_example.sh` as the recommended starting point. Adapt the per-policy PPO
-config blocks and the sequential runner loop for your production MAS before
-launching a real training run.
+For external command-driven training, use `run_external_mas_train.sh` as the
+recommended starting point. For the original in-process callable runner, use
+`run_e2e_train.sh`. Adapt the per-policy PPO config blocks and the MAS command
+configuration for your production system before launching a real training run.
 
 ## Config Field Modification Guide
 

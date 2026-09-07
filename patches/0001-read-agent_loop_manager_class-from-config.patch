@@ -1,0 +1,51 @@
+From f89b3dfc46acb317f6603581340bb076ab4ed13f Mon Sep 17 00:00:00 2001
+From: erpim <erpim@qq.com>
+Date: Sat, 6 Jun 2026 08:54:00 +0000
+Subject: [PATCH] feat: read agent_loop_manager_class from config in
+ fully-async rollouters
+
+Allows YAML-based registration of custom agent loop managers,
+matching the pattern used in main_ppo_sync.py:737-741.
+---
+ .../fully_async_policy/fully_async_rollouter.py            | 6 ++++++
+ .../fully_async_policy/fully_async_rollouter_tq.py         | 7 +++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter.py b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+index 3040ccf3..47918df4 100644
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter.py
+@@ -484,6 +484,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
+ 
+         self.agent_loop_manager_class = FullyAsyncAgentLoopManager
+ 
++        # Allow YAML to override the default manager class (same pattern as main_ppo_sync.py).
++        _manager_fqn = config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
++        if _manager_fqn:
++            from verl.utils.import_utils import load_class_from_fqn
++            self.agent_loop_manager_class = load_class_from_fqn(_manager_fqn)
++
+         # Config
+         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
+         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
+diff --git a/verl/experimental/fully_async_policy/fully_async_rollouter_tq.py b/verl/experimental/fully_async_policy/fully_async_rollouter_tq.py
+index d8485d31..6ac5d8c3 100644
+--- a/verl/experimental/fully_async_policy/fully_async_rollouter_tq.py
++++ b/verl/experimental/fully_async_policy/fully_async_rollouter_tq.py
+@@ -117,6 +117,13 @@ class FullyAsyncRollouterTQ(FullyAsyncRollouter):
+         # ==================== TQ-specific overrides ====================
+         self.replay_buffer = None  # Ray Actor handle, set via set_replay_buffer()
+         self.agent_loop_manager_class = FullyAsyncAgentLoopManagerTQ
++
++        # Allow YAML to override the default manager class (same pattern as main_ppo_sync.py).
++        _manager_fqn = config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
++        if _manager_fqn:
++            from verl.utils.import_utils import load_class_from_fqn
++            self.agent_loop_manager_class = load_class_from_fqn(_manager_fqn)
++
+         print("[TQFullyAsyncRollouter] initialized (TQ mode)")
+ 
+     async def set_replay_buffer(self, replay_buffer):
+-- 
+2.34.1
+

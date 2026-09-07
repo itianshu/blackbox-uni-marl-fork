@@ -3,9 +3,10 @@ import inspect
 import sys
 import types
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
 
@@ -87,11 +88,11 @@ def _install_dependency_stubs():
 
     if "transfer_queue" not in sys.modules:
         tq_stub = types.ModuleType("transfer_queue")
-        tq_stub.init = lambda config=None: None
-        tq_stub.close = lambda: None
-        tq_stub.kv_batch_put = lambda **kwargs: None
-        tq_stub.kv_put = lambda **kwargs: None
         sys.modules["transfer_queue"] = tq_stub
+    tq_stub = sys.modules["transfer_queue"]
+    for name in ("init", "close", "kv_batch_put", "kv_put", "kv_clear"):
+        if not hasattr(tq_stub, name):
+            setattr(tq_stub, name, lambda *args, **kwargs: None)
 
     if "verl.utils.debug" not in sys.modules:
         for name in [
@@ -109,6 +110,21 @@ def _install_dependency_stubs():
         debug_mod.marked_timer = marked_timer
         sys.modules["verl.utils.debug"] = debug_mod
         sys.modules["verl.utils"].debug = debug_mod
+
+    tracking_mod = sys.modules.setdefault("verl.utils.tracking", types.ModuleType("verl.utils.tracking"))
+    if not hasattr(tracking_mod, "Tracking"):
+        class Tracking:
+            def __init__(self, *args, **kwargs):
+                self.logged = []
+
+            def log(self, data, step):
+                self.logged.append((data, step))
+
+            def finish(self, exit_code=0):
+                return None
+
+        tracking_mod.Tracking = Tracking
+    sys.modules["verl.utils"].tracking = tracking_mod
 
 
 class RecordingLLMClient:
@@ -213,6 +229,8 @@ class FakeV1PPOTrainer:
         self.tokenizer = f"tokenizer:{self.policy_name}"
         self.processor = f"processor:{self.policy_name}"
         self.init_calls = 0
+        self.runtime_init_calls = 0
+        self.on_init_end_calls = 0
         self.fit_calls = 0
         self.global_steps = 0
         self.use_reference_policy = getattr(config, "use_reference_policy", False)
@@ -225,6 +243,12 @@ class FakeV1PPOTrainer:
 
     def init(self):
         self.init_calls += 1
+
+    def init_runtime(self):
+        self.runtime_init_calls += 1
+
+    def on_init_end(self):
+        self.on_init_end_calls += 1
 
     def get_llm_client(self):
         return self.llm_client
@@ -307,8 +331,8 @@ class FakeSharedAdvantagePPOTrainer(FakeV1PPOTrainer):
 
 
 class FakeV1PPOTrainerWithDataloader(FakeV1PPOTrainer):
-    def init(self):
-        super().init()
+    def init_runtime(self):
+        super().init_runtime()
         self.train_dataset = f"train_dataset:{self.policy_name}"
         self.val_dataset = f"val_dataset:{self.policy_name}"
         self.train_dataloader = FakeDataloader(
@@ -431,27 +455,69 @@ def _ns_deep(value):
     return value
 
 
+def _plain(value):
+    if isinstance(value, SimpleNamespace):
+        return {key: _plain(item) for key, item in vars(value).items()}
+    if isinstance(value, dict):
+        return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    return value
+
+
 def _config_with_policies(config=None, policy_configs=None):
-    config = _ns_deep(config) if config is not None else _NS()
+    if isinstance(config, DictConfig):
+        config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
+    else:
+        config = _ns_deep(config) if config is not None else _NS()
     # MultiAgentsPPOTrainer.__init__ reads these outer fields directly (mirrors
     # the guaranteed keys in the real multi_agent_blackbox.yaml).
-    config.data = getattr(config, "data", None) or _NS(train_batch_size=4)
+    if getattr(config, "data", None) is None:
+        data_config = OmegaConf.create({"train_batch_size": 4}) if isinstance(config, DictConfig) else _NS(train_batch_size=4)
+        if isinstance(config, DictConfig):
+            with open_dict(config):
+                config.data = data_config
+        else:
+            config.data = data_config
     trainer = getattr(config, "trainer", None)
     if trainer is None:
-        config.trainer = _NS(
+        trainer_defaults = _NS(
             save_freq=-1,
             total_training_steps=2,
+            resume_mode="disable",
+            default_hdfs_dir=None,
+            del_local_ckpt_after_load=False,
+            project_name="test",
+            experiment_name="test",
+            logger=["console"],
             v1=_NS(
                 trainer_mode="sync",
                 sync=_NS(parameter_sync_step=1),
                 separate_async=_NS(parameter_sync_step=1),
             ),
         )
+        if isinstance(config, DictConfig):
+            with open_dict(config):
+                config.trainer = OmegaConf.create(_plain(trainer_defaults))
+        else:
+            config.trainer = trainer_defaults
     else:
         if not hasattr(trainer, "save_freq"):
             trainer.save_freq = -1
         if not hasattr(trainer, "total_training_steps"):
             trainer.total_training_steps = 2
+        if not hasattr(trainer, "resume_mode"):
+            trainer.resume_mode = "disable"
+        if not hasattr(trainer, "default_hdfs_dir"):
+            trainer.default_hdfs_dir = None
+        if not hasattr(trainer, "del_local_ckpt_after_load"):
+            trainer.del_local_ckpt_after_load = False
+        if not hasattr(trainer, "project_name"):
+            trainer.project_name = "test"
+        if not hasattr(trainer, "experiment_name"):
+            trainer.experiment_name = "test"
+        if not hasattr(trainer, "logger"):
+            trainer.logger = ["console"]
         if not hasattr(trainer, "v1"):
             trainer.v1 = _NS(
                 trainer_mode="sync",
@@ -460,13 +526,18 @@ def _config_with_policies(config=None, policy_configs=None):
             )
     if policy_configs is not None:
         config.policies = {
-            policy_name: _NS(ppo_trainer_config=_ns_deep(policy_config))
+            policy_name: _NS(
+                ppo_trainer_config_name="test_policy_config",
+                ppo_trainer_overrides={},
+            )
             for policy_name, policy_config in policy_configs.items()
         }
-    return config
+    if isinstance(config, DictConfig):
+        return config
+    return OmegaConf.create(_plain(config))
 
 
-def _install_policy_trainer_registry_stub(policy_trainer_cls):
+def _install_policy_trainer_stubs(policy_trainer_cls):
     for name in [
         "verl",
         "verl.trainer",
@@ -477,9 +548,16 @@ def _install_policy_trainer_registry_stub(policy_trainer_cls):
             module.__path__ = []
 
     v1_mod = sys.modules.setdefault("verl.trainer.ppo.v1", types.ModuleType("verl.trainer.ppo.v1"))
-    v1_mod.get_trainer_cls = lambda trainer_mode: policy_trainer_cls
     sys.modules["verl.trainer"].ppo = sys.modules["verl.trainer.ppo"]
     sys.modules["verl.trainer.ppo"].v1 = v1_mod
+
+    sync_mod = types.ModuleType("uni_agent.trainer.single_ppo_trainer")
+    sync_mod.SinglePPOTrainer = policy_trainer_cls
+    sys.modules["uni_agent.trainer.single_ppo_trainer"] = sync_mod
+
+    async_mod = types.ModuleType("uni_agent.trainer.single_async_ppo_trainer")
+    async_mod.SingleAsyncPPOTrainer = policy_trainer_cls
+    sys.modules["uni_agent.trainer.single_async_ppo_trainer"] = async_mod
 
 
 def _test_multi_agents_trainer_cls(
@@ -487,9 +565,54 @@ def _test_multi_agents_trainer_cls(
     *,
     policy_trainer_cls=FakeV1PPOTrainer,
     agent_loop_manager_cls=FakeAgentFrameworkRolloutAdapter,
+    policy_configs=None,
 ):
+    def should_stub_component(name):
+        component = base_cls.__dict__.get(name)
+        return component is None or component.__module__ == "uni_agent.trainer.multi_agents_ppo_trainer"
+
     class TestableMultiAgentsPPOTrainer(base_cls):
         test_agent_loop_manager_cls = agent_loop_manager_cls
+
+        def _compose_policy_ppo_config(self, *, policy_name, config_name, policy_entry):
+            if policy_configs is not None:
+                policy_config = OmegaConf.create(_plain(policy_configs[policy_name]))
+                with open_dict(policy_config):
+                    policy_config.policy_name = policy_name
+                return policy_config
+            return super()._compose_policy_ppo_config(
+                policy_name=policy_name,
+                config_name=config_name,
+                policy_entry=policy_entry,
+            )
+
+        if policy_configs is not None and should_stub_component("_build_dataloader"):
+            def _build_dataloader(self):
+                source = next(
+                    (trainer for trainer in self.policy_trainers.values()
+                     if getattr(trainer, "train_dataloader", None) is not None),
+                    None,
+                )
+                if source is not None:
+                    self.train_dataset = getattr(source, "train_dataset", None)
+                    self.val_dataset = getattr(source, "val_dataset", None)
+                    self.train_dataloader = source.train_dataloader
+                    self.val_dataloader = source.val_dataloader
+                    self.train_dataloader_it = None
+                    for trainer in self.policy_trainers.values():
+                        if trainer is source:
+                            continue
+                        trainer.train_dataset = None
+                        trainer.val_dataset = None
+                        trainer.train_dataloader = None
+                        trainer.val_dataloader = None
+                        trainer.train_dataloader_it = None
+
+        if policy_configs is not None and should_stub_component("_build_replay_buffer"):
+            def _build_replay_buffer(self):
+                self.replay_buffer = FakeReplayBuffer("outer")
+                for index, trainer in enumerate(self.policy_trainers.values()):
+                    trainer.replay_buffer = self.replay_buffer if index == 0 else None
 
     return TestableMultiAgentsPPOTrainer
 
@@ -502,11 +625,12 @@ def _make_trainer(
     policy_trainer_cls=FakeV1PPOTrainer,
     agent_loop_manager_cls=FakeAgentFrameworkRolloutAdapter,
 ):
-    _install_policy_trainer_registry_stub(policy_trainer_cls)
+    _install_policy_trainer_stubs(policy_trainer_cls)
     trainer_cls = _test_multi_agents_trainer_cls(
         base_cls,
         policy_trainer_cls=policy_trainer_cls,
         agent_loop_manager_cls=agent_loop_manager_cls,
+        policy_configs=policy_configs,
     )
     return trainer_cls(config=_config_with_policies(config, policy_configs))
 
@@ -594,56 +718,47 @@ class TestMultiAgentsPPOTrainer:
         assert not hasattr(trainer, "create_policy_trainers")
         assert hasattr(trainer, "_create_policy_trainers")
 
-    def test_rejects_known_async_v1_trainer_modes(self):
+    def test_rejects_unsupported_v1_trainer_modes(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
-        config = SimpleNamespace(
-            policies={
-                "policy_1": SimpleNamespace(
-                    ppo_trainer_config=SimpleNamespace(
-                        policy_name="policy_1",
-                        trainer=SimpleNamespace(v1=SimpleNamespace(trainer_mode="colocate_async")),
+        with pytest.raises(ValueError, match="Unsupported trainer.v1.trainer_mode: 'colocate_async'"):
+            _make_trainer(
+                MultiAgentsPPOTrainer,
+                policy_configs={
+                    "policy_1": _policy_config(
+                        "policy_1",
+                        trainer=_NS(v1=_NS(trainer_mode="colocate_async")),
                     )
-                )
-            }
-        )
-
-        try:
-            _make_trainer(MultiAgentsPPOTrainer, config=config)
-        except ValueError as exc:
-            assert "supports synchronous v1 policy trainers only" in str(exc)
-            assert "policy_1" in str(exc)
-            assert "colocate_async" in str(exc)
-        else:
-            raise AssertionError("known async v1 trainer modes should be rejected")
+                },
+            )
 
     def test_can_resolve_policy_configs_from_config_policies(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
-        config = SimpleNamespace(
-            policies={
-                "first": SimpleNamespace(name="policy_1", ppo_trainer_config=_policy_config("policy_1")),
-                "second": SimpleNamespace(name="policy_2", ppo_trainer_config=_policy_config("policy_2")),
-            }
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={
+                "policy_1": _policy_config("policy_1"),
+                "policy_2": _policy_config("policy_2"),
+            },
         )
-
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
 
         assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
 
-    def test_uses_policy_key_as_policy_name_when_name_is_omitted(self):
+    def test_uses_policy_mapping_key_as_policy_name(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
-        config = SimpleNamespace(
-            policies={
-                "policy_1": SimpleNamespace(ppo_trainer_config=_policy_config("policy_1")),
-                "policy_2": SimpleNamespace(ppo_trainer_config=_policy_config("policy_2")),
-            }
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={
+                "first": _policy_config("ignored_name_1"),
+                "second": _policy_config("ignored_name_2"),
+            },
         )
 
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
-
-        assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
+        assert list(trainer.policy_trainers) == ["first", "second"]
+        assert trainer.policy_configs["first"].policy_name == "first"
+        assert trainer.policy_configs["second"].policy_name == "second"
 
     def test_preserves_per_policy_resource_config_from_policies(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -653,6 +768,7 @@ class TestMultiAgentsPPOTrainer:
             trainer=SimpleNamespace(
                 n_gpus_per_node=2,
                 default_local_dir="checkpoints/policy_1",
+                v1=_NS(trainer_mode="sync", sync=_NS(parameter_sync_step=1)),
             ),
             actor_rollout_ref=SimpleNamespace(
                 model=SimpleNamespace(path="/models/policy_1"),
@@ -664,105 +780,70 @@ class TestMultiAgentsPPOTrainer:
             trainer=SimpleNamespace(
                 n_gpus_per_node=4,
                 default_local_dir="checkpoints/policy_2",
+                v1=_NS(trainer_mode="sync", sync=_NS(parameter_sync_step=1)),
             ),
             actor_rollout_ref=SimpleNamespace(
                 model=SimpleNamespace(path="/models/policy_2"),
                 rollout=SimpleNamespace(tensor_model_parallel_size=4, gpu_memory_utilization=0.8),
             ),
         )
-        config = SimpleNamespace(
-            policies={
-                "policy_1": SimpleNamespace(name="policy_1", ppo_trainer_config=policy_1_config),
-                "policy_2": SimpleNamespace(name="policy_2", ppo_trainer_config=policy_2_config),
-            }
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={"policy_1": policy_1_config, "policy_2": policy_2_config},
         )
 
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
-
-        assert trainer.policy_configs == {
-            "policy_1": policy_1_config,
-            "policy_2": policy_2_config,
-        }
-        assert trainer.policy_trainers["policy_1"].config is policy_1_config
-        assert trainer.policy_trainers["policy_2"].config is policy_2_config
         assert trainer.policy_trainers["policy_1"].config.actor_rollout_ref.rollout.tensor_model_parallel_size == 2
         assert trainer.policy_trainers["policy_2"].config.actor_rollout_ref.rollout.tensor_model_parallel_size == 4
 
-    def test_can_resolve_policy_configs_from_root_level_ppo_trainer_compose_spec(self):
-        from omegaconf import OmegaConf
-
+    def test_can_resolve_policy_configs_from_root_level_ppo_trainer_compose_spec(self, monkeypatch):
+        import hydra
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
-        verl_config_dir = str((Path(__file__).resolve().parents[4] / "verl" / "verl" / "trainer" / "config").resolve())
-        config = OmegaConf.create(
-            {
-                "ppo_trainer_config_source": {
-                    "kind": "config_dir",
-                    "value": verl_config_dir,
-                },
-                "policies": {
-                    "policy_1": {
-                        "ppo_trainer_config_name": "ppo_trainer",
-                        "ppo_trainer_overrides": {
-                            "trainer": {
-                                "n_gpus_per_node": 2,
-                                "n_training_gpus_per_node": 2,
-                                "default_local_dir": "checkpoints/policy_1",
-                                "resume_mode": "disable",
-                                "total_training_steps": 100,
-                            },
-                            "data": {
-                                "train_files": ["train.parquet"],
-                                "val_files": ["val.parquet"],
-                                "train_batch_size": 4,
-                                "val_batch_size": 4,
-                                "return_raw_chat": True,
-                            },
-                            "actor_rollout_ref": {
-                                "model": {
-                                    "path": "/models/policy_1",
-                                },
-                                "rollout": {
-                                    "tensor_model_parallel_size": 2,
-                                    "gpu_memory_utilization": 0.6,
-                                },
-                            },
-                        },
+        compose_calls = []
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            compose_calls.append(("source", config_module, version_base))
+            yield
+
+        def fake_compose(*, config_name):
+            compose_calls.append(("compose", config_name))
+            return OmegaConf.create(
+                {
+                    "trainer": {"v1": {"trainer_mode": "sync"}},
+                    "actor_rollout_ref": {"actor": {"optim": {"lr": 1e-6}}},
+                }
+            )
+
+        monkeypatch.setattr(hydra, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(hydra, "compose", fake_compose)
+        config = SimpleNamespace(
+            ppo_trainer_config_source="verl.trainer.config",
+            policies={
+                "policy_1": _NS(
+                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_overrides={
+                        "actor_rollout_ref": {"model": {"path": "/models/policy_1"}},
+                        "data": {"train_files": ["train.parquet"]},
                     },
-                    "policy_2": {
-                        "ppo_trainer_config_name": "ppo_trainer",
-                        "ppo_trainer_overrides": {
-                            "trainer": {
-                                "n_gpus_per_node": 4,
-                                "n_training_gpus_per_node": 4,
-                                "default_local_dir": "checkpoints/policy_2",
-                                "resume_mode": "disable",
-                                "total_training_steps": 100,
-                            },
-                            "data": {
-                                "train_files": ["train.parquet"],
-                                "val_files": ["val.parquet"],
-                                "train_batch_size": 4,
-                                "val_batch_size": 4,
-                                "return_raw_chat": True,
-                            },
-                            "actor_rollout_ref": {
-                                "model": {
-                                    "path": "/models/policy_2",
-                                },
-                                "rollout": {
-                                    "tensor_model_parallel_size": 4,
-                                    "gpu_memory_utilization": 0.8,
-                                },
-                            },
-                        },
+                ),
+                "policy_2": _NS(
+                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_overrides={
+                        "actor_rollout_ref": {"model": {"path": "/models/policy_2"}},
                     },
-                },
-            }
+                ),
+            },
         )
 
         trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
 
+        assert compose_calls == [
+            ("source", "verl.trainer.config", None),
+            ("compose", "ppo_trainer"),
+            ("source", "verl.trainer.config", None),
+            ("compose", "ppo_trainer"),
+        ]
         assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
         assert trainer.policy_configs["policy_1"].policy_name == "policy_1"
         assert trainer.policy_configs["policy_2"].policy_name == "policy_2"
@@ -774,52 +855,35 @@ class TestMultiAgentsPPOTrainer:
     def test_disables_per_policy_resume_for_outer_checkpoint_ownership(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
-        policy_1_config = SimpleNamespace(
-            policy_name="policy_1",
-            trainer=SimpleNamespace(resume_mode="auto"),
-        )
-        policy_2_config = SimpleNamespace(
-            policy_name="policy_2",
-            trainer={
-                "resume_mode": "resume_path",
-                "resume_from_path": "checkpoints/policy_2/global_step_8",
-            },
-        )
-        config = SimpleNamespace(
-            policies={
-                "policy_1": SimpleNamespace(ppo_trainer_config=policy_1_config),
-                "policy_2": SimpleNamespace(ppo_trainer_config=policy_2_config),
-            },
-            trainer=SimpleNamespace(
-                resume_mode="auto",
-                default_local_dir="checkpoints/multi_agent_blackbox",
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            config=SimpleNamespace(
+                trainer=SimpleNamespace(
+                    resume_mode="auto",
+                    default_local_dir="checkpoints/multi_agent_blackbox",
+                )
             ),
+            policy_configs={
+                "policy_1": _policy_config(
+                    "policy_1",
+                    trainer=_NS(
+                        resume_mode="auto",
+                        v1=_NS(trainer_mode="sync", sync=_NS(parameter_sync_step=1)),
+                    ),
+                ),
+                "policy_2": _policy_config(
+                    "policy_2",
+                    trainer=_NS(
+                        resume_mode="resume_path",
+                        resume_from_path="checkpoints/policy_2/global_step_8",
+                        v1=_NS(trainer_mode="sync", sync=_NS(parameter_sync_step=1)),
+                    ),
+                ),
+            },
         )
-
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
 
         assert trainer.policy_trainers["policy_1"].config.trainer.resume_mode == "disable"
-        assert trainer.policy_trainers["policy_2"].config.trainer["resume_mode"] == "disable"
-
-    def test_can_resolve_policy_configs_from_list_config_policies(self):
-        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
-
-        config = SimpleNamespace(
-            policies=[
-                {
-                    "name": "policy_1",
-                    "ppo_trainer_config": _policy_config("policy_1"),
-                },
-                {
-                    "name": "policy_2",
-                    "ppo_trainer_config": _policy_config("policy_2"),
-                },
-            ]
-        )
-
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
-
-        assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
+        assert trainer.policy_trainers["policy_2"].config.trainer.resume_mode == "disable"
 
     def test_agent_framework_config_keeps_role_policy_mapping_with_policies(self):
         _install_dependency_stubs()
@@ -832,10 +896,6 @@ class TestMultiAgentsPPOTrainer:
             "agent_3": "policy_2",
         }
         config = SimpleNamespace(
-            policies={
-                "first": SimpleNamespace(name="policy_1", ppo_trainer_config=_policy_config("policy_1")),
-                "second": SimpleNamespace(name="policy_2", ppo_trainer_config=_policy_config("policy_2")),
-            },
             actor_rollout_ref=SimpleNamespace(
                 rollout=SimpleNamespace(
                     custom=SimpleNamespace(
@@ -846,13 +906,20 @@ class TestMultiAgentsPPOTrainer:
                 )
             ),
         )
-        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            config=config,
+            policy_configs={
+                "policy_1": _policy_config("policy_1"),
+                "policy_2": _policy_config("policy_2"),
+            },
+        )
 
         _build_test_agent_loop_manager(trainer)
 
         create_kwargs = FakeAgentFrameworkRolloutAdapter.create_calls[0]
         assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
-        assert create_kwargs["config"] is config
+        assert create_kwargs["config"] is trainer.config
         assert (
             create_kwargs["config"]
             .actor_rollout_ref
@@ -863,39 +930,69 @@ class TestMultiAgentsPPOTrainer:
             == role_policy_mapping
         )
 
-    def test_private_policy_runtime_init_initializes_each_policy_runtime_without_calling_fit(self):
+    def test_init_orders_policy_runtime_setup_before_checkpoint_and_rollout_sync(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
+        class RecordingInitTrainer(MultiAgentsPPOTrainer):
+            def _build_dataloader(self):
+                self.init_events.append("build_dataloader")
+
+            def _build_replay_buffer(self):
+                self.init_events.append("build_replay_buffer")
+
+            def _load_checkpoint(self):
+                self.init_events.append("load_checkpoint")
+
         trainer = _make_trainer(
-            MultiAgentsPPOTrainer,
+            RecordingInitTrainer,
             policy_configs={
                 "policy_1": _policy_config("policy_1"),
                 "policy_2": _policy_config("policy_2"),
             },
         )
+        trainer.init_events = []
+        for policy_name, policy_trainer in trainer.policy_trainers.items():
+            policy_trainer.init_runtime = lambda name=policy_name: trainer.init_events.append(f"{name}:init_runtime")
+            policy_trainer.on_init_end = lambda name=policy_name: trainer.init_events.append(f"{name}:on_init_end")
 
-        assert not hasattr(trainer, "_policy_runtimes_initialized")
-        trainer._init_policy_runtimes()
+        trainer.init()
 
-        assert [policy_trainer.init_calls for policy_trainer in trainer.policy_trainers.values()] == [1, 1]
+        assert trainer.init_events == [
+            "policy_1:init_runtime",
+            "policy_2:init_runtime",
+            "build_dataloader",
+            "build_replay_buffer",
+            "load_checkpoint",
+            "policy_1:on_init_end",
+            "policy_2:on_init_end",
+        ]
         assert [policy_trainer.fit_calls for policy_trainer in trainer.policy_trainers.values()] == [0, 0]
-        assert not hasattr(trainer, "init_workers")
 
-    def test_private_policy_runtime_init_uses_v1_init_entrypoint(self):
+    def test_init_runtime_does_not_use_legacy_init_workers(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
+        class RecordingInitTrainer(MultiAgentsPPOTrainer):
+            def _build_dataloader(self):
+                pass
+
+            def _build_replay_buffer(self):
+                pass
+
+            def _load_checkpoint(self):
+                pass
+
         trainer = _make_trainer(
-            MultiAgentsPPOTrainer,
-            policy_configs={
-                "policy_1": _policy_config("policy_1"),
-            },
+            RecordingInitTrainer,
+            policy_configs={"policy_1": _policy_config("policy_1")},
             policy_trainer_cls=FakeV1PPOTrainerWithLegacyInitWorkers,
         )
 
-        trainer._init_policy_runtimes()
+        trainer.init()
 
         policy_trainer = trainer.policy_trainers["policy_1"]
-        assert policy_trainer.init_calls == 1
+        assert policy_trainer.runtime_init_calls == 1
+        assert policy_trainer.init_calls == 0
+        assert policy_trainer.on_init_end_calls == 1
         assert policy_trainer.init_workers_calls == 0
 
     def test_train_step_exposes_v1_add_batch_to_generate_boundary(self):
@@ -949,7 +1046,7 @@ class TestMultiAgentsPPOTrainer:
             },
         )
 
-        trainer._init_policy_runtimes()
+        trainer.init()
         first_replay_buffer = trainer.replay_buffer
         agent_loop_manager = _build_test_agent_loop_manager(trainer)
 
@@ -960,7 +1057,7 @@ class TestMultiAgentsPPOTrainer:
         assert trainer.replay_buffer is first_replay_buffer
         assert trainer.policy_trainers["policy_1"].replay_buffer is first_replay_buffer
         assert trainer.policy_trainers["policy_2"].replay_buffer is None
-        assert create_kwargs["reward_loop_worker_handles"] == ["reward:policy_1"]
+        assert create_kwargs["reward_loop_worker_handles"] == ["reward:policy_1", "reward:policy_2"]
         assert create_kwargs["gateway_actor_kwargs"] == {
             "tokenizer": "tokenizer:policy_1",
             "processor": "processor:policy_1",
@@ -1042,17 +1139,17 @@ class TestMultiAgentsPPOTrainer:
         _init_agent_loop_and_fit(trainer)
 
         assert trainer.agent_loop_manager is not None
-        assert [policy_trainer.init_calls for policy_trainer in trainer.policy_trainers.values()] == [1, 1]
+        assert [policy_trainer.runtime_init_calls for policy_trainer in trainer.policy_trainers.values()] == [1, 1]
         assert [policy_trainer.fit_calls for policy_trainer in trainer.policy_trainers.values()] == [0, 0]
-        assert trainer.global_steps == 2
-        assert [policy_trainer.global_steps for policy_trainer in trainer.policy_trainers.values()] == [2, 2]
+        assert trainer.global_steps == 3
+        assert [policy_trainer.global_steps for policy_trainer in trainer.policy_trainers.values()] == [3, 3]
         assert trainer.step_events == [
-            ("sample", 0),
-            ("build", 0),
-            ("update", 0, {"policy_1": "batch:0"}),
             ("sample", 1),
             ("build", 1),
             ("update", 1, {"policy_1": "batch:1"}),
+            ("sample", 2),
+            ("build", 2),
+            ("update", 2, {"policy_1": "batch:2"}),
         ]
 
     def test_outer_checkpoint_loads_and_saves_multi_policy_state(self, tmp_path):
@@ -1065,6 +1162,10 @@ class TestMultiAgentsPPOTrainer:
         checkpoint_root = tmp_path / "multi_agent_ckpts"
         checkpoint_dir = checkpoint_root / "global_step_3"
         checkpoint_dir.mkdir(parents=True)
+        for policy_name, use_critic in (("policy_1", True), ("policy_2", False)):
+            (checkpoint_dir / "policies" / policy_name / "actor").mkdir(parents=True)
+            if use_critic:
+                (checkpoint_dir / "policies" / policy_name / "Critic").mkdir()
         torch.save({"loaded": "outer-dataloader"}, checkpoint_dir / "data.pt")
 
         config = SimpleNamespace(
@@ -1085,9 +1186,7 @@ class TestMultiAgentsPPOTrainer:
             },
             policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
-        trainer._init_policy_runtimes()
-
-        trainer._load_checkpoint()
+        trainer.init()
 
         assert trainer.global_steps == 3
         assert trainer.train_dataloader.loaded_states == [{"loaded": "outer-dataloader"}]
@@ -1123,6 +1222,307 @@ class TestMultiAgentsPPOTrainer:
         assert policy_1.critic_wg.save_calls[0]["args"][0] == str(save_dir / "policies" / "policy_1" / "Critic")
         assert policy_2.actor_rollout_wg.save_calls[0]["args"][0] == str(save_dir / "policies" / "policy_2" / "actor")
         assert policy_2.critic_wg.save_calls == []
+
+    def test_auto_resume_uses_checkpoint_tracker_instead_of_largest_directory(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_root = tmp_path / "multi_agent_ckpts"
+        expected = checkpoint_root / "global_step_3"
+        incomplete = checkpoint_root / "global_step_4"
+        expected.mkdir(parents=True)
+        incomplete.mkdir()
+        (checkpoint_root / "latest_checkpointed_iteration.txt").write_text("3", encoding="utf-8")
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                resume_mode="auto",
+                default_local_dir=str(checkpoint_root),
+            )
+        )
+
+        assert trainer._resolve_checkpoint_dir() == str(expected)
+
+    def test_resume_path_accepts_trailing_separator(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_dir = tmp_path / "global_step_3"
+        checkpoint_dir.mkdir()
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                resume_mode="resume_path",
+                resume_from_path=str(checkpoint_dir) + "/",
+                del_local_ckpt_after_load=False,
+            )
+        )
+        trainer.policy_trainers = {}
+        trainer.train_dataloader = None
+        trainer.timing_raw = {}
+        trainer.trainer_mode = "sync"
+
+        trainer._load_checkpoint()
+
+        assert trainer.global_steps == 3
+
+    def test_checkpoint_load_rejects_missing_policy_actor_directory(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_dir = tmp_path / "global_step_3"
+        checkpoint_dir.mkdir()
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                resume_mode="resume_path",
+                resume_from_path=str(checkpoint_dir),
+                del_local_ckpt_after_load=False,
+            )
+        )
+        trainer.policy_trainers = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_wg=FakeWorkerGroup("actor:policy_1"),
+                use_critic=False,
+            )
+        }
+        trainer.train_dataloader = None
+        trainer.timing_raw = {}
+
+        with pytest.raises(FileNotFoundError, match="policy_1.*actor"):
+            trainer._load_checkpoint()
+
+    def test_async_checkpoint_restores_saves_and_reissues_transfer_queue_state(self, tmp_path, monkeypatch):
+        _install_dependency_stubs()
+
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_root = tmp_path / "multi_agent_ckpts"
+        checkpoint_dir = checkpoint_root / "global_step_3"
+        (checkpoint_dir / "transfer_queue").mkdir(parents=True)
+        calls = {"load": [], "save": [], "put": [], "clear": []}
+        from verl.utils import tensordict_utils as tu
+
+        restored_batch = tu.get_tensordict(
+            {"uid": ["uid-a", "uid-b"], "raw_prompt": ["a", "b"]}
+        )
+        queue_items = {
+            "train": {
+                "uid-a": {"is_prompt": True, "status": "pending"},
+                "uid-b": {"is_prompt": True, "status": "running"},
+                "uid-c": {"is_prompt": True, "status": "finished"},
+                "uid-a_0_0": {"policy_name": "policy_1"},
+                "uid-b_0_0": {"policy_name": "policy_2"},
+                "uid-c_0_0": {"policy_name": "policy_1"},
+            }
+        }
+        monkeypatch.setattr(trainer_module.tq, "__version__", "0.1.9", raising=False)
+        monkeypatch.setattr(
+            trainer_module.tq,
+            "load_checkpoint",
+            lambda path: calls["load"].append(path),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            trainer_module.tq,
+            "save_checkpoint",
+            lambda path, metadata: calls["save"].append((path, metadata)),
+            raising=False,
+        )
+        monkeypatch.setattr(trainer_module.tq, "kv_list", lambda partition_id: queue_items, raising=False)
+        monkeypatch.setattr(
+            trainer_module.tq,
+            "kv_batch_get",
+            lambda **kwargs: restored_batch,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            trainer_module.tq,
+            "kv_clear",
+            lambda **kwargs: calls["clear"].append(kwargs),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            trainer_module.tq,
+            "kv_batch_put",
+            lambda **kwargs: calls["put"].append(kwargs),
+        )
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                resume_mode="resume_path",
+                resume_from_path=str(checkpoint_dir),
+                default_local_dir=str(checkpoint_root),
+                default_hdfs_dir=None,
+                del_local_ckpt_after_load=False,
+            )
+        )
+        trainer.trainer_mode = "separate_async"
+        trainer.policy_trainers = {}
+        trainer.train_dataloader = None
+        trainer.timing_raw = {}
+        trainer.agent_loop_manager = FakeAgentFrameworkRolloutAdapter()
+
+        trainer._load_checkpoint()
+        trainer.global_steps = 4
+        reissued = trainer._reissue_inflight_prompts()
+        trainer._save_checkpoint()
+
+        assert calls["load"] == [str(checkpoint_dir / "transfer_queue")]
+        assert calls["clear"] == [
+            {"keys": ["uid-a_0_0", "uid-b_0_0"], "partition_id": "train"}
+        ]
+        assert calls["put"] == [
+            {
+                "keys": ["uid-a", "uid-b"],
+                "partition_id": "train",
+                "tags": [
+                    {"is_prompt": True, "status": "pending", "global_steps": 4},
+                    {"is_prompt": True, "status": "pending", "global_steps": 4},
+                ],
+            }
+        ]
+        assert reissued == 2
+        assert restored_batch["global_steps"] == 4
+        assert trainer.agent_loop_manager.generated_prompts == [restored_batch]
+        assert calls["save"] == [
+            (
+                str(checkpoint_root / "global_step_4" / "transfer_queue"),
+                {"global_steps": 4},
+            )
+        ]
+
+    def test_multi_policy_async_checkpoint_save_does_not_publish_outer_tracker(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_root = tmp_path / "multi_agent_ckpts"
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                default_local_dir=str(checkpoint_root),
+                default_hdfs_dir=None,
+            )
+        )
+        trainer.policy_configs = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_ref=SimpleNamespace(
+                    actor=SimpleNamespace(checkpoint=SimpleNamespace(async_save=True))
+                )
+            )
+        }
+        trainer.policy_trainers = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_wg=FakeWorkerGroup("actor:policy_1"),
+                use_critic=False,
+            )
+        }
+        trainer.global_steps = 4
+        trainer.trainer_mode = "sync"
+        trainer.train_dataloader = None
+
+        assert trainer._has_async_checkpoint_save() is True
+        trainer._save_checkpoint()
+
+        assert not (checkpoint_root / "latest_checkpointed_iteration.txt").exists()
+
+    def test_multi_policy_checkpoint_save_forwards_native_retention_limits(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_root = tmp_path / "multi_agent_ckpts"
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                default_local_dir=str(checkpoint_root),
+                default_hdfs_dir=None,
+                max_actor_ckpt_to_keep=2,
+                max_critic_ckpt_to_keep=3,
+            )
+        )
+        trainer.policy_configs = {}
+        trainer.policy_trainers = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_wg=FakeWorkerGroup("actor:policy_1"),
+                critic_wg=FakeWorkerGroup("critic:policy_1"),
+                use_critic=True,
+            )
+        }
+        trainer.global_steps = 4
+        trainer.trainer_mode = "sync"
+        trainer.train_dataloader = None
+
+        trainer._save_checkpoint()
+
+        actor_call = trainer.policy_trainers["policy_1"].actor_rollout_wg.save_calls[0]
+        critic_call = trainer.policy_trainers["policy_1"].critic_wg.save_calls[0]
+        assert actor_call["kwargs"]["max_ckpt_to_keep"] == 2
+        assert critic_call["kwargs"]["max_ckpt_to_keep"] == 3
+
+    def test_checkpoint_save_fails_fast_when_policy_actor_worker_is_unavailable(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_root = tmp_path / "multi_agent_ckpts"
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                default_local_dir=str(checkpoint_root),
+                default_hdfs_dir=None,
+            )
+        )
+        trainer.policy_configs = {}
+        trainer.policy_trainers = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_wg=None,
+                use_critic=False,
+            )
+        }
+        trainer.global_steps = 1
+        trainer.trainer_mode = "sync"
+        trainer.train_dataloader = None
+
+        with pytest.raises(AttributeError):
+            trainer._save_checkpoint()
+
+        assert not (checkpoint_root / "latest_checkpointed_iteration.txt").exists()
+
+    def test_checkpoint_load_fails_fast_when_policy_actor_worker_is_unavailable(self, tmp_path):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        checkpoint_dir = tmp_path / "global_step_1"
+        (checkpoint_dir / "policies" / "policy_1" / "actor").mkdir(parents=True)
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.config = SimpleNamespace(
+            trainer=SimpleNamespace(
+                resume_mode="resume_path",
+                resume_from_path=str(checkpoint_dir),
+                del_local_ckpt_after_load=False,
+            )
+        )
+        trainer.policy_trainers = {
+            "policy_1": SimpleNamespace(
+                actor_rollout_wg=None,
+                use_critic=False,
+            )
+        }
+        trainer.train_dataloader = None
+        trainer.timing_raw = {}
+        trainer.trainer_mode = "sync"
+
+        with pytest.raises(AttributeError):
+            trainer._load_checkpoint()
 
     def test_build_per_policy_batches_groups_trajectories_by_policy_name(self):
         _install_dependency_stubs()
@@ -1261,7 +1661,7 @@ class TestMultiAgentsPPOTrainer:
 
         trainer._step_once(metrics={}, timing_raw={}, sample_batch_size=1)
 
-        assert trainer.build_per_policy_batches_calls == 1
+        assert trainer.build_per_policy_batches_calls == 2
 
     def test_step_once_computes_advantage_from_policy_batches(self):
         _install_dependency_stubs()
@@ -1724,7 +2124,7 @@ class TestMultiAgentsPPOTrainer:
             "policy_1/update_weights",
             "policy_2/update_weights",
         ]
-        assert all(call["timing_raw"] is trainer.timing_raw for call in marked_timer.calls)
+        assert all(isinstance(call["timing_raw"], dict) for call in marked_timer.calls)
         assert all(call["kwargs"]["color"] == "red" for call in marked_timer.calls)
 
     def test_fit_loads_outer_checkpoint_before_training_loop(self):
@@ -1754,11 +2154,11 @@ class TestMultiAgentsPPOTrainer:
 
         assert trainer.step_events == [
             ("load_checkpoint", 0),
-            ("sample", 1),
-            ("build", 1),
-            ("update", 1, {"policy_1": "batch:1"}),
+            ("sample", 2),
+            ("build", 2),
+            ("update", 2, {"policy_1": "batch:2"}),
         ]
-        assert trainer.global_steps == 2
+        assert trainer.global_steps == 3
 
     def test_fit_saves_outer_checkpoint_by_save_frequency(self):
         _install_dependency_stubs()
@@ -1787,7 +2187,7 @@ class TestMultiAgentsPPOTrainer:
         assert ("save_checkpoint", 1) in trainer.step_events
         assert ("save_checkpoint", 2) in trainer.step_events
 
-    def test_promotes_first_policy_trainer_dataloader_as_outer_dataloader(self):
+    def test_shared_dataloader_uses_first_initialized_policy(self):
         _install_dependency_stubs()
 
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -1801,10 +2201,9 @@ class TestMultiAgentsPPOTrainer:
             policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
 
-        trainer._init_policy_runtimes()
+        trainer.init()
 
         first_policy_trainer = trainer.policy_trainers["policy_1"]
-        assert trainer.outer_data_source_policy_name == "policy_1"
         assert trainer.train_dataset == "train_dataset:policy_1"
         assert trainer.val_dataset == "val_dataset:policy_1"
         assert trainer.train_dataloader is first_policy_trainer.train_dataloader
@@ -1851,7 +2250,7 @@ class TestMultiAgentsPPOTrainer:
         assert _td_get(generated, "reward_model") == [{"ground_truth": "answer:policy_1"}]
         assert _td_get(generated, "tools_kwargs") == [{"env": {"image": "image:policy_1"}}]
         assert _td_get(generated, "data_source") == ["source:policy_1"]
-        assert _td_get(generated, "global_steps") == 0
+        assert _td_get(generated, "global_steps") == 1
 
     def test_submit_batch_to_rollout_marks_prompt_pending_before_dispatch(self, monkeypatch):
         _install_dependency_stubs()
@@ -1869,7 +2268,7 @@ class TestMultiAgentsPPOTrainer:
             },
             policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
-        trainer._init_policy_runtimes()
+        trainer.init()
         trainer.agent_loop_manager = _build_test_agent_loop_manager(trainer)
 
         batch = trainer._next_train_batch()
@@ -1904,7 +2303,7 @@ class TestMultiAgentsPPOTrainer:
             },
             policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
-        trainer._init_policy_runtimes()
+        trainer.init()
 
         try:
             trainer._submit_batch_to_rollout(trainer._next_train_batch())

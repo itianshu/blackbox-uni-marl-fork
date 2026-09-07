@@ -1,0 +1,25 @@
+# Example template consumed by external_mas_runner. The runner writes a copy
+# per rollout and replaces every base_url/model value below.
+llm:
+  base_url: http://placeholder.invalid/v1
+  api_key: EMPTY
+
+agents:
+  agent_1:
+    model: agent_1
+    llm:
+      base_url: http://placeholder.invalid/v1
+    system_prompt: "Decompose the task and produce a concise plan."
+    max_tokens: 1024
+  agent_2:
+    model: agent_2
+    llm:
+      base_url: http://placeholder.invalid/v1
+    system_prompt: "Execute the main task using the available context."
+    max_tokens: 2048
+  agent_3:
+    model: agent_3
+    llm:
+      base_url: http://placeholder.invalid/v1
+    system_prompt: "Verify the previous outputs and return the final answer."
+    max_tokens: 1024

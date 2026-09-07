@@ -329,6 +329,11 @@ def test_remote_framework_cancels_ray_task_when_local_wait_is_cancelled(monkeypa
         "cancel",
         lambda ref, force=False: cancelled_refs.append((ref, force)),
     )
+    monkeypatch.setattr(
+        framework_module.ray,
+        "wait",
+        lambda refs, **_kwargs: ([], list(refs)),
+    )
 
     async def runner(**_kwargs):
         return None
@@ -357,8 +362,67 @@ def test_remote_framework_cancels_ray_task_when_local_wait_is_cancelled(monkeypa
 
     asyncio.run(cancel_local_wait())
 
-    assert cancelled_refs == [(remote_ref, True)]
+    assert cancelled_refs == [(remote_ref, False), (remote_ref, True)]
     assert framework._remote_tasks == {}
+
+
+def test_remote_framework_applies_configured_ray_task_options(monkeypatch):
+    from examples.multi_agent_blackbox import framework as framework_module
+
+    calls = []
+    result = concurrent.futures.Future()
+    result.set_result({"reward_info": {}})
+
+    class FakeRemote:
+        def options(self, **kwargs):
+            calls.append(("options", kwargs))
+            return self
+
+        def remote(self, **kwargs):
+            calls.append(("remote", kwargs))
+            return SimpleNamespace(future=lambda: result)
+
+    monkeypatch.setattr(framework_module, "remote_multi_agent_run", FakeRemote())
+
+    async def runner(**_kwargs):
+        return None
+
+    framework = object.__new__(framework_module.RemoteMultiAgentFramework)
+    framework.multi_agent_runner = partial(
+        runner,
+        execution={
+            "backend": "local_process",
+            "ray": {
+                "num_cpus": 1,
+                "resources": {"mas_runner_slot": 1},
+                "scheduling_strategy": "SPREAD",
+                "cancel_grace_seconds": 3,
+            },
+        },
+    )
+    framework.role_policy_mapping = {"agent": "policy_1"}
+    framework._remote_tasks = {}
+
+    asyncio.run(
+        framework._execute_multi_agent_runner(
+            raw_prompt="task",
+            rollout=SimpleNamespace(base_url="http://gateway", sessions={}),
+            rollout_id="rollout-options",
+            sample_index=0,
+            runner_kwargs=None,
+        )
+    )
+
+    assert calls[0] == (
+        "options",
+        {
+            "num_cpus": 1,
+            "resources": {"mas_runner_slot": 1},
+            "scheduling_strategy": "SPREAD",
+        },
+    )
+    remote_kwargs = calls[1][1]
+    assert remote_kwargs["runner_kwargs"]["execution"] == {"backend": "local_process"}
 
 
 def test_remote_framework_shutdown_waits_for_cancelled_ray_tasks(monkeypatch):
@@ -387,8 +451,8 @@ def test_remote_framework_shutdown_waits_for_cancelled_ray_tasks(monkeypatch):
     framework.shutdown(timeout=2.0)
 
     assert events[:2] == [
-        ("cancel", refs[0], True),
-        ("cancel", refs[1], True),
+        ("cancel", refs[0], False),
+        ("cancel", refs[1], False),
     ]
     assert events[2][0:3] == ("wait", refs, 2)
     assert framework._remote_tasks == {}

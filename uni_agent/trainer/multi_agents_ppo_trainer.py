@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -11,9 +12,23 @@ import numpy as np
 import ray
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf, open_dict
+from packaging.version import InvalidVersion, Version
 
 
 logger = logging.getLogger(__name__)
+
+
+def _tq_supports_checkpoint() -> bool:
+    """Whether the installed TransferQueue can snapshot and restore state."""
+    try:
+        version_supported = Version(getattr(tq, "__version__", "")) >= Version("0.1.9")
+    except InvalidVersion:
+        return False
+    return (
+        version_supported
+        and callable(getattr(tq, "save_checkpoint", None))
+        and callable(getattr(tq, "load_checkpoint", None))
+    )
 
 
 class MultiAgentsPPOTrainer:
@@ -144,17 +159,24 @@ class MultiAgentsPPOTrainer:
     def init(self) -> None:
         """Initialize all components of the multi-agent trainer.
 
-        1. Per-policy v1 trainer runtimes (actor/rollout engines per policy).
+        1. Per-policy v1 runtime setup for each policy; ``on_init_end()`` is
+           intentionally deferred.
         2. Shared outer dataloader: single prompt stream for all policies.
         3. Shared outer replay buffer over the TransferQueue.
-        4. Outer checkpoint load — the outer trainer owns the checkpoint
-           lifecycle, so per-policy trainers never resume on their own.
+        4. Outer checkpoint phase; the outer trainer owns the shared checkpoint
+           lifecycle and establishes actor/critic state and ``global_steps``.
+        5. Invoke each policy's ``on_init_end()`` after the outer
+           initialization phase to synchronize current actor weights to that
+           policy's rollout replicas.
         """
         for policy_trainer in self.policy_trainers.values():
-            policy_trainer.init()
+            policy_trainer.init_runtime()
         self._build_dataloader()
         self._build_replay_buffer()
         self._load_checkpoint()
+
+        for policy_trainer in self.policy_trainers.values():
+            policy_trainer.on_init_end()
 
     def get_multi_policy_llm_client(self) -> list[Any] | None:
         from uni_agent.trainer.gateway.runtime import PolicyRoutingLLMClient
@@ -237,6 +259,7 @@ class MultiAgentsPPOTrainer:
         # tags all use the current step number.
         self.global_steps += 1
         self._sync_policy_runtime_context()
+        self._reissue_inflight_prompts()
         self.on_train_begin()
         succeeded = False
         try:
@@ -789,31 +812,104 @@ class MultiAgentsPPOTrainer:
             self.global_steps = 0
             return
 
-        self.global_steps = int(os.path.basename(checkpoint_dir).split("global_step_")[-1])
-        del_local_after_load = bool(self.config.trainer.del_local_ckpt_after_load)
+        checkpoint_name = os.path.basename(os.path.normpath(checkpoint_dir))
+        step_text = checkpoint_name.removeprefix("global_step_")
+        if checkpoint_name == step_text or not step_text.isdigit():
+            raise ValueError(f"Invalid checkpoint directory name: {checkpoint_dir}")
+        self.global_steps = int(step_text)
+
+        policy_paths = {}
         for policy_name, trainer in self.policy_trainers.items():
             policy_checkpoint_dir = os.path.join(checkpoint_dir, "policies", policy_name)
-            actor_wg = getattr(trainer, "actor_rollout_wg", None)
-            if actor_wg is not None:
-                actor_wg.load_checkpoint(
-                    local_path=os.path.join(policy_checkpoint_dir, "actor"),
-                    del_local_after_load=del_local_after_load,
+            actor_path = os.path.join(policy_checkpoint_dir, "actor")
+            if not os.path.isdir(actor_path):
+                raise FileNotFoundError(
+                    f"Checkpoint for policy {policy_name!r} is missing actor directory: {actor_path}"
                 )
 
-            if getattr(trainer, "use_critic", False):
-                critic_wg = getattr(trainer, "critic_wg", None)
-                if critic_wg is not None:
-                    critic_wg.load_checkpoint(
-                        local_path=os.path.join(policy_checkpoint_dir, "Critic"),
-                        del_local_after_load=del_local_after_load,
+            critic_path = None
+            if trainer.use_critic:
+                critic_path = os.path.join(policy_checkpoint_dir, "Critic")
+                if not os.path.isdir(critic_path):
+                    raise FileNotFoundError(
+                        f"Checkpoint for policy {policy_name!r} is missing critic directory: {critic_path}"
                     )
+            policy_paths[policy_name] = (actor_path, critic_path)
+
+        del_local_after_load = bool(self.config.trainer.del_local_ckpt_after_load)
+        for policy_name, trainer in self.policy_trainers.items():
+            actor_path, critic_path = policy_paths[policy_name]
+            trainer.actor_rollout_wg.load_checkpoint(
+                local_path=actor_path,
+                del_local_after_load=del_local_after_load,
+            )
+
+            if trainer.use_critic:
+                trainer.critic_wg.load_checkpoint(
+                    local_path=critic_path,
+                    del_local_after_load=del_local_after_load,
+                )
 
         dataloader_path = os.path.join(checkpoint_dir, "data.pt")
         if self.train_dataloader is not None and os.path.exists(dataloader_path):
             import torch
 
             self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
+        elif self.train_dataloader is not None:
+            logger.warning("No dataloader state found at %s; starting its state from scratch", dataloader_path)
+
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq_checkpoint_path = os.path.join(checkpoint_dir, "transfer_queue")
+            if os.path.exists(tq_checkpoint_path):
+                logger.info("Loading TransferQueue state from %s", tq_checkpoint_path)
+                tq.load_checkpoint(tq_checkpoint_path)
         self._sync_policy_runtime_context()
+
+    def _reissue_inflight_prompts(self, partition_id: str = "train") -> int:
+        """Re-dispatch restored pending/running prompt groups after resume."""
+        if self.trainer_mode == "sync" or not _tq_supports_checkpoint():
+            return 0
+
+        data = tq.kv_list(partition_id)
+        if not data:
+            return 0
+        items = data.get(partition_id, {})
+        inflight_uids = [
+            key
+            for key, tag in items.items()
+            if tag.get("is_prompt", False) and tag.get("status") in ("pending", "running")
+        ]
+        if not inflight_uids:
+            return 0
+        if self.agent_loop_manager is None:
+            raise RuntimeError("agent_loop_manager must be initialized before reissuing prompts")
+
+        batch = tq.kv_batch_get(keys=inflight_uids, partition_id=partition_id)
+        trajectory_prefixes = tuple(f"{uid}_" for uid in inflight_uids)
+        old_trajectory_keys = [
+            key
+            for key, tag in items.items()
+            if not tag.get("is_prompt", False) and key.startswith(trajectory_prefixes)
+        ]
+        if old_trajectory_keys:
+            tq.kv_clear(keys=old_trajectory_keys, partition_id=partition_id)
+
+        from verl.utils import tensordict_utils as tu
+
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tags = [
+            {"is_prompt": True, "status": "pending", "global_steps": self.global_steps}
+            for _ in inflight_uids
+        ]
+        tq.kv_batch_put(keys=inflight_uids, partition_id=partition_id, tags=tags)
+        self.agent_loop_manager.generate_sequences(batch)
+        logger.info(
+            "Re-issued %d in-flight prompts at step %d and cleared %d partial trajectories",
+            len(inflight_uids),
+            self.global_steps,
+            len(old_trajectory_keys),
+        )
+        return len(inflight_uids)
 
     def _resolve_checkpoint_dir(self) -> str | None:
         resume_mode = self.config.trainer.resume_mode
@@ -823,7 +919,10 @@ class MultiAgentsPPOTrainer:
             checkpoint_dir = self.config.trainer.resume_from_path
             if not checkpoint_dir:
                 raise ValueError("trainer.resume_from_path is required when trainer.resume_mode='resume_path'")
-            return os.path.abspath(str(checkpoint_dir))
+            checkpoint_dir = os.path.abspath(os.path.normpath(str(checkpoint_dir)))
+            if not os.path.isdir(checkpoint_dir):
+                raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+            return checkpoint_dir
         if resume_mode == "auto":
             checkpoint_root = self.config.trainer.default_local_dir
             if not checkpoint_root:
@@ -831,19 +930,20 @@ class MultiAgentsPPOTrainer:
             checkpoint_root = os.path.abspath(str(checkpoint_root))
             if not os.path.isdir(checkpoint_root):
                 return None
-            latest_step = -1
-            latest_dir = None
-            for name in os.listdir(checkpoint_root):
-                if not name.startswith("global_step_"):
-                    continue
-                try:
-                    step = int(name.split("global_step_")[-1])
-                except ValueError:
-                    continue
-                if step > latest_step:
-                    latest_step = step
-                    latest_dir = os.path.join(checkpoint_root, name)
-            return latest_dir
+            tracker_path = os.path.join(checkpoint_root, "latest_checkpointed_iteration.txt")
+            if not os.path.isfile(tracker_path):
+                logger.info("No checkpoint tracker found at %s; training from scratch", tracker_path)
+                return None
+            with open(tracker_path, encoding="utf-8") as file:
+                step_text = file.read().strip()
+            if not step_text.isdigit():
+                raise ValueError(f"Invalid checkpoint step in {tracker_path}: {step_text!r}")
+            checkpoint_dir = os.path.join(checkpoint_root, f"global_step_{step_text}")
+            if not os.path.isdir(checkpoint_dir):
+                raise FileNotFoundError(
+                    f"Checkpoint tracker points to a missing directory: {checkpoint_dir}"
+                )
+            return checkpoint_dir
         raise ValueError(f"Unknown trainer.resume_mode: {resume_mode}")
 
     def _save_checkpoint(self) -> None:
@@ -855,48 +955,58 @@ class MultiAgentsPPOTrainer:
         os.makedirs(policies_dir, exist_ok=True)
 
         default_hdfs_dir = self.config.trainer.default_hdfs_dir
+        remove_previous = self._trainer_option("remove_previous_ckpt_in_save", False)
+        if remove_previous:
+            logger.warning(
+                "remove_previous_ckpt_in_save is deprecated; use max_actor_ckpt_to_keep=1 "
+                "and max_critic_ckpt_to_keep=1 instead"
+            )
+        max_actor_ckpt_to_keep = (
+            1 if remove_previous else self._trainer_option("max_actor_ckpt_to_keep", None)
+        )
+        max_critic_ckpt_to_keep = (
+            1 if remove_previous else self._trainer_option("max_critic_ckpt_to_keep", None)
+        )
         for policy_name, trainer in self.policy_trainers.items():
             policy_checkpoint_dir = os.path.join(policies_dir, policy_name)
             os.makedirs(policy_checkpoint_dir, exist_ok=True)
 
-            actor_wg = getattr(trainer, "actor_rollout_wg", None)
-            if actor_wg is not None:
-                actor_remote_path = (
+            actor_remote_path = (
+                None
+                if default_hdfs_dir is None
+                else posixpath.join(
+                    str(default_hdfs_dir),
+                    f"global_step_{self.global_steps}",
+                    "policies",
+                    policy_name,
+                    "actor",
+                )
+            )
+            trainer.actor_rollout_wg.save_checkpoint(
+                os.path.join(policy_checkpoint_dir, "actor"),
+                actor_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            )
+
+            if trainer.use_critic:
+                critic_remote_path = (
                     None
                     if default_hdfs_dir is None
-                    else os.path.join(
+                    else posixpath.join(
                         str(default_hdfs_dir),
                         f"global_step_{self.global_steps}",
                         "policies",
                         policy_name,
-                        "actor",
+                        "Critic",
                     )
                 )
-                actor_wg.save_checkpoint(
-                    os.path.join(policy_checkpoint_dir, "actor"),
-                    actor_remote_path,
+                trainer.critic_wg.save_checkpoint(
+                    os.path.join(policy_checkpoint_dir, "Critic"),
+                    critic_remote_path,
                     self.global_steps,
+                    max_ckpt_to_keep=max_critic_ckpt_to_keep,
                 )
-
-            if getattr(trainer, "use_critic", False):
-                critic_wg = getattr(trainer, "critic_wg", None)
-                if critic_wg is not None:
-                    critic_remote_path = (
-                        None
-                        if default_hdfs_dir is None
-                        else os.path.join(
-                            str(default_hdfs_dir),
-                            f"global_step_{self.global_steps}",
-                            "policies",
-                            policy_name,
-                            "Critic",
-                        )
-                    )
-                    critic_wg.save_checkpoint(
-                        os.path.join(policy_checkpoint_dir, "Critic"),
-                        critic_remote_path,
-                        self.global_steps,
-                    )
 
         if self.train_dataloader is not None:
             import torch
@@ -904,10 +1014,51 @@ class MultiAgentsPPOTrainer:
             os.makedirs(checkpoint_dir, exist_ok=True)
             torch.save(self.train_dataloader.state_dict(), os.path.join(checkpoint_dir, "data.pt"))
 
+        if self.trainer_mode != "sync" and _tq_supports_checkpoint():
+            tq.save_checkpoint(
+                os.path.join(checkpoint_dir, "transfer_queue"),
+                metadata={"global_steps": self.global_steps},
+            )
+
+        if self._has_async_checkpoint_save():
+            logger.warning(
+                "Skipping multi-policy latest checkpoint tracker at step %d because at least one "
+                "policy checkpoint uses async_save; publish the tracker only after all policy saves complete.",
+                self.global_steps,
+            )
+            return
+
         os.makedirs(str(checkpoint_root), exist_ok=True)
         latest_path = os.path.join(str(checkpoint_root), "latest_checkpointed_iteration.txt")
         with open(latest_path, "w", encoding="utf-8") as file:
             file.write(str(self.global_steps))
+
+    def _trainer_option(self, name: str, default: Any = None) -> Any:
+        trainer_config = self.config.trainer
+        getter = getattr(trainer_config, "get", None)
+        if callable(getter):
+            return getter(name, default)
+        return getattr(trainer_config, name, default)
+
+    def _has_async_checkpoint_save(self) -> bool:
+        """Return whether any policy model checkpoint is written asynchronously."""
+        checkpoint_paths = (
+            "actor_rollout_ref.actor.checkpoint.async_save",
+            "critic.checkpoint.async_save",
+        )
+        for policy_config in getattr(self, "policy_configs", {}).values():
+            for path in checkpoint_paths:
+                value = policy_config
+                for component in path.split("."):
+                    if isinstance(value, Mapping):
+                        value = value.get(component)
+                    else:
+                        value = getattr(value, component, None)
+                    if value is None:
+                        break
+                if bool(value):
+                    return True
+        return False
 
     def _should_save_checkpoint(self) -> bool:
         save_freq = self.save_freq

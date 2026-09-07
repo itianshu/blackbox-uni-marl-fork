@@ -16,6 +16,16 @@ from verl.trainer.ppo.v1.trainer_separate_async import PPOTrainerSeparateAsync
 
 
 class SingleAsyncPPOTrainer(PPOTrainerSeparateAsync):
+    def init_runtime(self) -> None:
+        """Initialize the per-policy runtime without syncing rollout weights.
+
+        ``MultiAgentsPPOTrainer`` owns the shared checkpoint lifecycle.  It
+        therefore lets the outer trainer establish actor/critic state first;
+        the inherited ``on_init_end()`` hook can then synchronize the current
+        actor weights to standalone rollout replicas.
+        """
+        self._setup()
+
     def _build_replay_buffer(self):
         """The outer trainer owns the shared async replay buffer."""
         return None

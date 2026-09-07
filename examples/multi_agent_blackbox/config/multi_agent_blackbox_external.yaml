@@ -1,0 +1,54 @@
+defaults:
+  - multi_agent_blackbox
+  - _self_
+
+# Command-driven alternative to the bundled Python MAS demo. The external MAS
+# must accept the generated YAML and send OpenAI-compatible requests to its
+# injected base_url with model set to an agent role.
+actor_rollout_ref:
+  rollout:
+    custom:
+      agent_framework:
+        multi_agent_runner_fqn: examples.multi_agent_blackbox.external_mas_runner.external_mas_runner
+        multi_agent_runner_kwargs:
+          # Disable kwargs used only by the bundled callable demo.
+          mas_config_path: null
+          execution:
+            backend: local_process
+            ray:
+              # Each MAS command runs on the node selected for its Ray task.
+              num_cpus: 1
+              scheduling_strategy: SPREAD
+              # Optional cluster placement constraint. Worker nodes must
+              # advertise this custom resource before enabling it.
+              resources: {}
+              cancel_grace_seconds: 5
+          command:
+            # The bundled three-agent MAS is a standalone command. Placeholders
+            # are expanded after tokenization, so prompts with spaces remain one arg.
+            argv:
+              - python
+              - -m
+              - examples.multi_agent_blackbox.scripts.three_agent_external_mas
+              - --config
+              - "{config_path}"
+              - --prompt
+              - "{prompt}"
+            work_dir: null
+            env: {}
+          config:
+            template_path: examples/multi_agent_blackbox/config/external_mas_template.yaml
+            injection:
+              global_base_url_path: llm.base_url
+              agents_path: agents
+              agent_base_url_path: llm.base_url
+              agent_model_path: model
+              inject_agent_base_url: true
+          timeout:
+            seconds: 600
+          result:
+            # The last JSON object printed to stdout is returned to the
+            # framework. It may contain final_result and reward_info.
+            mode: stdout_json
+          logs:
+            directory: null
