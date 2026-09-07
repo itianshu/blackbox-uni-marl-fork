@@ -182,6 +182,91 @@ No verl file is modified by this runtime path. The file-level patch under
 `examples/multi_agent_blackbox/patches/` is an archival alternative and is not
 used by the launch scripts.
 
+## Dynamic Inference Scheduling (cross-policy replica borrowing)
+
+`dynamic_inference_scheduling`（顶层配置块，默认 `enable: false`，零行为变化）
+implements the RFC for borrowing GPU replicas across policies at step
+boundaries: underloaded policies (home) sleep one or more topology-valid N:M
+borrow units (vLLM level-2), and pre-created replicas with the bottleneck
+policy's (donor's) architecture wake on the same cards, receive a directed
+weight push, and join the donor's load balancer. Borrow quantity is computed by
+demand-conserving discrete load equalisation and may include multiple units in
+one decision. Decision and execution logic lives in
+`uni_agent/trainer/dynamic_inference/`; verl itself stays pristine — the patches (STANDALONE
+engine sleep/wake, guest external resource pool) chain on top of
+`verl_patch.py` at runtime.
+
+### 前置条件（不满足会在启动时立即报错）
+
+1. `trainer.v1.trainer_mode: separate_async`（借用对象是 standalone rollout
+   replica，sync 模式无此结构）；
+2. 每个 home policy 至少有 `home_replicas_per_unit + 1` 个 standalone
+   replica；算法可一次借出多个完整单元，但始终保留 ≥1 个继续服务；
+3. 支持异构 replica 的 N:M 折算，但必须满足
+   `N × home_cards_per_replica = M × donor_cards_per_replica`，且两侧每节点
+   GPU 数一致。例如 `2×(单节点8卡) → 1×(双节点16卡)`，反向配置为
+   `1×(双节点16卡) → 2×(单节点8卡)`；
+4. 每个 policy 的 rollout 配置满足：`name: vllm`、
+   `enable_sleep_mode: true`、`free_cache_engine: true`、
+   `checkpoint_engine.backend: nccl`（示例 yaml 已满足）；
+5. `borrowing.pairs: []` 会对任意数量的 policy 自动生成 1:1 全有向图，
+   适合同构 topology；异构 policy 必须显式声明合法的 N:M 边。借还图支持
+   多入边和多出边，home placement group 的 worker slot 数会自动设置为
+   `1 + out_degree(home)`，无需手工配置。
+
+异构多向借用需要显式写出每个方向，例如 `policy_8gpu` 可同时具有两条出边：
+
+```yaml
+borrowing:
+  pairs:
+    - {home: policy_8gpu, donor: policy_16gpu,
+       home_replicas_per_unit: 2, guest_replicas_per_unit: 1}
+    - {home: policy_16gpu, donor: policy_8gpu,
+       home_replicas_per_unit: 1, guest_replicas_per_unit: 2}
+    - {home: policy_8gpu, donor: policy_c,
+       home_replicas_per_unit: 1, guest_replicas_per_unit: 1}
+```
+
+每条出边会在相应 home 卡上预创建一套 sleeping guest。不同 home replica
+单元可同时沿不同边借出；共享同一 home replica 的两套 guest 不能同时唤醒。
+
+### 启用步骤
+
+1. 把顶层 `dynamic_inference_scheduling.enable` 改为 `true`，按需调整
+   阈值（各字段含义见 yaml 注释）；
+2. 把 worker hook 切换到调度补丁（内部链式调用原 example hook）：
+
+   ```yaml
+   ray_kwargs:
+     ray_init:
+       runtime_env:
+         worker_process_setup_hook: uni_agent.trainer.dynamic_inference.patch.apply_worker_patch
+   ```
+
+3. 重启训练 Driver（Ray worker hook 只在新 Ray job 生效）。
+
+### 额外资源预算
+
+- **host RAM**：每个沉睡 guest replica 持有完整的 vLLM worker actor
+  外壳与 CPU 侧权重缓冲；一个借出单元的额外占用按
+  `guest_replicas_per_unit` 计算。所有 guest 都会在训练开始前预创建。
+- **启动时间**：预创建过场（home sleep → guest init → guest sleep →
+  home wake）每单元需数秒至数十秒；precreate 在训练开始前一次性完成，
+  且内置探针——若 worker 侧 sleep 补丁未生效（sleep 瞬间返回），启动
+  立即失败并提示切换 `sleep_patch_mode: collective_rpc` 降级（仅 DP=1）。
+
+### 运行时安全与降级
+
+- 借还与 `update_weights` 严格串行（边界顺序：删减归还 → 各 policy
+  `update_weights` → 续借 guest 定向同步 → 增量借入）；
+- 借用失败自动回滚并屏蔽该 pair 一个 swap 窗口；重复失败触发熔断，
+  调度器降级为 static（只归还不再借用）；
+- 目标连续确认、最小收益死区、稳定观察窗口和最短持有期共同限制换手；
+- 训练 cleanup 时先归还全部活跃借出、kill 全部 guest actor，再走
+  per-policy 清理。
+- 指标以 `dynamic_inference/*` 前缀合并进 trainer metrics
+  （swap_episodes / renewals / returns / bottleneck / kv_util / disabled 等）。
+
 ## Verification
 
 Run the real two-policy verifier on the Linux Ray 2.55.1 GPU cluster:

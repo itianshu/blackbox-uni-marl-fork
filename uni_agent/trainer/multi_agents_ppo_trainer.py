@@ -69,6 +69,10 @@ class MultiAgentsPPOTrainer:
         self.timing_raw: dict[str, Any] = {}
 
         self._create_policy_trainers()
+        # Dynamic inference scheduling (cross-policy replica borrowing); None
+        # unless config.dynamic_inference_scheduling.enable is true. Built in
+        # init() once every policy runtime exists.
+        self._dynamic_inference = None
         # Per-policy phase methods (compute_log_prob / update_actor /
         # update_weights) run on disjoint GPU sets, so they are submitted to
         # this pool to overlap instead of idling one policy's GPUs. verl's
@@ -169,11 +173,74 @@ class MultiAgentsPPOTrainer:
            initialization phase to synchronize current actor weights to that
            policy's rollout replicas.
         """
+        self._prepare_dynamic_inference_slots()
         for policy_trainer in self.policy_trainers.values():
             policy_trainer.init_runtime()
         self._build_dataloader()
         self._build_replay_buffer()
         self._load_checkpoint()
+        self._init_dynamic_inference()
+
+    def _prepare_dynamic_inference_slots(self) -> None:
+        """Reserve one home slot plus one sleeping-guest slot per outgoing edge.
+
+        Standalone placement groups are created inside each policy trainer's
+        ``init()``, before the dynamic controller can pre-create guests.  Put
+        the graph-derived slot count on every rollout config and install the
+        local ``init_standalone`` wrapper before those placement groups exist.
+        """
+        from uni_agent.trainer.dynamic_inference import patch
+        from uni_agent.trainer.dynamic_inference.types import (
+            expand_pairs,
+            required_slots_by_home,
+            parse_scheduling_config,
+        )
+
+        scheduling = parse_scheduling_config(
+            self.config.get("dynamic_inference_scheduling"))
+        if scheduling is None or scheduling.mode == "static":
+            return
+
+        policy_names = list(self.policy_configs)
+        pairs = expand_pairs(scheduling, policy_names)
+        slots_by_home = required_slots_by_home(pairs, policy_names)
+        patch.apply_patch()
+
+        for policy_name, policy_config in self.policy_configs.items():
+            rollout = policy_config.actor_rollout_ref.rollout
+            custom = rollout.get("custom")
+            if custom is None:
+                with open_dict(rollout):
+                    rollout.custom = OmegaConf.create({})
+                custom = rollout.custom
+            with open_dict(custom):
+                custom["dynamic_inference_max_colocate_count"] = slots_by_home[policy_name]
+
+    def _init_dynamic_inference(self) -> None:
+        """Build the dynamic inference controller when the config block enables it.
+
+        All policy runtimes (standalone replicas holding initial weights) must
+        already exist: setup pre-creates the guest replicas and probes the
+        worker-side sleep patch before training starts.
+        """
+        from uni_agent.trainer.dynamic_inference.controller import DynamicInferenceController
+
+        controller = DynamicInferenceController.maybe_create(self)
+        if controller is None:
+            return
+        controller.setup()
+        self._dynamic_inference = controller
+
+    def _shutdown_dynamic_inference(self) -> None:
+        """Return every active lend, stop the poll loop, kill guest replicas."""
+        if self._dynamic_inference is None:
+            return
+        try:
+            self._dynamic_inference.shutdown()
+        except Exception as exc:
+            logger.warning("dynamic inference shutdown failed: %s", exc)
+        finally:
+            self._dynamic_inference = None
 
         for policy_trainer in self.policy_trainers.values():
             policy_trainer.on_init_end()
@@ -291,6 +358,8 @@ class MultiAgentsPPOTrainer:
         # checkpoint manager's weight-sync metrics in _pending_sync_metrics;
         # verl's native fit() merges them via _consume_sync_metrics().
         metrics.update(self._consume_sync_metrics())
+        if self._dynamic_inference is not None:
+            metrics.update(self._dynamic_inference.last_metrics or {})
         # Mirror verl v1 trainer.fit(): evict the sampled trajectory records
         # from TransferQueue at the end of each step. ReplayBuffer.sample()
         # only clears the prompt uids, so without this the per-trajectory
@@ -1259,6 +1328,11 @@ class MultiAgentsPPOTrainer:
             return
         # separate_async: delegate to verl's per-policy on_step_end (standalone
         # checkpoint manager; update_weights contains abort/resume internally).
+        # Dynamic inference borrows on fresh metrics; the step boundary only
+        # retries returns, updates home weights, and refreshes active guests.
+        if self._dynamic_inference is not None:
+            self._dynamic_inference.run_boundary(self)
+            return
         futures = [
             self._policy_pool.submit(self._run_trainer_hook, policy_name, "on_step_end")
             for policy_name in self.policy_trainers
@@ -1392,6 +1466,11 @@ class MultiAgentsPPOTrainer:
                 # Preserve those resources and surface the failure so callers
                 # do not treat a partial cleanup as successful.
                 raise
+
+        # Return every active borrow, stop the poll loop and kill the guest
+        # replicas before the per-policy teardown removes their placement
+        # groups (guests ride the home replicas' pools but own Ray actors).
+        self._shutdown_dynamic_inference()
 
         for trainer in self.policy_trainers.values():
             cleanup = getattr(trainer, "cleanup", None)

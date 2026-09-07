@@ -113,9 +113,82 @@ ray_kwargs:
     runtime_env:
       # Applies the example patch inside every Ray worker (per-policy unique
       # Ray names); required for multi-policy sharing on one cluster.
+      # ⚠️ 启用 dynamic_inference_scheduling 时须切换为：
+      #   worker_process_setup_hook: uni_agent.trainer.dynamic_inference.patch.apply_worker_patch
+      # 该 hook 内部会先链式调用上面的 examples.multi_agent_blackbox.verl_patch.apply_worker_patch，
+      # 再打 STANDALONE 引擎 sleep/wake 补丁（vLLM level-2 睡眠），二者叠加生效。
       worker_process_setup_hook: examples.multi_agent_blackbox.verl_patch.apply_worker_patch
   # Set a path to dump a Ray timeline for profiling; null = disabled.
   timeline_json_file: null
+
+# ── 跨 policy 动态推理调度（replica 借用）────────────────────────────────
+# 机制（RFC《多智能体动态推理调度》）：separate-async 模式下，每次完整 metrics
+# 抓取后把低载 policy（home，借出方）的 standalone replica 借给瓶颈 policy
+# （donor，借入方）——home 引擎 level-2 睡眠、唤醒预创建好的 guest 副本
+# （donor 结构、dummy 权重）、定向推送一次 donor 最新权重、纳入 donor 的
+# 负载均衡器。普通借还由 metrics 即时驱动；step boundary 只更新权重并刷新续借 guest。
+#
+# 前置条件（违反则启动时报错）：
+#   - trainer.v1.trainer_mode 必须是 separate_async；
+#   - home policy 至少 N+1 个 standalone replica（借 N 个仍留 ≥1 个服务）；
+#   - 支持异构 N:M 折算，但须 N×home卡数=M×donor卡数；同节点卡优先归组，
+#     聚合后的物理节点布局须能放置 donor replica；
+#   - rollout: name=vllm、enable_sleep_mode=true、free_cache_engine=true、
+#     checkpoint_engine.backend=nccl（本配置已满足）；
+#   - borrowing.pairs 为空时，对任意数量 policy 自动生成 1:1 全有向图；
+#     异构拓扑需显式声明 N:M 边。支持多入边/多出边，home worker slot 数
+#     自动设置为 1 + out_degree(home)。
+#
+# enable: false 时零行为变化（外层 trainer 走原 on_step_end 路径）。
+dynamic_inference_scheduling:
+  enable: false
+  # static = 只归还从不借用（安全降级模式）；resource = KV cache 利用率主信号
+  # （vLLM /metrics 抓取，零埋点）。
+  mode: resource
+
+  # ── KV cache 利用率信号（主判定）────────────────────────────────
+  resource_usage:
+    kv_enter: 0.85                # KV 利用率（p90 of per-replica max，EMA）≥ 此值可判瓶颈
+    kv_exit: 0.6                  # 瓶颈态退出阈值（非对称滞回）
+    kv_post_lend_max: 0.7         # 须满足 kv_exit < 此值 < kv_enter，避免借后立即早归还
+    kv_metric_names:              # /metrics 中 KV gauge 候选名（vLLM 版本相关，按序取首个命中）
+      - kv_cache_usage_perc
+      - gpu_cache_usage_perc
+      - kv_cache_usage_ratio
+    ema_alpha: 0.3                # KV 利用率 EMA 平滑；运行时滚动窗口约为 20 次抓取
+
+  # ── 层 1：瓶颈确认 ─────────────────────────────────────────────
+  bottleneck_confirm_polls: 10    # 连续 N 次完整 metrics 判定同一 policy 过载才借
+
+  # ── 防抖：目标分配确认和动作稳定期 ────────────────────────────
+  rebalance_confirm_polls: 2      # 同一目标分配连续出现 N 次完整 metrics 后立即执行
+  rebalance_settle_polls: 3       # 物理借还后等待 N 次 poll，再参与普通再均衡
+  min_lend_polls: 2               # 普通路径至少经过 N 次完整 metrics；安全早归还不受限制
+  borrow_cooldown_s: 10.0         # 成功借出后 N 秒内禁止新增借卡；普通/安全归还仍可执行
+  return_confirm_polls: 10        # donor EMA KV <= kv_exit 连续 N 次后尝试安全的部分归还
+
+  # ── 提前归还（与借卡统一使用 KV 主信号）────────────────────────
+  early_return_confirm_polls: 10  # home EMA KV >= kv_enter 连续 N 次后立即归还一个单元
+
+  # ── 轮询与执行 ─────────────────────────────────────────────────
+  poll_interval_s: 0.2            # LB 辅助指标轮询周期；不用于决定归还
+  metrics_scrape_interval_s: 1.0  # vLLM /metrics 抓取周期
+  borrow_drain_timeout_s: 10.0
+  # patched = worker 侧 hook 打的 sleep/wake 补丁（默认）；
+  # collective_rpc = 免补丁降级路径（仅 DP=1 时可用）。
+  sleep_patch_mode: patched
+
+  borrowing:
+    # 空 = 对任意数量 policy 自动生成 1:1 全有序对（同构拓扑）。显式声明示例：
+    #   pairs:
+    #     # 2 个单节点 8 卡 home -> 1 个双节点 16 卡 donor guest
+    #     - {home: policy_1, donor: policy_2,
+    #        home_replicas_per_unit: 2, guest_replicas_per_unit: 1}
+    #     # 反向：1 个双节点 16 卡 home -> 2 个单节点 8 卡 donor guest
+    #     - {home: policy_2, donor: policy_1,
+    #        home_replicas_per_unit: 1, guest_replicas_per_unit: 2}
+    pairs: []
+    guest_replica_rank_offset: 10000  # 保证 guest 的 vLLM actor 名全局唯一
 
 # Shared rollout/framework wiring: n/top_p are projected into the per-policy
 # configs below; agent/custom.* are consumed by the outer trainer only.
