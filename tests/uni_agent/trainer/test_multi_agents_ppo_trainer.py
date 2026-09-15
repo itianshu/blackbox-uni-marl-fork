@@ -150,6 +150,9 @@ def _install_dependency_stubs():
     metric_mod.compute_throughout_metrics = getattr(
         metric_mod, "compute_throughout_metrics", lambda *args, **kwargs: {}
     )
+    metric_mod.process_validation_metrics = getattr(
+        metric_mod, "process_validation_metrics", lambda *args, **kwargs: {}
+    )
     utils_mod = sys.modules.setdefault("verl.trainer.ppo.utils", types.ModuleType("verl.trainer.ppo.utils"))
     utils_mod.create_rl_dataset = getattr(utils_mod, "create_rl_dataset", lambda *args, **kwargs: [])
     utils_mod.create_rl_sampler = getattr(utils_mod, "create_rl_sampler", lambda *args, **kwargs: None)
@@ -543,6 +546,7 @@ def _config_with_policies(config=None, policy_configs=None):
             project_name="test",
             experiment_name="test",
             logger=["console"],
+            val_before_train=False,
             v1=_NS(
                 trainer_mode="sync",
                 sync=_NS(parameter_sync_step=1),
@@ -571,6 +575,8 @@ def _config_with_policies(config=None, policy_configs=None):
             trainer.experiment_name = "test"
         if not hasattr(trainer, "logger"):
             trainer.logger = ["console"]
+        if not hasattr(trainer, "val_before_train"):
+            trainer.val_before_train = False
         if not hasattr(trainer, "v1"):
             trainer.v1 = _NS(
                 trainer_mode="sync",
@@ -1485,6 +1491,9 @@ class TestMultiAgentsPPOTrainer:
                 super().__init__(config)
                 self.local_trigger_steps = []
 
+            def on_sample_end(self):
+                return None
+
             def _compute_old_log_prob(self, batch, metrics=None):
                 self.local_trigger_steps.append(self.local_trigger_step)
                 return super()._compute_old_log_prob(batch, metrics)
@@ -1973,6 +1982,148 @@ class TestMultiAgentsPPOTrainer:
                 {"global_steps": 4},
             )
         ]
+
+    def test_validation_selects_one_final_record_per_mas_rollout(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        batch = SimpleKVBatchMeta(
+            partition_id="val",
+            keys=["uid_a_0_0", "uid_a_0_1", "uid_a_1_0"],
+            tags=[
+                {"uid": "uid_a", "sample_idx": 0, "record_idx": 0},
+                {"uid": "uid_a", "sample_idx": 0, "record_idx": 1},
+                {"uid": "uid_a", "sample_idx": 1, "record_idx": 0},
+            ],
+        )
+
+        assert MultiAgentsPPOTrainer._validation_final_record_keys(batch) == [
+            "uid_a_0_1",
+            "uid_a_1_0",
+        ]
+
+    def test_fit_runs_outer_initial_validation_and_supports_val_only(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class RecordingTrainer(RecordingMultiAgentsPPOTrainerMixin, MultiAgentsPPOTrainer):
+            pass
+
+        config = SimpleNamespace(
+            transfer_queue=SimpleNamespace(enable=False),
+            trainer=SimpleNamespace(total_training_steps=2, val_before_train=True, val_only=True),
+        )
+        trainer = _make_trainer(
+            RecordingTrainer,
+            config=config,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
+        )
+        trainer.init()
+        trainer.step_events = []
+        trainer._validate = lambda: {"val-core/test/reward/mean@1": 1.0}
+
+        trainer.fit(FakeAgentFrameworkRolloutAdapter.create())
+
+        assert trainer.global_steps == 0
+        assert trainer.step_events == []
+
+    def test_outer_validation_uses_val_partition_and_final_mas_records(self, monkeypatch):
+        _install_dependency_stubs()
+        import torch
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
+        )
+        trainer.init()
+        trainer.global_steps = 5
+        trainer.val_dataloader = FakeDataloader(
+            [{"raw_prompt": [[{"role": "user", "content": "question"}]]}]
+        )
+        trainer.agent_loop_manager = FakeAgentFrameworkRolloutAdapter()
+        val_batch = SimpleKVBatchMeta(
+            partition_id="val",
+            keys=["uid_0_0", "uid_0_1", "uid_1_0"],
+            tags=[
+                {"uid": "uid", "sample_idx": 0, "record_idx": 0},
+                {"uid": "uid", "sample_idx": 0, "record_idx": 1},
+                {"uid": "uid", "sample_idx": 1, "record_idx": 0},
+            ],
+        )
+        trainer.replay_buffer.next_sample = (val_batch, {})
+        calls = {"put": [], "get": [], "clear": []}
+        monkeypatch.setattr(
+            trainer_module.tq, "kv_batch_put", lambda **kwargs: calls["put"].append(kwargs)
+        )
+
+        def get_fields(**kwargs):
+            calls["get"].append(kwargs)
+            return {
+                "uid": ["uid", "uid"],
+                "rm_scores": [torch.tensor([0.0, 2.0]), torch.tensor([3.0])],
+                "num_turns": [2, 4],
+                "data_source": ["math", "math"],
+                "extra_fields": [{}, {}],
+            }
+
+        monkeypatch.setattr(trainer_module.tq, "kv_batch_get", get_fields, raising=False)
+        monkeypatch.setattr(
+            trainer_module.tq, "kv_clear", lambda **kwargs: calls["clear"].append(kwargs)
+        )
+
+        metrics = trainer._validate()
+
+        assert calls["put"][0]["partition_id"] == "val"
+        assert calls["get"][0]["keys"] == ["uid_0_1", "uid_1_0"]
+        assert calls["clear"] == [{"keys": val_batch.keys, "partition_id": "val"}]
+        assert trainer.replay_buffer.sample_calls == [
+            {"global_steps": 5, "partition_id": "val", "batch_size": 1}
+        ]
+        generated = trainer.agent_loop_manager.generated_prompts[0]
+        assert _td_get(generated, "validate") is True
+        assert _td_get(generated, "global_steps") == 5
+        assert metrics["validation/reward/mean"] == pytest.approx(2.5)
+        assert metrics["val-aux/num_turns/mean"] == pytest.approx(3.0)
+        assert trainer.policy_trainers["policy_1"].checkpoint_manager.update_weight_steps == []
+        assert trainer.policy_trainers["policy_1"].checkpoint_manager.sleep_calls == 0
+
+    def test_fit_validates_at_test_frequency_and_last_step(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class RecordingTrainer(RecordingMultiAgentsPPOTrainerMixin, MultiAgentsPPOTrainer):
+            pass
+
+        config = SimpleNamespace(
+            transfer_queue=SimpleNamespace(enable=False),
+            trainer=SimpleNamespace(
+                total_training_steps=3,
+                val_before_train=False,
+                test_freq=2,
+            ),
+        )
+        trainer = _make_trainer(
+            RecordingTrainer,
+            config=config,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
+        )
+        trainer.init()
+        trainer.step_events = []
+        validation_steps = []
+
+        def validate():
+            validation_steps.append(trainer.global_steps)
+            return {"validation/reward/mean": float(trainer.global_steps)}
+
+        trainer._validate = validate
+        trainer.fit(FakeAgentFrameworkRolloutAdapter.create())
+
+        assert validation_steps == [2, 3]
 
     def test_multi_policy_async_checkpoint_save_does_not_publish_outer_tracker(self, tmp_path):
         _install_dependency_stubs()
@@ -2760,6 +2911,90 @@ class TestMultiAgentsPPOTrainer:
         assert all(isinstance(call["timing_raw"], dict) for call in marked_timer.calls)
         assert all(call["kwargs"]["color"] == "red" for call in marked_timer.calls)
 
+    def test_sync_sample_end_exposes_missing_sleep_replicas_interface(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+        )
+        trainer.policy_trainers["policy_1"].checkpoint_manager = None
+
+        with pytest.raises(AttributeError):
+            trainer.on_sample_end()
+
+    def test_get_reward_handles_exposes_missing_policy_interface(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.policy_trainers = {"policy_1": SimpleNamespace()}
+
+        with pytest.raises(AttributeError):
+            trainer.get_reward_handles()
+
+    def test_trainer_hook_exposes_missing_lifecycle_interface(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.trainer_mode = "separate_async"
+        trainer.policy_trainers = {"policy_1": SimpleNamespace()}
+
+        with pytest.raises(AttributeError):
+            trainer._run_trainer_hook("policy_1", "on_step_end")
+
+    def test_update_weights_exposes_missing_checkpoint_interface(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.global_steps = 1
+        trainer.policy_trainers = {"policy_1": SimpleNamespace(checkpoint_manager=None)}
+
+        with pytest.raises(AttributeError):
+            trainer._update_weights_one_policy("policy_1")
+
+    def test_separate_async_hooks_isolate_and_prefix_policy_timing(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class SeparateAsyncHookTrainer(FakeV1PPOTrainer):
+            def on_step_end(self):
+                # Mirrors verl's hook: the native hook records an unprefixed
+                # stage in the trainer-owned timing context.
+                self.timing_raw["update_weights"] = self.policy_name
+
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={
+                "policy_1": _policy_config("policy_1"),
+                "policy_2": _policy_config("policy_2"),
+            },
+            policy_trainer_cls=SeparateAsyncHookTrainer,
+        )
+        trainer.trainer_mode = "separate_async"
+        trainer.global_steps = 7
+        trainer.timing_raw = {"step": 1.0}
+        trainer._sync_policy_runtime_context()
+
+        trainer.on_step_end()
+
+        assert trainer.timing_raw == {
+            "step": 1.0,
+            "policy_1/update_weights": "policy_1",
+            "policy_2/update_weights": "policy_2",
+        }
+        policy_timings = [
+            trainer.policy_trainers[name].timing_raw
+            for name in ("policy_1", "policy_2")
+        ]
+        assert policy_timings[0] is not policy_timings[1]
+        assert policy_timings == [
+            {"update_weights": "policy_1"},
+            {"update_weights": "policy_2"},
+        ]
+
     def test_fit_loads_outer_checkpoint_before_training_loop(self):
         _install_dependency_stubs()
 
@@ -2954,6 +3189,16 @@ class TestMultiAgentsPPOTrainer:
             }
         ]
         assert len(trainer.agent_loop_manager.generated_prompts) == 1
+
+    def test_submit_batch_to_rollout_is_train_only_like_native_v1(self):
+        _install_dependency_stubs()
+
+        import inspect
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        signature = inspect.signature(MultiAgentsPPOTrainer._submit_batch_to_rollout)
+
+        assert "partition_id" not in signature.parameters
 
     def test_rollout_submission_uses_sync_transfer_queue_api(self, monkeypatch):
         _install_dependency_stubs()

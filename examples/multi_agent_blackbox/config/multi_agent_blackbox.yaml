@@ -22,8 +22,8 @@ ppo_trainer_config_name: ppo_trainer
 data:
   train_files: ???
   val_files: ???
-  train_batch_size: 4
-  val_batch_size: 4
+  train_batch_size: 32
+  val_batch_size: 64
   return_raw_chat: true
   trust_remote_code: true
   dataloader_num_workers: 4
@@ -69,6 +69,9 @@ trainer:
   project_name: uni_marl
   experiment_name: uni_marl_blackbox_grpo
   total_training_steps: 100
+  val_before_train: false
+  val_only: false
+  test_freq: 5
   resume_mode: disable
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
   resume_from_path: null
@@ -82,7 +85,7 @@ trainer:
     trainer_mode: separate_async
     separate_async:
       # Async warmup batches pre-filled into TQ before the loop starts.
-      num_warmup_batches: 16
+      num_warmup_batches: 8
       # One rollout-weight sync cycle contains this many local PPO updates.
       # Must satisfy train_batch_size == parameter_sync_step * each policy's
       # actor_rollout_ref.actor.ppo_mini_batch_size.
@@ -130,10 +133,13 @@ actor_rollout_ref:
     # Kept explicit to mirror v1 separate_async's configuration-and-assertion
     # contract. It must satisfy data.train_batch_size ==
     # trainer.v1.separate_async.parameter_sync_step * this value.
-    ppo_mini_batch_size: 4
+    ppo_mini_batch_size: 32
   rollout:
     # GRPO group size: rollouts per prompt, shared by all policies (interpolated below).
     n: 4
+    val_kwargs:
+      n: 1
+      do_sample: false
     # Temperature is per-policy (policies.*.ppo_trainer_overrides.actor_rollout_ref
     # .rollout.temperature); the runner does not send it, so sampling uses each
     # policy's vLLM generation config, matching the log-prob recompute.

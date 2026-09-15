@@ -230,7 +230,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         if global_steps is None:
             raise ValueError("OpenAICompatibleAgentFramework requires prompts['global_steps']")
 
-        partition_id = "val" if "validate" in prompts.keys() else "train"
+        validate = prompts["validate"] if "validate" in prompts else False
+        partition_id = "val" if validate else "train"
         if partition_id == "val":
             val_kwargs = self._rollout_config.get("val_kwargs", {})
             num_sessions = int(val_kwargs.get("n"))
@@ -775,13 +776,16 @@ class MultiAgentFramework(AgentFramework):
             self._bg_thread.start()
         return self._bg_loop
 
-    async def _run_batch_to_tq_guarded(self, prompts, *, global_steps, partition_id, num_rollouts) -> None:
+    async def _run_batch_to_tq_guarded(
+        self, prompts, *, global_steps, partition_id, num_rollouts, rollout_metadata=None
+    ) -> None:
         try:
             stats = await self._run_batch_to_tq(
                 prompts,
                 global_steps=global_steps,
                 partition_id=partition_id,
                 num_rollouts=num_rollouts,
+                rollout_metadata=rollout_metadata,
             )
             logger.info(
                 "multi-agent generate_sequences summary: num_input_prompts=%s num_success_rollouts=%s "
@@ -822,10 +826,24 @@ class MultiAgentFramework(AgentFramework):
             raise ValueError("MultiAgentFramework requires prompts['global_steps']")
         global_steps = self._scalar(global_steps)
 
-        partition_id = "val" if "validate" in prompts.keys() else "train"
+        validate = prompts["validate"] if "validate" in prompts else False
+        partition_id = "val" if validate else "train"
+        rollout_metadata = None
         if partition_id == "val":
             val_kwargs = self._rollout_config.get("val_kwargs", {})
             num_rollouts = int(val_kwargs.get("n"))
+            if bool(val_kwargs.get("do_sample", True)):
+                sampling_params_override = {
+                    key: val_kwargs.get(key)
+                    for key in ("temperature", "top_p", "top_k")
+                    if val_kwargs.get(key) is not None
+                }
+            else:
+                sampling_params_override = {"temperature": 0.0, "top_p": 1.0, "top_k": -1}
+            rollout_metadata = {
+                "validate": True,
+                "sampling_params_override": sampling_params_override,
+            }
         else:
             num_rollouts = int(self._rollout_config.get("n"))
 
@@ -845,6 +863,7 @@ class MultiAgentFramework(AgentFramework):
                 global_steps=global_steps,
                 partition_id=partition_id,
                 num_rollouts=num_rollouts,
+                rollout_metadata=rollout_metadata,
             ),
             loop,
         )
@@ -859,6 +878,7 @@ class MultiAgentFramework(AgentFramework):
         global_steps: int,
         partition_id: str,
         num_rollouts: int,
+        rollout_metadata: dict[str, object] | None = None,
     ) -> dict:
         assert len(prompts) > 0, "generate_sequences requires a non-empty batch"
         if num_rollouts <= 0:
@@ -893,6 +913,7 @@ class MultiAgentFramework(AgentFramework):
                 global_steps=global_steps,
                 partition_id=partition_id,
                 num_rollouts=num_rollouts,
+                rollout_metadata=rollout_metadata,
             )
             for sample_index in range(len(prompts))
         ]
@@ -929,6 +950,7 @@ class MultiAgentFramework(AgentFramework):
         global_steps: int,
         partition_id: str,
         num_rollouts: int,
+        rollout_metadata: dict[str, object] | None = None,
     ) -> dict:
         uid = str(sample_fields["uid"])
 
@@ -939,6 +961,7 @@ class MultiAgentFramework(AgentFramework):
                 sample_index=sample_index,
                 sample_fields=sample_fields,
                 sample_idx=sample_idx,
+                rollout_metadata=rollout_metadata,
                 runner_kwargs={
                     key: sample_fields[key]
                     for key in ("tools_kwargs", "agent_name")
@@ -1000,6 +1023,7 @@ class MultiAgentFramework(AgentFramework):
         sample_fields: dict[str, object],
         sample_idx: int,
         runner_kwargs: dict[str, object] | None = None,
+        rollout_metadata: dict[str, object] | None = None,
     ) -> tuple[object, list[Trajectory]]:
         async def run_and_annotate() -> tuple[object, list[Trajectory]]:
             rollout_result = await self.run_rollout(
@@ -1007,6 +1031,7 @@ class MultiAgentFramework(AgentFramework):
                 rollout_id=rollout_id,
                 sample_index=sample_index,
                 runner_kwargs=runner_kwargs,
+                metadata=rollout_metadata,
             )
             if not rollout_result.trajectories:
                 return rollout_result, []
@@ -1033,14 +1058,18 @@ class MultiAgentFramework(AgentFramework):
         rollout_id: str | None = None,
         sample_index: int = 0,
         runner_kwargs: dict[str, object] | None = None,
+        metadata: dict[str, object] | None = None,
     ):
         """Run one external MAS rollout and return finalized Gateway trajectories."""
         rollout_id = rollout_id or f"multi-agent-rollout-{sample_index}-{uuid4().hex}"
         rollout = None
+        create_kwargs = {"role_policy_mapping": self.role_policy_mapping}
+        if metadata is not None:
+            create_kwargs["metadata"] = dict(metadata)
         create_task = asyncio.create_task(
             self.session_runtime.create_multi_agent_rollout(
                 rollout_id,
-                role_policy_mapping=self.role_policy_mapping,
+                **create_kwargs,
             )
         )
         try:

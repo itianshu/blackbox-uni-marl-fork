@@ -812,6 +812,106 @@ class TestMultiAgentFrameworkTQ:
     def test_generate_sequences_writes_rollout_records_with_v1_compatible_keys(self):
         asyncio.run(self._run_generate_sequences())
 
+    def test_generate_sequences_uses_validate_value_for_partition(self):
+        asyncio.run(self._run_generate_sequences_with_validate_value(False))
+        asyncio.run(self._run_generate_sequences_with_validate_value(True))
+
+    def test_generate_sequences_forwards_validation_sampling_override(self):
+        asyncio.run(self._run_generate_sequences_forwards_validation_sampling_override())
+
+    async def _run_generate_sequences_forwards_validation_sampling_override(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.framework import framework as framework_module
+        from uni_agent.trainer.framework.framework import MultiAgentFramework
+
+        recorded_tq = RecordingTQ()
+        original_tq = framework_module.tq
+        original_converter = framework_module._list_of_tq_fields_to_tensordict
+        framework_module.tq = recorded_tq
+        framework_module._list_of_tq_fields_to_tensordict = lambda fields: fields
+
+        async def runner(**kwargs):
+            return {"reward_info": {"reward_score": 0.75}}
+
+        prompts = TensorDict(
+            {
+                "uid": NonTensorStack(NonTensorData("prompt-uid")),
+                "raw_prompt": NonTensorStack(NonTensorData([{"role": "user", "content": "solve"}])),
+                "global_steps": torch.tensor([9]),
+            },
+            batch_size=1,
+        )
+        prompts.set_non_tensor("validate", True)
+        runtime = FakeMultiAgentSessionRuntime()
+        framework = MultiAgentFramework(
+            session_runtime=runtime,
+            multi_agent_runner=runner,
+            role_policy_mapping={"agent_1": "policy_1"},
+            rollout_config={
+                "n": 1,
+                "val_kwargs": {"n": 1, "do_sample": False, "temperature": 0.7, "top_p": 0.4, "top_k": 8},
+            },
+        )
+
+        try:
+            await framework.generate_sequences(prompts)
+            background_task = next(iter(framework._bg_tasks))
+            await asyncio.wrap_future(background_task)
+        finally:
+            framework_module.tq = original_tq
+            framework_module._list_of_tq_fields_to_tensordict = original_converter
+
+        assert runtime.created[0]["metadata"] == {
+            "validate": True,
+            "sampling_params_override": {"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+        }
+
+    async def _run_generate_sequences_with_validate_value(self, validate):
+        _install_dependency_stubs()
+        from uni_agent.trainer.framework import framework as framework_module
+        from uni_agent.trainer.framework.framework import MultiAgentFramework
+
+        recorded_tq = RecordingTQ()
+        original_tq = framework_module.tq
+        original_converter = framework_module._list_of_tq_fields_to_tensordict
+        framework_module.tq = recorded_tq
+        framework_module._list_of_tq_fields_to_tensordict = lambda fields: fields
+
+        async def runner(**kwargs):
+            return {"reward_info": {"reward_score": 0.75}}
+
+        prompts = TensorDict(
+            {
+                "uid": NonTensorStack(NonTensorData("prompt-uid")),
+                "raw_prompt": NonTensorStack(NonTensorData([
+                    {"role": "user", "content": "solve"}
+                ])),
+                "global_steps": torch.tensor([9]),
+            },
+            batch_size=1,
+        )
+        prompts.set_non_tensor("validate", validate)
+        runtime = FakeMultiAgentSessionRuntime()
+        framework = MultiAgentFramework(
+            session_runtime=runtime,
+            multi_agent_runner=runner,
+            role_policy_mapping={"agent_1": "policy_1"},
+            rollout_config={"n": 1, "val_kwargs": {"n": 2}},
+        )
+
+        try:
+            await framework.generate_sequences(prompts)
+            background_task = next(iter(framework._bg_tasks))
+            await asyncio.wrap_future(background_task)
+        finally:
+            framework_module.tq = original_tq
+            framework_module._list_of_tq_fields_to_tensordict = original_converter
+
+        expected_partition = "val" if validate else "train"
+        assert recorded_tq.batch_puts[0]["partition_id"] == expected_partition
+        assert recorded_tq.kv_puts[-1]["partition_id"] == expected_partition
+        assert len(runtime.created) == (2 if validate else 1)
+
     async def _run_generate_sequences(self):
         _install_dependency_stubs()
         from uni_agent.trainer.framework import framework as framework_module
@@ -1214,6 +1314,43 @@ class TestBuildSamplingParams:
 
         assert params["logprobs"] is False
 
+    def test_validation_override_wins_over_request_sampling_params(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.gateway.gateway import _build_sampling_params
+
+        params = _build_sampling_params(
+            payload={"top_p": 0.2, "top_k": 4, "max_tokens": 16},
+            base_sampling_params={"temperature": 0.8},
+            allowed_request_sampling_param_keys=frozenset({"top_p", "top_k", "max_tokens"}),
+            sampling_params_override={"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+        )
+
+        assert params["temperature"] == 0.0
+        assert params["top_p"] == 1.0
+        assert params["top_k"] == -1
+        assert params["max_tokens"] == 16
+
+    def test_validation_override_can_force_greedy_sampling(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.gateway.gateway import _build_sampling_params
+
+        params = _build_sampling_params(
+            payload={},
+            base_sampling_params={"temperature": 0.8, "top_p": 0.9, "top_k": 20},
+            allowed_request_sampling_param_keys=frozenset(),
+            sampling_params_override={
+                "do_sample": False,
+                "temperature": 0.7,
+                "top_p": 0.4,
+                "top_k": 8,
+            },
+        )
+
+        assert "do_sample" not in params
+        assert params["temperature"] == 0.0
+        assert params["top_p"] == 1.0
+        assert params["top_k"] == -1
+
     def test_default_allowed_request_keys_include_logprobs(self):
         _install_dependency_stubs()
         from uni_agent.trainer.gateway.gateway import _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
@@ -1298,6 +1435,43 @@ class TestBuildSamplingParams:
 
     def test_rollout_uses_policy_specific_tokenizer(self):
         asyncio.run(self._run_rollout_uses_policy_specific_tokenizer())
+
+    def test_rollout_validation_sampling_override_wins_over_request(self):
+        asyncio.run(self._run_rollout_validation_sampling_override_wins_over_request())
+
+    async def _run_rollout_validation_sampling_override_wins_over_request(self):
+        import httpx
+
+        backend = RecordingBackend([("validation", "completed")])
+        actor = _make_gateway(backend)
+        await actor.create_multi_agent_rollout(
+            "rollout-validation",
+            role_policy_mapping={"agent_1": "policy_1"},
+            metadata={
+                "validate": True,
+                "sampling_params_override": {"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+            },
+        )
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=actor._app),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/rollouts/rollout-validation/v1/chat/completions",
+                json={
+                    "model": "agent_1",
+                    "messages": [{"role": "user", "content": "validate"}],
+                    "temperature": 0.8,
+                    "top_p": 0.2,
+                    "top_k": 4,
+                },
+            )
+
+        assert response.status_code == 200
+        assert backend.requests[0]["sampling_params"]["temperature"] == 0.0
+        assert backend.requests[0]["sampling_params"]["top_p"] == 1.0
+        assert backend.requests[0]["sampling_params"]["top_k"] == -1
 
     def test_rollout_accumulates_version_range_across_multi_turn_generation(self):
         asyncio.run(self._run_rollout_accumulates_version_range_across_multi_turn_generation())

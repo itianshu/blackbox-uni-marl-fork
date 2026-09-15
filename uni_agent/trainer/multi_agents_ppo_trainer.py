@@ -4,6 +4,7 @@ import logging
 import os
 from uuid import uuid4
 import posixpath
+from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -23,6 +24,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    process_validation_metrics,
 )
 from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
@@ -215,10 +217,7 @@ class MultiAgentsPPOTrainer:
         """
         handles: list[Any] = []
         for trainer in self.policy_trainers.values():
-            get_reward_handles = getattr(trainer, "get_reward_handles", None)
-            if not callable(get_reward_handles):
-                continue
-            trainer_handles = get_reward_handles()
+            trainer_handles = trainer.get_reward_handles()
             if trainer_handles:
                 handles.extend(list(trainer_handles))
         return handles or None
@@ -268,17 +267,33 @@ class MultiAgentsPPOTrainer:
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
-        # verl semantics: global_steps is 1-based and is advanced before
-        # on_train_begin, so warmup batches and update_weights/rollout version
-        # tags all use the current step number.
-        self.global_steps += 1
-        self._sync_policy_runtime_context()
-        self._reissue_inflight_prompts()
-        self.on_train_begin()
         succeeded = False
         try:
+            # Native v1 validates the restored policy before advancing to the
+            # first training step. Validation is outer-owned because one MAS
+            # rollout can produce records for multiple policies.
+            if self.config.trainer.get("val_before_train", True):
+                val_metrics = self._validate()
+                if not val_metrics:
+                    raise RuntimeError("Validation produced no metrics")
+                self.logger.log(data=val_metrics, step=self.global_steps)
+                if self.config.trainer.get("val_only", False):
+                    succeeded = True
+                    return
+
+            # verl semantics: global_steps is 1-based and is advanced before
+            # on_train_begin, so warmup batches and update_weights/rollout version
+            # tags all use the current step number.
+            self.global_steps += 1
+            self._sync_policy_runtime_context()
+            self._reissue_inflight_prompts()
+            self.on_train_begin()
             while self.global_steps <= self.total_training_steps:
                 step_metrics = self.train_step()
+                is_last_step = self.global_steps >= self.total_training_steps
+                test_freq = self.config.trainer.get("test_freq", -1)
+                if test_freq > 0 and (is_last_step or self.global_steps % test_freq == 0):
+                    step_metrics.update(self._validate())
                 # Mirror verl v1 trainer.fit(): record per-step metrics
                 # (loss/adv/grad_norm, prefixed per policy) to the configured
                 # backend. Sorting keeps the two policies' metrics grouped.
@@ -1219,6 +1234,10 @@ class MultiAgentsPPOTrainer:
     def _submit_batch_to_rollout(self, batch) -> int:
         """Register prompts in TransferQueue and dispatch them for generation.
 
+        This is the training-only submission path, matching native v1's
+        ``PPOTrainer._submit_batch_to_rollout`` contract. Validation uses its
+        own explicit ``val`` registration in ``_validate`` below.
+
         Returns the number of submitted prompts (refill_fn contract).
         """
         if batch is None:
@@ -1256,10 +1275,171 @@ class MultiAgentsPPOTrainer:
         self.agent_loop_manager.generate_sequences(batch)
         return len(uid_values)
 
+    @staticmethod
+    def _validation_final_record_keys(batch) -> list[str]:
+        """Return the final record for each complete MAS rollout.
+
+        A single ``{uid, sample_idx}`` is one MAS rollout and may contain one
+        trajectory per agent. The final record is the only record counted as a
+        validation sample; retaining the other keys lets callers clean up all
+        records from TransferQueue.
+        """
+        final: dict[tuple[str, int], tuple[int, int, str]] = {}
+        for position, (key, tag) in enumerate(zip(batch.keys, batch.tags, strict=True)):
+            key_parts = str(key).rsplit("_", 2)
+            uid = str(tag.get("uid") or key_parts[0])
+            try:
+                sample_value = tag.get("sample_idx")
+                sample_idx = int(sample_value if sample_value is not None else key_parts[1])
+            except (IndexError, TypeError, ValueError):
+                sample_idx = 0
+            try:
+                record_value = tag.get("record_idx")
+                record_idx = int(record_value if record_value is not None else key_parts[2])
+            except (IndexError, TypeError, ValueError):
+                record_idx = position
+            group_key = (uid, sample_idx)
+            previous = final.get(group_key)
+            if previous is None or record_idx > previous[0]:
+                final[group_key] = (record_idx, position, str(key))
+        return [item[2] for item in sorted(final.values(), key=lambda item: item[1])]
+
+    @staticmethod
+    def _validation_values(data, key: str) -> list[Any]:
+        value = data.get(key) if hasattr(data, "get") else None
+        if value is None:
+            return []
+        if isinstance(value, NonTensorData):
+            return [value.data]
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return [item.data if isinstance(item, NonTensorData) else item for item in value]
+        return [value]
+
+    def _validate(self) -> dict[str, Any]:
+        """Run validation entirely at the multi-agent orchestration layer."""
+        if getattr(self, "val_dataloader", None) is None:
+            return {}
+
+        data_sources: list[str] = []
+        sample_uids: list[str] = []
+        sample_turns: list[float] = []
+        reward_values: list[float] = []
+        reward_extra_infos: dict[str, list[Any]] = defaultdict(list)
+        timing_raw: dict[str, Any] = {}
+        self.timing_raw = timing_raw
+
+        for batch_dict in self.val_dataloader:
+            batch_dict = dict(batch_dict)
+            raw_prompts = batch_dict.get("raw_prompt")
+            if raw_prompts is None:
+                raise ValueError("Validation batch must contain raw_prompt")
+            batch_dict["uid"] = np.array([str(uuid4()) for _ in range(len(raw_prompts))], dtype=object)
+            batch = tu.get_tensordict(batch_dict)
+            tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(batch, "validate", True)
+            # Match native v1's separate validation path: register validation
+            # prompt markers directly in the ``val`` TQ partition instead of
+            # widening the train-only submission helper with a partition arg.
+            tags = [
+                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps}
+                for _ in range(len(batch))
+            ]
+            tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
+            self.agent_loop_manager.generate_sequences(batch)
+            sampled = self.replay_buffer.sample(
+                global_steps=self.global_steps,
+                partition_id="val",
+                batch_size=len(batch),
+            )
+
+            val_batch, _ = sampled if isinstance(sampled, tuple) else (sampled, {})
+            if not val_batch.keys:
+                raise RuntimeError("Validation replay buffer returned no trajectories")
+            try:
+                final_keys = self._validation_final_record_keys(val_batch)
+                fields = tq.kv_batch_get(
+                    keys=final_keys,
+                    partition_id="val",
+                    select_fields=["uid", "rm_scores", "num_turns", "data_source", "extra_fields"],
+                )
+                uid_values = self._validation_values(fields, "uid")
+                score_values = self._validation_values(fields, "rm_scores")
+                turn_values = self._validation_values(fields, "num_turns")
+                source_values = self._validation_values(fields, "data_source")
+                extra_values = self._validation_values(fields, "extra_fields")
+                if len(score_values) != len(final_keys):
+                    raise RuntimeError("Validation trajectories are missing rm_scores")
+                for index, score in enumerate(score_values):
+                    score_tensor = torch.as_tensor(score)
+                    reward = float(score_tensor.sum().item())
+                    reward_values.append(reward)
+                    sample_uids.append(str(uid_values[index]) if index < len(uid_values) else final_keys[index])
+                    sample_turns.append(float(turn_values[index]) if index < len(turn_values) else 0.0)
+                    data_sources.append(str(source_values[index]) if index < len(source_values) else "unknown")
+                    extra = extra_values[index] if index < len(extra_values) else {}
+                    extra = getattr(extra, "data", extra)
+                    current_extra = (
+                        extra.get("reward_extra_info", {}) if isinstance(extra, dict) else {}
+                    )
+                    sample_position = len(reward_extra_infos["reward"])
+                    for key in reward_extra_infos.keys() - {"reward"} - current_extra.keys():
+                        reward_extra_infos[key].append(None)
+                    for key, value in current_extra.items():
+                        if key not in reward_extra_infos:
+                            reward_extra_infos[key] = [None] * sample_position
+                        reward_extra_infos[key].append(value)
+                    reward_extra_infos["reward"].append(reward)
+            finally:
+                tq.kv_clear(keys=val_batch.keys, partition_id="val")
+
+        if not reward_values:
+            return {}
+        metrics = {}
+        try:
+            metrics.update(
+                self._format_validation_metrics(
+                    data_sources, sample_uids, reward_extra_infos, sample_turns
+                )
+            )
+        except (ImportError, AttributeError):
+            metrics = {}
+        if not metrics:
+            metrics["validation/reward/mean"] = float(np.mean(reward_values))
+            metrics["validation/reward/min"] = float(np.min(reward_values))
+            metrics["validation/reward/max"] = float(np.max(reward_values))
+        metrics["val-aux/num_turns/mean"] = float(np.mean(sample_turns))
+        metrics["val-aux/num_turns/min"] = float(np.min(sample_turns))
+        metrics["val-aux/num_turns/max"] = float(np.max(sample_turns))
+        return metrics
+
+    @staticmethod
+    def _format_validation_metrics(data_sources, sample_uids, reward_extra_infos, sample_turns):
+        structured = process_validation_metrics(data_sources, sample_uids, reward_extra_infos)
+        metrics = {}
+        for data_source, variables in structured.items():
+            for variable, values in variables.items():
+                core_variable = "acc" if "acc" in variables else "reward"
+                n_max = max(int(name.split("@")[-1].split("/")[0]) for name in values)
+                for name, value in values.items():
+                    is_core = (
+                        variable == core_variable
+                        and name.startswith(("mean", "maj", "best"))
+                        and f"@{n_max}" in name
+                    )
+                    section = "val-core" if is_core else "val-aux"
+                    metrics[f"{section}/{data_source}/{variable}/{name}"] = value
+        return metrics
+
     def _sync_policy_runtime_context(self) -> None:
         for trainer in self.policy_trainers.values():
             trainer.global_steps = self.global_steps
-            trainer.timing_raw = self.timing_raw
+            # In separate_async, lifecycle hooks receive a private timing
+            # context in _run_trainer_hook; never share the outer dict across
+            # concurrently executing policy hooks.
+            if self.trainer_mode == "sync":
+                trainer.timing_raw = self.timing_raw
 
     def on_train_begin(self) -> None:
         if self.config.get("skip") is not None:
@@ -1342,27 +1522,44 @@ class MultiAgentsPPOTrainer:
             for policy_name in self.policy_trainers
         ]
         for future in futures:
-            future.result()
+            policy_name, per_policy_timing = future.result()
+            self._merge_policy_timing(policy_name, per_policy_timing)
 
-    def _run_trainer_hook(self, policy_name: str, hook_name: str) -> None:
-        """Run one policy trainer's verl lifecycle hook (e.g. on_step_end/on_sample_end)."""
+    def _run_trainer_hook(self, policy_name: str, hook_name: str) -> tuple[str, dict[str, Any]]:
+        """Run one policy trainer lifecycle hook with an isolated timing context.
+
+        Native ``separate_async`` hooks record stages such as ``update_weights``
+        in ``trainer.timing_raw``.  Because policy hooks run concurrently, each
+        policy receives a private dictionary; the caller merges it back into the
+        outer timing context with a policy-qualified key.
+        """
         trainer = self.policy_trainers[policy_name]
-        hook = getattr(trainer, hook_name, None)
-        if callable(hook):
-            hook()
+        timing_raw: dict[str, Any] = {}
+        if self.trainer_mode == "separate_async":
+            trainer.timing_raw = timing_raw
+        if hook_name == "on_step_end":
+            trainer.on_step_end()
+        elif hook_name == "on_sample_end":
+            trainer.on_sample_end()
+        else:
+            raise ValueError(f"Unsupported trainer lifecycle hook: {hook_name!r}")
+        return policy_name, timing_raw
+
+    def _merge_policy_timing(self, policy_name: str, timing_raw: Mapping[str, Any] | None) -> None:
+        """Merge one policy's hook timings into outer ``timing_raw`` safely."""
+        if not timing_raw:
+            return
+        prefix = f"{policy_name}/"
+        for key, value in timing_raw.items():
+            qualified_key = key if str(key).startswith(prefix) else f"{prefix}{key}"
+            self.timing_raw[qualified_key] = value
 
     def _update_weights_one_policy(self, policy_name: str) -> tuple[None, dict[str, Any]]:
         """Wake one policy's vLLM replicas with the current weights."""
         timing_raw: dict[str, Any] = {}
         trainer = self.policy_trainers[policy_name]
-        checkpoint_manager = getattr(trainer, "checkpoint_manager", None)
-        if checkpoint_manager is None:
-            return None, timing_raw
-        update_weights = getattr(checkpoint_manager, "update_weights", None)
-        if not callable(update_weights):
-            return None, timing_raw
         with marked_timer(f"{policy_name}/update_weights", timing_raw, color="red"):
-            update_weights(self.global_steps)
+            trainer.checkpoint_manager.update_weights(self.global_steps)
         return None, timing_raw
 
     def on_sample_begin(self) -> None:
@@ -1372,14 +1569,8 @@ class MultiAgentsPPOTrainer:
         self._sync_policy_runtime_context()
         if self.trainer_mode == "sync":
             for policy_name, trainer in self.policy_trainers.items():
-                checkpoint_manager = getattr(trainer, "checkpoint_manager", None)
-                if checkpoint_manager is None:
-                    continue
-                sleep_replicas = getattr(checkpoint_manager, "sleep_replicas", None)
-                if not callable(sleep_replicas):
-                    continue
                 with marked_timer(f"{policy_name}/sleep_replicas", self.timing_raw, color="red"):
-                    sleep_replicas()
+                    trainer.checkpoint_manager.sleep_replicas()
             return
         # separate_async: delegate to verl's per-policy on_sample_end.
         # On the first completed sample, hybrid replicas switch from rollout
@@ -1389,7 +1580,8 @@ class MultiAgentsPPOTrainer:
             for policy_name in self.policy_trainers
         ]
         for future in futures:
-            future.result()
+            policy_name, per_policy_timing = future.result()
+            self._merge_policy_timing(policy_name, per_policy_timing)
 
     @staticmethod
     def _prefix_metrics(metrics: dict[str, Any], policy_name: str, policy_metrics: dict[str, Any]) -> None:

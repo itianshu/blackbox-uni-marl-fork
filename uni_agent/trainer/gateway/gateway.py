@@ -177,11 +177,18 @@ def _build_sampling_params(
     *,
     base_sampling_params: dict[str, Any],
     allowed_request_sampling_param_keys: frozenset[str],
+    sampling_params_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     sampling_params = dict(base_sampling_params)
     for key in allowed_request_sampling_param_keys:
         if key in payload:
             sampling_params[key] = payload[key]
+    if sampling_params_override:
+        override = dict(sampling_params_override)
+        do_sample = override.pop("do_sample", None)
+        if do_sample is False:
+            override = {"temperature": 0.0, "top_p": 1.0, "top_k": -1}
+        sampling_params.update(override)
     # RL rollouts need per-token log probs so that rollout_log_probs land in
     # TransferQueue instead of zeros. Request them by default; clients can opt
     # out explicitly with ``logprobs=false`` in the payload.
@@ -796,6 +803,7 @@ class _GatewayActor:
                     payload,
                     base_sampling_params=self._base_sampling_params,
                     allowed_request_sampling_param_keys=self._allowed_request_sampling_param_keys,
+                    sampling_params_override=session.metadata.get("sampling_params_override"),
                 )
 
             try:
