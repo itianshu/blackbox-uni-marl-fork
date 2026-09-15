@@ -1,8 +1,10 @@
+import ast
 import asyncio
 import inspect
 import sys
 import types
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -44,7 +46,9 @@ def _install_dependency_stubs():
         "verl",
         "verl.utils",
     ]:
-        sys.modules.setdefault(name, types.ModuleType(name))
+        module = sys.modules.setdefault(name, types.ModuleType(name))
+        if not hasattr(module, "__path__"):
+            module.__path__ = []
 
     tensordict_utils_mod = sys.modules.get("verl.utils.tensordict_utils")
     if tensordict_utils_mod is None:
@@ -86,13 +90,15 @@ def _install_dependency_stubs():
         tensordict_utils_mod.get = get
     sys.modules["verl.utils"].tensordict_utils = tensordict_utils_mod
 
-    if "transfer_queue" not in sys.modules:
-        tq_stub = types.ModuleType("transfer_queue")
-        sys.modules["transfer_queue"] = tq_stub
-    tq_stub = sys.modules["transfer_queue"]
+    tq_stub = types.ModuleType("transfer_queue")
     for name in ("init", "close", "kv_batch_put", "kv_put", "kv_clear"):
-        if not hasattr(tq_stub, name):
-            setattr(tq_stub, name, lambda *args, **kwargs: None)
+        setattr(tq_stub, name, lambda *args, **kwargs: None)
+    tq_stub.KVBatchMeta = SimpleKVBatchMeta
+    sys.modules["transfer_queue"] = tq_stub
+
+    trainer_module = sys.modules.get("uni_agent.trainer.multi_agents_ppo_trainer")
+    if trainer_module is not None:
+        trainer_module.tq = tq_stub
 
     if "verl.utils.debug" not in sys.modules:
         for name in [
@@ -125,6 +131,44 @@ def _install_dependency_stubs():
 
         tracking_mod.Tracking = Tracking
     sys.modules["verl.utils"].tracking = tracking_mod
+    skip_mod = sys.modules.setdefault("verl.utils.skip", types.ModuleType("verl.utils.skip"))
+    if not hasattr(skip_mod, "SkipManager"):
+        skip_mod.SkipManager = type("SkipManager", (), {"init": staticmethod(lambda config: None)})
+    sys.modules["verl.utils"].skip = skip_mod
+
+    trainer_mod = sys.modules.setdefault("verl.trainer", types.ModuleType("verl.trainer"))
+    ppo_mod = sys.modules.setdefault("verl.trainer.ppo", types.ModuleType("verl.trainer.ppo"))
+    v1_mod = sys.modules.setdefault("verl.trainer.ppo.v1", types.ModuleType("verl.trainer.ppo.v1"))
+    trainer_mod.ppo = ppo_mod
+    ppo_mod.v1 = v1_mod
+
+    metric_mod = sys.modules.setdefault(
+        "verl.trainer.ppo.metric_utils", types.ModuleType("verl.trainer.ppo.metric_utils")
+    )
+    metric_mod.compute_data_metrics = getattr(metric_mod, "compute_data_metrics", lambda *args, **kwargs: {})
+    metric_mod.compute_timing_metrics = getattr(metric_mod, "compute_timing_metrics", lambda *args, **kwargs: {})
+    metric_mod.compute_throughout_metrics = getattr(
+        metric_mod, "compute_throughout_metrics", lambda *args, **kwargs: {}
+    )
+    utils_mod = sys.modules.setdefault("verl.trainer.ppo.utils", types.ModuleType("verl.trainer.ppo.utils"))
+    utils_mod.create_rl_dataset = getattr(utils_mod, "create_rl_dataset", lambda *args, **kwargs: [])
+    utils_mod.create_rl_sampler = getattr(utils_mod, "create_rl_sampler", lambda *args, **kwargs: None)
+    replay_mod = sys.modules.setdefault(
+        "verl.trainer.ppo.v1.replay_buffer", types.ModuleType("verl.trainer.ppo.v1.replay_buffer")
+    )
+    replay_mod.ReplayBuffer = getattr(replay_mod, "ReplayBuffer", object)
+    replay_mod.ReplayBufferAsync = getattr(replay_mod, "ReplayBufferAsync", object)
+    v1_utils_mod = sys.modules.setdefault(
+        "verl.trainer.ppo.v1.utils", types.ModuleType("verl.trainer.ppo.v1.utils")
+    )
+    v1_utils_mod.MetricsAggregator = getattr(v1_utils_mod, "MetricsAggregator", object)
+    dataset_mod = sys.modules.setdefault(
+        "verl.utils.dataset.rl_dataset", types.ModuleType("verl.utils.dataset.rl_dataset")
+    )
+    dataset_mod.collate_fn = getattr(dataset_mod, "collate_fn", lambda batch: batch)
+
+    protocol_mod = sys.modules.setdefault("verl.protocol", types.ModuleType("verl.protocol"))
+    protocol_mod.DataProto = getattr(protocol_mod, "DataProto", object)
 
 
 class RecordingLLMClient:
@@ -298,6 +342,9 @@ class FakeSharedAdvantagePPOTrainer(FakeV1PPOTrainer):
         super()._record_stage(stage, batch, metrics)
         return batch
 
+    def _get_n_gpus_for_throughput(self):
+        return 1
+
     def _compute_advantage(self, batch, metrics=None):
         self.stage_calls.append(("advantage", list(batch.keys)))
         rollout_scores = {}
@@ -470,6 +517,12 @@ def _config_with_policies(config=None, policy_configs=None):
         config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
     else:
         config = _ns_deep(config) if config is not None else _NS()
+    if not hasattr(config, "ppo_trainer_config_name"):
+        if isinstance(config, DictConfig):
+            with open_dict(config):
+                config.ppo_trainer_config_name = "test_policy_config"
+        else:
+            config.ppo_trainer_config_name = "test_policy_config"
     # MultiAgentsPPOTrainer.__init__ reads these outer fields directly (mirrors
     # the guaranteed keys in the real multi_agent_blackbox.yaml).
     if getattr(config, "data", None) is None:
@@ -527,7 +580,6 @@ def _config_with_policies(config=None, policy_configs=None):
     if policy_configs is not None:
         config.policies = {
             policy_name: _NS(
-                ppo_trainer_config_name="test_policy_config",
                 ppo_trainer_overrides={},
             )
             for policy_name, policy_config in policy_configs.items()
@@ -558,6 +610,53 @@ def _install_policy_trainer_stubs(policy_trainer_cls):
     async_mod = types.ModuleType("uni_agent.trainer.single_async_ppo_trainer")
     async_mod.SingleAsyncPPOTrainer = policy_trainer_cls
     sys.modules["uni_agent.trainer.single_async_ppo_trainer"] = async_mod
+
+
+def _install_metrics_aggregator_stub():
+    from collections import defaultdict
+
+    utils_mod = types.ModuleType("verl.trainer.ppo.v1.utils")
+
+    class MetricsAggregator:
+        def __init__(self):
+            self.values = defaultdict(list)
+            self.weights = defaultdict(list)
+
+        def add_step_metrics(self, metrics, sample_count=0):
+            for key, value in metrics.items():
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                self.values[key].append(float(value))
+                self.weights[key].append(sample_count)
+
+        def get_aggregated_metrics(self):
+            result = {}
+            for key, values in self.values.items():
+                if key in {
+                    "training/off_policy/evicted_samples",
+                    "training/filter_groups/evicted_samples",
+                    "training/filter_groups/discarded_surplus_samples",
+                    "training/rollout_failure/evicted_samples",
+                }:
+                    result[key] = sum(values)
+                elif key.endswith("/max"):
+                    result[key] = max(values)
+                elif key.endswith("/min"):
+                    result[key] = min(values)
+                else:
+                    weights = self.weights[key]
+                    result[key] = sum(value * weight for value, weight in zip(values, weights)) / sum(weights)
+            if {"global_seqlen/min", "global_seqlen/max"}.issubset(result):
+                result["global_seqlen/minmax_diff"] = (
+                    result["global_seqlen/max"] - result["global_seqlen/min"]
+                )
+            return result
+
+    utils_mod.MetricsAggregator = MetricsAggregator
+    sys.modules["verl.trainer.ppo.v1.utils"] = utils_mod
+    trainer_module = sys.modules.get("uni_agent.trainer.multi_agents_ppo_trainer")
+    if trainer_module is not None:
+        trainer_module.MetricsAggregator = MetricsAggregator
 
 
 def _test_multi_agents_trainer_cls(
@@ -697,7 +796,39 @@ class TestMultiAgentsPPOTrainer:
         assert not hasattr(MultiAgentsPPOTrainer, "build_gateway_actor_kwargs")
         assert not hasattr(MultiAgentsPPOTrainer, "collect_reward_loop_worker_handles")
         assert not hasattr(MultiAgentsPPOTrainer, "prepare_policy_batches_for_advantage")
+        assert not hasattr(MultiAgentsPPOTrainer, "_call_v1_stage")
         assert hasattr(MultiAgentsPPOTrainer, "_sync_policy_runtime_context")
+
+    def test_stable_dependencies_are_imported_at_module_level(self):
+        source_path = Path(__file__).parents[3] / "uni_agent" / "trainer" / "multi_agents_ppo_trainer.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        allowed_inline_modules = {
+            "uni_agent.trainer.single_async_ppo_trainer",
+            "uni_agent.trainer.single_ppo_trainer",
+        }
+        unexpected_inline_imports = [
+            f"{module}:{node.lineno}"
+            for scope in ast.walk(tree)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+            for node in ast.walk(scope)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for module in ([node.module] if isinstance(node, ast.ImportFrom) else [alias.name for alias in node.names])
+            if module not in allowed_inline_modules
+        ]
+
+        assert unexpected_inline_imports == []
+
+    def test_data_metric_dependencies_are_imported_at_module_level(self):
+        source_path = Path(__file__).parents[3] / "uni_agent" / "trainer" / "multi_agents_ppo_trainer.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+
+        assert {"DataProto", "compute_data_metrics"} <= imported_names
 
     def test_creates_one_v1_trainer_per_policy_config(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -724,13 +855,254 @@ class TestMultiAgentsPPOTrainer:
         with pytest.raises(ValueError, match="Unsupported trainer.v1.trainer_mode: 'colocate_async'"):
             _make_trainer(
                 MultiAgentsPPOTrainer,
+                config=SimpleNamespace(
+                    data=SimpleNamespace(train_batch_size=4),
+                    trainer=SimpleNamespace(
+                        v1=SimpleNamespace(
+                            trainer_mode="colocate_async",
+                            colocate_async=SimpleNamespace(parameter_sync_step=1),
+                        )
+                    ),
+                ),
                 policy_configs={
                     "policy_1": _policy_config(
                         "policy_1",
-                        trainer=_NS(v1=_NS(trainer_mode="colocate_async")),
+                        trainer=_NS(v1=_NS(trainer_mode="sync")),
                     )
                 },
             )
+
+    def test_allows_separate_async_parameter_sync_step_greater_than_one(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        async_v1 = _NS(trainer_mode="separate_async", separate_async=_NS(parameter_sync_step=2))
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            config=SimpleNamespace(
+                data=SimpleNamespace(train_batch_size=4),
+                trainer=SimpleNamespace(v1=async_v1),
+            ),
+            policy_configs={
+                "policy_1": _policy_config("policy_1", trainer=_NS(v1=async_v1)),
+                "policy_2": _policy_config("policy_2", trainer=_NS(v1=async_v1)),
+            },
+        )
+
+        assert trainer.parameter_sync_step == 2
+        assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
+
+    def test_outer_runtime_mode_selects_policy_trainer_class(self, monkeypatch):
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class SyncTrainer(FakeV1PPOTrainer):
+            pass
+
+        class AsyncTrainer(FakeV1PPOTrainer):
+            pass
+
+        config = SimpleNamespace(
+            data=SimpleNamespace(train_batch_size=4),
+            trainer=SimpleNamespace(
+                v1=SimpleNamespace(
+                    trainer_mode="separate_async",
+                    separate_async=SimpleNamespace(parameter_sync_step=2),
+                )
+            ),
+            policies={
+                "policy_1": _NS(
+                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_overrides={},
+                )
+            },
+        )
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            yield
+
+        def fake_compose(*, config_name):
+            return OmegaConf.create({"trainer": {"v1": {}}, "data": {}})
+
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(trainer_module, "compose", fake_compose)
+
+        _install_policy_trainer_stubs(SyncTrainer)
+        import uni_agent.trainer.single_async_ppo_trainer as async_module
+
+        async_module.SingleAsyncPPOTrainer = AsyncTrainer
+        trainer_cls = _test_multi_agents_trainer_cls(MultiAgentsPPOTrainer, policy_configs=None)
+        trainer = trainer_cls(config=_config_with_policies(config))
+
+        assert isinstance(trainer.policy_trainers["policy_1"], AsyncTrainer)
+
+    def test_outer_runtime_values_are_injected_into_policy_config(self, monkeypatch):
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        config = SimpleNamespace(
+            data=SimpleNamespace(train_batch_size=4),
+            trainer=SimpleNamespace(
+                v1=SimpleNamespace(
+                    trainer_mode="separate_async",
+                    separate_async=SimpleNamespace(parameter_sync_step=2),
+                )
+            ),
+            policies={
+                "policy_1": _NS(
+                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_overrides={},
+                )
+            },
+        )
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            yield
+
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(
+            trainer_module,
+            "compose",
+            lambda *, config_name: OmegaConf.create({"trainer": {"v1": {}}, "data": {}}),
+        )
+
+        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
+        policy_config = trainer.policy_configs["policy_1"]
+
+        assert policy_config.trainer.v1.trainer_mode == "separate_async"
+        assert policy_config.trainer.v1.separate_async.parameter_sync_step == 2
+
+    def test_outer_algorithm_and_reward_override_policy_values(self, monkeypatch):
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        config = OmegaConf.create(
+            {
+                "data": {"train_batch_size": 4},
+                "trainer": {
+                    "v1": {
+                        "trainer_mode": "sync",
+                        "sync": {
+                            "parameter_sync_step": 1,
+                            "num_warmup_batches": 3,
+                        },
+                    }
+                },
+                "algorithm": {
+                    "adv_estimator": "grpo",
+                    "gamma": 1.0,
+                    "filter_groups": None,
+                },
+                "reward": {
+                    "num_workers": 8,
+                    "custom_reward_function": {
+                        "path": "pkg://outer.reward",
+                        "name": "compute_score",
+                    },
+                },
+                "policies": {
+                    "policy_1": {
+                        "ppo_trainer_config_name": "ppo_trainer",
+                        "ppo_trainer_overrides": {
+                            "algorithm": {"adv_estimator": "wrong", "gamma": 0.1},
+                            "reward": {
+                                "num_workers": 1,
+                                "custom_reward_function": {
+                                    "path": "pkg://policy.reward",
+                                    "name": "wrong",
+                                },
+                            },
+                        },
+                    }
+                },
+            }
+        )
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            yield
+
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(
+            trainer_module,
+            "compose",
+            lambda *, config_name: OmegaConf.create(
+                {
+                    "trainer": {"v1": {}},
+                    "data": {},
+                    "algorithm": {"adv_estimator": "default"},
+                    "reward": {"num_workers": 2},
+                }
+            ),
+        )
+
+        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
+        policy_config = trainer.policy_configs["policy_1"]
+
+        assert policy_config.algorithm.adv_estimator == "grpo"
+        assert policy_config.algorithm.gamma == 1.0
+        assert policy_config.algorithm.filter_groups is None
+        assert policy_config.reward.num_workers == 8
+        assert policy_config.reward.custom_reward_function.path == "pkg://outer.reward"
+        assert policy_config.reward.custom_reward_function.name == "compute_score"
+        assert policy_config.trainer.v1.trainer_mode == "sync"
+        assert policy_config.trainer.v1.sync.parameter_sync_step == 1
+        assert policy_config.trainer.v1.sync.num_warmup_batches == 3
+
+    def test_outer_runtime_values_override_legacy_policy_values(self, monkeypatch):
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        config = SimpleNamespace(
+            data=SimpleNamespace(train_batch_size=4),
+            trainer=SimpleNamespace(
+                v1=SimpleNamespace(
+                    trainer_mode="separate_async",
+                    separate_async=SimpleNamespace(parameter_sync_step=2),
+                )
+            ),
+            policies={
+                "policy_1": _NS(
+                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_overrides={
+                        "trainer": {
+                            "v1": {
+                                "trainer_mode": "sync",
+                                "separate_async": {"parameter_sync_step": 99},
+                            }
+                        }
+                    },
+                )
+            },
+        )
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            yield
+
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(
+            trainer_module,
+            "compose",
+            lambda *, config_name: OmegaConf.create(
+                {
+                    "trainer": {
+                        "v1": {
+                            "trainer_mode": "sync",
+                            "separate_async": {"parameter_sync_step": 1},
+                        }
+                    },
+                    "data": {},
+                }
+            ),
+        )
+
+        trainer = _make_trainer(MultiAgentsPPOTrainer, config=config)
+        policy_config = trainer.policy_configs["policy_1"]
+
+        assert policy_config.trainer.v1.trainer_mode == "separate_async"
+        assert policy_config.trainer.v1.separate_async.parameter_sync_step == 2
 
     def test_can_resolve_policy_configs_from_config_policies(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -796,7 +1168,7 @@ class TestMultiAgentsPPOTrainer:
         assert trainer.policy_trainers["policy_2"].config.actor_rollout_ref.rollout.tensor_model_parallel_size == 4
 
     def test_can_resolve_policy_configs_from_root_level_ppo_trainer_compose_spec(self, monkeypatch):
-        import hydra
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
         compose_calls = []
@@ -811,24 +1183,26 @@ class TestMultiAgentsPPOTrainer:
             return OmegaConf.create(
                 {
                     "trainer": {"v1": {"trainer_mode": "sync"}},
+                    "data": {"train_files": ["base.parquet"]},
                     "actor_rollout_ref": {"actor": {"optim": {"lr": 1e-6}}},
                 }
             )
 
-        monkeypatch.setattr(hydra, "initialize_config_module", fake_initialize_config_module)
-        monkeypatch.setattr(hydra, "compose", fake_compose)
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(trainer_module, "compose", fake_compose)
         config = SimpleNamespace(
             ppo_trainer_config_source="verl.trainer.config",
+            ppo_trainer_config_name="ppo_trainer",
+            data=_NS(train_batch_size=4, train_files=["outer.parquet"]),
             policies={
                 "policy_1": _NS(
-                    ppo_trainer_config_name="ppo_trainer",
                     ppo_trainer_overrides={
                         "actor_rollout_ref": {"model": {"path": "/models/policy_1"}},
-                        "data": {"train_files": ["train.parquet"]},
+                        "data": {"train_files": ["policy.parquet"]},
                     },
                 ),
                 "policy_2": _NS(
-                    ppo_trainer_config_name="ppo_trainer",
+                    ppo_trainer_config_source="custom.policy.config",
                     ppo_trainer_overrides={
                         "actor_rollout_ref": {"model": {"path": "/models/policy_2"}},
                     },
@@ -850,7 +1224,39 @@ class TestMultiAgentsPPOTrainer:
         assert trainer.policy_configs["policy_1"].actor_rollout_ref.actor.optim.lr == 1e-6
         assert trainer.policy_configs["policy_1"].actor_rollout_ref.model.path == "/models/policy_1"
         assert trainer.policy_configs["policy_2"].actor_rollout_ref.model.path == "/models/policy_2"
-        assert trainer.policy_configs["policy_1"].data.train_files == ["train.parquet"]
+        assert trainer.policy_configs["policy_1"].data.train_files == ["policy.parquet"]
+
+    def test_root_ppo_trainer_config_name_is_shared_by_all_policies(self, monkeypatch):
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        compose_calls = []
+
+        @contextmanager
+        def fake_initialize_config_module(*, config_module, version_base):
+            yield
+
+        def fake_compose(*, config_name):
+            compose_calls.append(config_name)
+            return OmegaConf.create({"trainer": {"v1": {}}, "data": {}})
+
+        monkeypatch.setattr(trainer_module, "initialize_config_module", fake_initialize_config_module)
+        monkeypatch.setattr(trainer_module, "compose", fake_compose)
+        config = SimpleNamespace(
+            ppo_trainer_config_source="verl.trainer.config",
+            ppo_trainer_config_name="ppo_trainer",
+            policies={
+                "default_policy": _NS(ppo_trainer_overrides={}),
+                "override_policy": _NS(
+                    ppo_trainer_config_name="ppo_megatron_trainer",
+                    ppo_trainer_overrides={},
+                ),
+            },
+        )
+
+        _make_trainer(MultiAgentsPPOTrainer, config=config)
+
+        assert compose_calls == ["ppo_trainer", "ppo_trainer"]
 
     def test_disables_per_policy_resume_for_outer_checkpoint_ownership(self):
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -1028,6 +1434,175 @@ class TestMultiAgentsPPOTrainer:
             ("update", 0, {"policy_1": "batch:0"}),
         ]
 
+    def test_step_keeps_caller_timing_raw_as_trainer_timing_context(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class TimingRecordingTrainer(MultiAgentsPPOTrainer):
+            def _add_batch_to_generate(self):
+                return None
+
+            def _step_once(self, metrics, timing_raw, sample_batch_size):
+                del metrics, sample_batch_size
+                assert timing_raw is self.timing_raw
+                timing_raw["custom_stage"] = 1.0
+                return SimpleKVBatchMeta(
+                    keys=["uid_0"],
+                    tags=[{"policy_name": "policy_1"}],
+                )
+
+        trainer = _make_trainer(
+            TimingRecordingTrainer,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+        )
+        timing_raw = {}
+
+        trainer.step(metrics={}, timing_raw=timing_raw)
+
+        assert timing_raw == {"custom_stage": 1.0}
+        assert trainer.timing_raw is timing_raw
+
+    def test_throughput_gpu_count_requires_policy_trainer_interface(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.policy_trainers = {"policy_1": object()}
+
+        with pytest.raises(AttributeError, match="_get_n_gpus_for_throughput"):
+            trainer._get_n_gpus_for_throughput()
+
+    def test_decoupled_step_tracks_local_trigger_step_per_policy(self):
+        _install_dependency_stubs()
+        _install_metrics_aggregator_stub()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class LocalTriggerRecordingTrainer(FakeV1PPOTrainer):
+            def __init__(self, config):
+                super().__init__(config)
+                self.local_trigger_steps = []
+
+            def _compute_old_log_prob(self, batch, metrics=None):
+                self.local_trigger_steps.append(self.local_trigger_step)
+                return super()._compute_old_log_prob(batch, metrics)
+
+        async_v1 = _NS(trainer_mode="separate_async", separate_async=_NS(parameter_sync_step=2))
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            config=SimpleNamespace(
+                data=SimpleNamespace(train_batch_size=4),
+                trainer=SimpleNamespace(critic_warmup=0, v1=async_v1),
+            ),
+            policy_configs={
+                "policy_1": _policy_config("policy_1", trainer=_NS(v1=async_v1)),
+                "policy_2": _policy_config("policy_2", trainer=_NS(v1=async_v1)),
+            },
+            policy_trainer_cls=LocalTriggerRecordingTrainer,
+        )
+        batches = iter(
+            [
+                SimpleKVBatchMeta(
+                    keys=["p1_0", "p2_0"],
+                    tags=[{"policy_name": "policy_1"}, {"policy_name": "policy_2"}],
+                ),
+                SimpleKVBatchMeta(
+                    keys=["p1_1"],
+                    tags=[{"policy_name": "policy_1"}],
+                ),
+            ]
+        )
+        trainer.replay_buffer = SimpleNamespace(sample=lambda **_: next(batches))
+        trainer._add_batch_to_generate = lambda: None
+
+        assert not hasattr(trainer, "_policy_local_trigger_steps")
+        assert not hasattr(trainer, "_last_step_policy_names")
+
+        trainer.step(metrics={}, timing_raw={})
+
+        assert trainer.policy_trainers["policy_1"].local_trigger_steps == [0, 1]
+        assert trainer.policy_trainers["policy_2"].local_trigger_steps == [0]
+        assert not hasattr(trainer, "_policy_local_trigger_steps")
+        assert not hasattr(trainer, "_last_step_policy_names")
+
+    def test_decoupled_step_aggregates_metrics_globally_and_per_policy(self):
+        _install_metrics_aggregator_stub()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class MetricRecordingTrainer(MultiAgentsPPOTrainer):
+            def __init__(self, **kwargs):
+                self.iteration = 0
+                super().__init__(**kwargs)
+
+            def _add_batch_to_generate(self):
+                return None
+
+            def _step_once(self, metrics, timing_raw, sample_batch_size):
+                del timing_raw, sample_batch_size
+                self.iteration += 1
+                if self.iteration == 1:
+                    metrics.update(
+                        {
+                            "training/off_policy/evicted_samples": 2,
+                            "training/off_policy/trajectory_staleness/mean": 1.0,
+                            "policy_1/actor/loss/mean": 2.0,
+                            "policy_1/global_seqlen/min": 10.0,
+                            "policy_1/global_seqlen/max": 20.0,
+                            "policy_1/global_seqlen/minmax_diff": 10.0,
+                            "policy_2/actor/loss/mean": 5.0,
+                        }
+                    )
+                    return SimpleKVBatchMeta(
+                        keys=["p1_0", "p1_1", "p2_0"],
+                        tags=[
+                            {"policy_name": "policy_1"},
+                            {"policy_name": "policy_1"},
+                            {"policy_name": "policy_2"},
+                        ],
+                    )
+                metrics.update(
+                    {
+                        "training/off_policy/evicted_samples": 3,
+                        "training/off_policy/trajectory_staleness/mean": 4.0,
+                        "policy_1/actor/loss/mean": 6.0,
+                        "policy_1/global_seqlen/min": 0.0,
+                        "policy_1/global_seqlen/max": 15.0,
+                        "policy_1/global_seqlen/minmax_diff": 15.0,
+                    }
+                )
+                return SimpleKVBatchMeta(
+                    keys=["p1_2"],
+                    tags=[{"policy_name": "policy_1"}],
+                )
+
+        async_v1 = _NS(trainer_mode="separate_async", separate_async=_NS(parameter_sync_step=2))
+        trainer = _make_trainer(
+            MetricRecordingTrainer,
+            config=SimpleNamespace(
+                data=SimpleNamespace(train_batch_size=4),
+                trainer=SimpleNamespace(v1=async_v1),
+            ),
+            policy_configs={
+                "policy_1": _policy_config("policy_1", trainer=_NS(v1=async_v1)),
+                "policy_2": _policy_config("policy_2", trainer=_NS(v1=async_v1)),
+            },
+        )
+        metrics = {}
+
+        batch = trainer.step(metrics=metrics, timing_raw={})
+
+        assert batch.keys == ["p1_0", "p1_1", "p2_0", "p1_2"]
+        assert metrics["training/off_policy/evicted_samples"] == 5
+        assert metrics["training/off_policy/trajectory_staleness/mean"] == pytest.approx(1.75)
+        assert metrics["policy_1/actor/loss/mean"] == pytest.approx(10 / 3)
+        assert metrics["policy_2/actor/loss/mean"] == pytest.approx(5.0)
+        assert metrics["policy_1/global_seqlen/min"] == 0
+        assert metrics["policy_1/global_seqlen/max"] == 20
+        assert metrics["policy_1/global_seqlen/minmax_diff"] == 20
+
     def test_builds_one_shared_agent_loop_manager_with_policy_routing_client(self):
         _install_dependency_stubs()
 
@@ -1133,6 +1708,7 @@ class TestMultiAgentsPPOTrainer:
                 "policy_1": _policy_config("policy_1"),
                 "policy_2": _policy_config("policy_2"),
             },
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
         trainer.step_events = []
 
@@ -1261,7 +1837,7 @@ class TestMultiAgentsPPOTrainer:
             )
         )
         trainer.policy_trainers = {}
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
         trainer.timing_raw = {}
         trainer.trainer_mode = "sync"
 
@@ -1290,7 +1866,7 @@ class TestMultiAgentsPPOTrainer:
                 use_critic=False,
             )
         }
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
         trainer.timing_raw = {}
 
         with pytest.raises(FileNotFoundError, match="policy_1.*actor"):
@@ -1365,7 +1941,7 @@ class TestMultiAgentsPPOTrainer:
         )
         trainer.trainer_mode = "separate_async"
         trainer.policy_trainers = {}
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
         trainer.timing_raw = {}
         trainer.agent_loop_manager = FakeAgentFrameworkRolloutAdapter()
 
@@ -1426,7 +2002,7 @@ class TestMultiAgentsPPOTrainer:
         }
         trainer.global_steps = 4
         trainer.trainer_mode = "sync"
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
 
         assert trainer._has_async_checkpoint_save() is True
         trainer._save_checkpoint()
@@ -1458,7 +2034,7 @@ class TestMultiAgentsPPOTrainer:
         }
         trainer.global_steps = 4
         trainer.trainer_mode = "sync"
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
 
         trainer._save_checkpoint()
 
@@ -1489,7 +2065,7 @@ class TestMultiAgentsPPOTrainer:
         }
         trainer.global_steps = 1
         trainer.trainer_mode = "sync"
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
 
         with pytest.raises(AttributeError):
             trainer._save_checkpoint()
@@ -1517,7 +2093,7 @@ class TestMultiAgentsPPOTrainer:
                 use_critic=False,
             )
         }
-        trainer.train_dataloader = None
+        trainer.train_dataloader = FakeDataloader([])
         trainer.timing_raw = {}
         trainer.trainer_mode = "sync"
 
@@ -1544,6 +2120,7 @@ class TestMultiAgentsPPOTrainer:
                 {"policy_name": "policy_2", "role": "agent_2"},
                 {"policy_name": "policy_1", "role": "agent_3"},
             ],
+            fields=["responses", "response_mask"],
             extra_info={"temperature": 0.7},
         )
 
@@ -1556,8 +2133,64 @@ class TestMultiAgentsPPOTrainer:
             {"policy_name": "policy_1", "role": "agent_3"},
         ]
         assert grouped["policy_1"].partition_id == "train"
+        assert grouped["policy_1"].fields == ["responses", "response_mask"]
         assert grouped["policy_1"].extra_info == {"temperature": 0.7}
         assert grouped["policy_2"].keys == ["uid_0_1"]
+        assert grouped["policy_2"].fields == ["responses", "response_mask"]
+        assert grouped["policy_2"].extra_info == {"temperature": 0.7}
+
+        grouped["policy_1"].extra_info["temperature"] = 0.3
+        assert grouped["policy_2"].extra_info == {"temperature": 0.7}
+
+    def test_make_batch_like_rejects_non_kv_batch_constructor(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class NonKVBatch:
+            def __init__(self, keys, tags):
+                self.keys = keys
+                self.tags = tags
+
+        batch = object.__new__(NonKVBatch)
+        batch.partition_id = "train"
+        batch.keys = ["uid_0_0"]
+        batch.tags = [{"policy_name": "policy_1"}]
+        batch.fields = ["responses"]
+        batch.extra_info = {"temperature": 0.7}
+
+        with pytest.raises(TypeError):
+            MultiAgentsPPOTrainer._make_batch_like(
+                batch,
+                keys=batch.keys,
+                tags=batch.tags,
+            )
+
+    def test_make_batch_like_requires_partition_id(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        class MissingPartitionBatch:
+            def __init__(self, *, partition_id, keys, tags, fields, extra_info):
+                self.partition_id = partition_id
+                self.keys = keys
+                self.tags = tags
+                self.fields = fields
+                self.extra_info = extra_info
+
+        batch = object.__new__(MissingPartitionBatch)
+        batch.keys = ["uid_0_0"]
+        batch.tags = [{"policy_name": "policy_1"}]
+        batch.fields = ["responses"]
+        batch.extra_info = {"temperature": 0.7}
+
+        with pytest.raises(AttributeError, match="partition_id"):
+            MultiAgentsPPOTrainer._make_batch_like(
+                batch,
+                keys=batch.keys,
+                tags=batch.tags,
+            )
 
     def test_step_once_prepares_advantage_once_then_updates_each_policy(self):
         _install_dependency_stubs()
@@ -2055,14 +2688,11 @@ class TestMultiAgentsPPOTrainer:
         trainer.step_events = []
         trainer.agent_loop_manager = _build_test_agent_loop_manager(trainer)
 
-        trainer.train_step()
+        with pytest.raises(AttributeError, match="train_dataloader"):
+            trainer.train_step()
 
         assert len(trainer.agent_loop_manager.generated_prompts) == 0
-        assert trainer.step_events == [
-            ("sample", 0),
-            ("build", 0),
-            ("update", 0, {"policy_1": "batch:0"}),
-        ]
+        assert trainer.step_events == []
 
     def test_fit_uses_injected_agent_loop_manager(self):
         _install_dependency_stubs()
@@ -2082,13 +2712,14 @@ class TestMultiAgentsPPOTrainer:
             policy_configs={
                 "policy_1": _policy_config("policy_1"),
             },
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
         trainer.step_events = []
 
         agent_loop_manager = _init_agent_loop_and_fit(trainer)
 
         assert trainer.agent_loop_manager is agent_loop_manager
-        assert len(agent_loop_manager.generated_prompts) == 0
+        assert len(agent_loop_manager.generated_prompts) == 2
 
     def test_sync_runtime_hooks_drive_per_policy_checkpoint_managers(self, monkeypatch):
         _install_dependency_stubs()
@@ -2100,6 +2731,8 @@ class TestMultiAgentsPPOTrainer:
         debug_module.marked_timer = marked_timer
         monkeypatch.setitem(sys.modules, "verl.utils.debug", debug_module)
         sys.modules["verl.utils"].debug = debug_module
+        import uni_agent.trainer.multi_agents_ppo_trainer as trainer_module
+        monkeypatch.setattr(trainer_module, "marked_timer", marked_timer)
 
         trainer = _make_trainer(
             MultiAgentsPPOTrainer,
@@ -2147,6 +2780,7 @@ class TestMultiAgentsPPOTrainer:
             policy_configs={
                 "policy_1": _policy_config("policy_1"),
             },
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
         trainer.step_events = []
 
@@ -2160,7 +2794,7 @@ class TestMultiAgentsPPOTrainer:
         ]
         assert trainer.global_steps == 3
 
-    def test_fit_saves_outer_checkpoint_by_save_frequency(self):
+    def test_fit_saves_outer_checkpoint_before_policy_step_end(self):
         _install_dependency_stubs()
 
         from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
@@ -2168,6 +2802,10 @@ class TestMultiAgentsPPOTrainer:
         class RecordingTrainer(RecordingMultiAgentsPPOTrainerMixin, MultiAgentsPPOTrainer):
             def _save_checkpoint(self):
                 self.step_events.append(("save_checkpoint", self.global_steps))
+
+            def on_step_end(self):
+                self.step_events.append(("on_step_end", self.global_steps))
+                super().on_step_end()
 
         config = SimpleNamespace(
             transfer_queue=SimpleNamespace(enable=False),
@@ -2179,13 +2817,24 @@ class TestMultiAgentsPPOTrainer:
             policy_configs={
                 "policy_1": _policy_config("policy_1"),
             },
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
         )
         trainer.step_events = []
 
         _init_agent_loop_and_fit(trainer)
 
-        assert ("save_checkpoint", 1) in trainer.step_events
-        assert ("save_checkpoint", 2) in trainer.step_events
+        assert trainer.step_events == [
+            ("sample", 1),
+            ("build", 1),
+            ("update", 1, {"policy_1": "batch:1"}),
+            ("save_checkpoint", 1),
+            ("on_step_end", 1),
+            ("sample", 2),
+            ("build", 2),
+            ("update", 2, {"policy_1": "batch:2"}),
+            ("save_checkpoint", 2),
+            ("on_step_end", 2),
+        ]
 
     def test_shared_dataloader_uses_first_initialized_policy(self):
         _install_dependency_stubs()
@@ -2215,6 +2864,25 @@ class TestMultiAgentsPPOTrainer:
         assert second_policy_trainer.train_dataloader is None
         assert second_policy_trainer.val_dataloader is None
         assert second_policy_trainer.train_dataloader_it is None
+
+    def test_dataloaders_are_created_by_init_not_constructor(self):
+        _install_dependency_stubs()
+
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = _make_trainer(
+            MultiAgentsPPOTrainer,
+            policy_configs={"policy_1": _policy_config("policy_1")},
+            policy_trainer_cls=FakeV1PPOTrainerWithDataloader,
+        )
+
+        assert not hasattr(trainer, "train_dataloader")
+        assert not hasattr(trainer, "val_dataloader")
+
+        trainer.init()
+
+        assert trainer.train_dataloader is trainer.policy_trainers["policy_1"].train_dataloader
+        assert trainer.val_dataloader is trainer.policy_trainers["policy_1"].val_dataloader
 
     def test_train_step_uses_promoted_v1_dataloader_batch(self):
         _install_dependency_stubs()
@@ -2311,3 +2979,60 @@ class TestMultiAgentsPPOTrainer:
             pass
         else:
             raise AssertionError("multi-agent trainer should call sync transfer_queue.kv_batch_put directly")
+
+    def test_add_data_metrics_reports_trajectory_staleness_by_policy(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.global_steps = 12
+        trainer.policy_trainers = {"policy_1": object(), "policy_2": object()}
+        batch = SimpleKVBatchMeta(
+            keys=["k1", "k2", "k3", "k4"],
+            tags=[
+                {"policy_name": "policy_1", "min_global_steps": 8, "max_global_steps": 10},
+                {"policy_name": "policy_1", "min_global_steps": 11, "max_global_steps": 11},
+                {"policy_name": "policy_2", "min_global_steps": 9, "max_global_steps": 9},
+                {
+                    "policy_name": "policy_2",
+                    "is_padding": True,
+                    "min_global_steps": 1,
+                    "max_global_steps": 1,
+                },
+            ],
+        )
+        metrics = {}
+
+        trainer._add_data_metrics(batch, metrics)
+
+        assert metrics["training/off_policy/trajectory_spans/mean"] == pytest.approx(5 / 3)
+        assert metrics["training/off_policy/trajectory_spans/max"] == 3
+        assert metrics["training/off_policy/trajectory_spans/min"] == 1
+        assert metrics["training/off_policy/trajectory_staleness/mean"] == pytest.approx(1)
+        assert metrics["training/off_policy/trajectory_staleness/max"] == 2
+        assert metrics["training/off_policy/trajectory_staleness/min"] == 0
+        assert metrics["training/off_policy/trajectory_staleness_worst/mean"] == pytest.approx(5 / 3)
+        assert metrics["training/off_policy/trajectory_staleness_worst/max"] == 3
+        assert metrics["training/off_policy/trajectory_staleness_worst/min"] == 0
+
+        assert metrics["policy_1/off_policy/trajectory_spans/mean"] == pytest.approx(2)
+        assert metrics["policy_1/off_policy/trajectory_staleness/mean"] == pytest.approx(0.5)
+        assert metrics["policy_1/off_policy/trajectory_staleness_worst/mean"] == pytest.approx(1.5)
+        assert metrics["policy_2/off_policy/trajectory_spans/mean"] == pytest.approx(1)
+        assert metrics["policy_2/off_policy/trajectory_staleness/mean"] == pytest.approx(2)
+        assert metrics["policy_2/off_policy/trajectory_staleness_worst/mean"] == pytest.approx(2)
+
+    def test_add_data_metrics_skips_staleness_when_version_metadata_is_absent(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.global_steps = 12
+        trainer.policy_trainers = {"policy_1": object()}
+        batch = SimpleKVBatchMeta(
+            keys=["k1"],
+            tags=[{"policy_name": "policy_1"}],
+        )
+        metrics = {}
+
+        trainer._add_data_metrics(batch, metrics)
+
+        assert not any("off_policy/trajectory_" in key for key in metrics)

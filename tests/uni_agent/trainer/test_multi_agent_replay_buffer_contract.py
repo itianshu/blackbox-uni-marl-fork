@@ -4,6 +4,8 @@ import types
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 
 @dataclass
 class FakeKVBatchMeta:
@@ -49,6 +51,8 @@ class FakeTransferQueueModule(types.ModuleType):
 
 
 def _load_v1_replay_buffer_with_fake_tq(fake_tq):
+    import verl
+
     original_modules = {
         name: sys.modules.get(name)
         for name in ("transfer_queue", "omegaconf", "verl.utils.skip")
@@ -73,7 +77,9 @@ def _load_v1_replay_buffer_with_fake_tq(fake_tq):
         skip_mod.SkipManager = FakeSkipManager
         sys.modules["verl.utils.skip"] = skip_mod
 
-        module_path = Path(__file__).parents[4] / "verl" / "verl" / "trainer" / "ppo" / "v1" / "replay_buffer.py"
+        module_path = Path(verl.__file__).resolve().parent / "trainer" / "ppo" / "v1" / "replay_buffer.py"
+        if not module_path.is_file():
+            pytest.skip(f"Installed verl package does not expose replay_buffer.py: {module_path}")
         spec = importlib.util.spec_from_file_location("_uni_agent_test_v1_replay_buffer", module_path)
         module = importlib.util.module_from_spec(spec)
         assert spec.loader is not None

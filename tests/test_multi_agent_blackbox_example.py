@@ -137,8 +137,9 @@ def test_multi_agent_blackbox_yaml_exposes_framework_and_policy_mapping():
     assert set(cfg["policies"]) == {"policy_1", "policy_2"}
     assert "name" not in cfg["policies"]["policy_1"]
     assert "name" not in cfg["policies"]["policy_2"]
-    assert cfg["policies"]["policy_1"]["ppo_trainer_config_name"] == "ppo_trainer"
-    assert cfg["policies"]["policy_2"]["ppo_trainer_config_name"] == "ppo_trainer"
+    assert cfg["ppo_trainer_config_name"] == "ppo_trainer"
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_1"]
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_2"]
 
 
 def test_external_multi_agent_recipe_exposes_command_runner_contract():
@@ -180,52 +181,94 @@ def test_external_mas_training_script_selects_external_recipe_without_callable_c
     assert "actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.config.template_path=${MAS_TEMPLATE_PATH}" in content
 
 
+def test_multi_agent_launchers_configure_shared_outer_ppo_mini_batch_size():
+    for script_name in ("run_e2e_train.sh", "run_external_mas_train.sh"):
+        content = (EXAMPLE_DIR / "scripts" / script_name).read_text(encoding="utf-8")
+
+        assert 'PARAMETER_SYNC_STEP="${PARAMETER_SYNC_STEP:-1}"' in content
+        assert "PPO_MINI_BATCH_SIZE" in content
+        assert "trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP}" in content
+        assert "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" in content
+        assert "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.actor.ppo_mini_batch_size" not in content
+        assert "policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.actor.ppo_mini_batch_size" not in content
+
+
 def test_multi_agent_blackbox_yaml_uses_public_ppo_trainer_base_per_policy():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 
     assert "hydra" not in cfg
     assert "defaults" not in cfg
-    assert cfg["ppo_trainer_config_source"] == {
-        "kind": "config_module",
-        "value": "verl.trainer.config",
-    }
+    assert cfg["ppo_trainer_config_source"] == "verl.trainer.config"
     assert "policy_ppo_trainer_base" not in cfg
 
-    assert cfg["policies"]["policy_1"]["ppo_trainer_config_name"] == "ppo_trainer"
-    assert cfg["policies"]["policy_2"]["ppo_trainer_config_name"] == "ppo_trainer"
+    assert cfg["ppo_trainer_config_name"] == "ppo_trainer"
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_1"]
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_2"]
+    for policy_name in ("policy_1", "policy_2"):
+        assert "use_v1" not in cfg["policies"][policy_name]["ppo_trainer_overrides"].get("trainer", {})
     assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["data"]["train_batch_size"] == "${data.train_batch_size}"
-    assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 4
+    assert (
+        cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["actor"]
+        ["ppo_mini_batch_size"]
+        == "${actor_rollout_ref.actor.ppo_mini_batch_size}"
+    )
     assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.6
 
     assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.6
 
 
-def test_multi_agent_blackbox_yaml_propagates_top_level_data_and_algorithm_to_policies():
+def test_multi_agent_blackbox_yaml_projects_shared_ppo_mini_batch_size_to_policies():
+    cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
+
+    assert cfg["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 4
+    for policy_name in ("policy_1", "policy_2"):
+        assert (
+            cfg["policies"][policy_name]["ppo_trainer_overrides"]["actor_rollout_ref"]["actor"]
+            ["ppo_mini_batch_size"]
+            == "${actor_rollout_ref.actor.ppo_mini_batch_size}"
+        )
+
+
+def test_multi_agent_blackbox_yaml_keeps_shared_runtime_topology_at_outer_level():
+    cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
+
+    assert cfg["trainer"]["v1"]["trainer_mode"] == "separate_async"
+    assert cfg["trainer"]["v1"]["separate_async"]["parameter_sync_step"] == 1
+    for policy_name in ("policy_1", "policy_2"):
+        policy_trainer = cfg["policies"][policy_name]["ppo_trainer_overrides"].get("trainer", {})
+        assert "v1" not in policy_trainer
+
+
+def test_multi_agent_blackbox_yaml_keeps_top_p_per_policy():
+    cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
+
+    assert "top_p" not in cfg["actor_rollout_ref"]["rollout"]
+    for policy_name in ("policy_1", "policy_2"):
+        assert (
+            cfg["policies"][policy_name]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["top_p"]
+            == 1.0
+        )
+
+
+def test_multi_agent_blackbox_yaml_keeps_shared_data_and_algorithm_at_root_level():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 
     for policy_name in ("policy_1", "policy_2"):
         ppo_config = cfg["policies"][policy_name]["ppo_trainer_overrides"]
 
-        assert ppo_config["data"]["train_files"] == "${data.train_files}"
-        assert ppo_config["data"]["val_files"] == "${data.val_files}"
+        assert cfg["data"]["train_files"] == "???"
+        assert cfg["data"]["val_files"] == "???"
         assert ppo_config["data"]["train_batch_size"] == "${data.train_batch_size}"
-        assert ppo_config["data"]["val_batch_size"] == "${data.val_batch_size}"
-        assert ppo_config["data"]["return_raw_chat"] == "${data.return_raw_chat}"
-
-        assert ppo_config["algorithm"]["adv_estimator"] == "${algorithm.adv_estimator}"
-        assert ppo_config["algorithm"]["gamma"] == "${algorithm.gamma}"
-        assert ppo_config["algorithm"]["lam"] == "${algorithm.lam}"
-
-        assert ppo_config["reward"]["custom_reward_function"] == {
-            "path": "${reward.custom_reward_function.path}",
-            "name": "${reward.custom_reward_function.name}",
-        }
+        # algorithm/reward are injected from the outer config during policy
+        # composition and are intentionally absent from YAML overrides.
+        assert "algorithm" not in ppo_config
+        assert "reward" not in ppo_config
 
         assert ppo_config["actor_rollout_ref"]["rollout"]["n"] == "${actor_rollout_ref.rollout.n}"
         # Temperature is owned per policy (no top-level reference): each policy
         # holds its own value, which drives both sampling and recomputation.
         assert ppo_config["actor_rollout_ref"]["rollout"]["temperature"] == 1.0
-        assert ppo_config["actor_rollout_ref"]["rollout"]["top_p"] == "${actor_rollout_ref.rollout.top_p}"
+        assert ppo_config["actor_rollout_ref"]["rollout"]["top_p"] == 1.0
 
 
 def test_multi_agent_blackbox_yaml_has_v1_compatible_transfer_queue_and_ray_defaults():
@@ -282,8 +325,8 @@ def test_multi_agent_blackbox_yaml_documents_per_policy_resource_isolation():
     assert "n_training_gpus_per_node" not in policy_2["trainer"]
     assert policy_1["trainer"]["default_local_dir"].endswith("/policy_1")
     assert policy_2["trainer"]["default_local_dir"].endswith("/policy_2")
-    assert policy_1["actor_rollout_ref"]["model"]["path"] == "${oc.env:POLICY_1_MODEL_PATH,???}"
-    assert policy_2["actor_rollout_ref"]["model"]["path"] == "${oc.env:POLICY_2_MODEL_PATH,???}"
+    assert policy_1["actor_rollout_ref"]["model"]["path"] == "???"
+    assert policy_2["actor_rollout_ref"]["model"]["path"] == "???"
     assert policy_1["actor_rollout_ref"]["actor"]["fsdp_config"]["fsdp_size"] == 8
     assert policy_2["actor_rollout_ref"]["actor"]["fsdp_config"]["fsdp_size"] == 8
     assert policy_1["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 4
@@ -301,7 +344,6 @@ def test_multi_agent_blackbox_yaml_documents_per_policy_resource_isolation():
 def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monkeypatch):
     from hydra import compose, initialize_config_dir
 
-    monkeypatch.setitem(sys.modules, "transfer_queue", types.SimpleNamespace(kv_batch_put=lambda **kwargs: None))
     sys.modules.pop("uni_agent.trainer.multi_agents_ppo_trainer", None)
     from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
@@ -312,31 +354,22 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
             self.config = config
             self.__class__.instances.append(self)
 
-    monkeypatch.setenv("POLICY_1_MODEL_PATH", "/models/policy_1")
-    monkeypatch.setenv("POLICY_2_MODEL_PATH", "/models/policy_2")
-    for name in ["verl", "verl.trainer", "verl.trainer.ppo"]:
-        module = types.ModuleType(name)
-        module.__path__ = []
-        monkeypatch.setitem(sys.modules, name, module)
-    v1_module = types.ModuleType("verl.trainer.ppo.v1")
-    v1_module.get_trainer_cls = lambda trainer_mode: ConfigSmokePolicyTrainer
-    monkeypatch.setitem(sys.modules, "verl.trainer.ppo.v1", v1_module)
-    sys.modules["verl.trainer"].ppo = sys.modules["verl.trainer.ppo"]
-    sys.modules["verl.trainer.ppo"].v1 = v1_module
+    async_trainer_module = types.ModuleType("uni_agent.trainer.single_async_ppo_trainer")
+    async_trainer_module.SingleAsyncPPOTrainer = ConfigSmokePolicyTrainer
+    monkeypatch.setitem(sys.modules, "uni_agent.trainer.single_async_ppo_trainer", async_trainer_module)
 
     config_dir = str((EXAMPLE_DIR / "config").resolve())
-    verl_config_dir = (Path(__file__).resolve().parents[2] / "verl" / "verl" / "trainer" / "config").as_posix()
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         cfg = compose(
             config_name="multi_agent_blackbox",
             overrides=[
-                "ppo_trainer_config_source.kind=config_dir",
-                f"ppo_trainer_config_source.value={verl_config_dir}",
                 "data.train_files=[train.parquet]",
                 "data.val_files=[val.parquet]",
                 "trainer.total_training_steps=1",
                 "actor_rollout_ref.rollout.n=8",
-                "actor_rollout_ref.rollout.top_p=0.95",
+                "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.model.path=/models/policy_1",
+                "policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.model.path=/models/policy_2",
+                "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.top_p=0.95",
                 "policies.policy_1.ppo_trainer_overrides.trainer.nnodes=2",
                 "policies.policy_2.ppo_trainer_overrides.trainer.nnodes=3",
                 "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.temperature=0.5",
@@ -348,7 +381,6 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
 
     assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
     assert len(ConfigSmokePolicyTrainer.instances) == 2
-    assert trainer.policy_configs["policy_1"].data.train_files == ["train.parquet"]
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.actor.optim.lr == 1e-6
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.model.path == "/models/policy_1"
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.model.path == "/models/policy_2"
@@ -356,7 +388,8 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.n == 8
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.rollout.temperature == 0.5
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.temperature == 0.8
-    assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.top_p == 0.95
+    assert trainer.policy_configs["policy_1"].actor_rollout_ref.rollout.top_p == 0.95
+    assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.top_p == 1.0
     assert trainer.policy_configs["policy_1"].trainer.nnodes == 2
     assert trainer.policy_configs["policy_2"].trainer.nnodes == 3
     assert cfg.actor_rollout_ref.rollout.custom.agent_framework.role_policy_mapping == {
@@ -366,52 +399,32 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
     }
 
 
-def test_run_train_script_uses_multi_agents_entrypoint_and_config():
-    script = EXAMPLE_DIR / "scripts" / "run_train.sh"
+def test_e2e_training_script_uses_multi_agents_entrypoint_and_config():
+    script = EXAMPLE_DIR / "scripts" / "run_e2e_train.sh"
     content = script.read_text(encoding="utf-8")
 
-    assert "python3 -m uni_agent.trainer.main_multi_agents_ppo" in content
+    assert "-m uni_agent.trainer.main_multi_agents_ppo" in content
     assert "--config-name=multi_agent_blackbox" in content
-    assert "--config-path=\"$(pwd)/examples/multi_agent_blackbox/config\"" in content
+    assert "--config-path=\"${REPO_ROOT}/examples/multi_agent_blackbox/config\"" in content
     assert "actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.mas_config_path" in content
     assert "actor_rollout_ref.rollout.n=${ROLLOUT_N}" in content
-    assert "POLICY_1_GPUS" in content
-    assert "POLICY_2_GPUS" in content
     assert "POLICY_1_NNODES" in content
     assert "POLICY_2_NNODES" in content
-    assert "POLICY_1_TP" in content
-    assert "POLICY_2_TP" in content
-    assert 'POLICY_1_NNODES="${POLICY_1_NNODES:-2}"' in content
-    assert 'POLICY_2_NNODES="${POLICY_2_NNODES:-2}"' in content
-    assert 'POLICY_1_GPUS="${POLICY_1_GPUS:-8}"' in content
-    assert 'POLICY_2_GPUS="${POLICY_2_GPUS:-8}"' in content
-    assert 'POLICY_1_TP="${POLICY_1_TP:-4}"' in content
-    assert 'POLICY_2_TP="${POLICY_2_TP:-8}"' in content
+    assert "POLICY_1_N_GPUS_PER_NODE" in content
+    assert "POLICY_2_N_GPUS_PER_NODE" in content
+    assert "POLICY_1_TENSOR_PARALLEL_SIZE" in content
+    assert "POLICY_2_TENSOR_PARALLEL_SIZE" in content
     assert "policies.policy_1.ppo_trainer_overrides.trainer.nnodes=${POLICY_1_NNODES}" in content
     assert "policies.policy_2.ppo_trainer_overrides.trainer.nnodes=${POLICY_2_NNODES}" in content
-    assert "policies.policy_1.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_1_GPUS}" in content
-    assert "policies.policy_2.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_2_GPUS}" in content
+    assert "policies.policy_1.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_1_N_GPUS_PER_NODE}" in content
+    assert "policies.policy_2.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_2_N_GPUS_PER_NODE}" in content
     assert (
-        "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_1_TP}"
+        "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_1_TENSOR_PARALLEL_SIZE}"
         in content
     )
     assert (
-        "policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_2_TP}"
+        "policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_2_TENSOR_PARALLEL_SIZE}"
         in content
-    )
-
-
-def test_verify_vllm_servers_checks_worker_patch_before_trainer_init():
-    script = EXAMPLE_DIR / "scripts" / "verify_vllm_servers.py"
-    content = script.read_text(encoding="utf-8")
-    main_body = content.split("def main() -> None:", maxsplit=1)[1]
-
-    assert "examples.multi_agent_blackbox.verl_patch.apply_worker_patch" in content
-    assert "@ray.remote" in content
-    assert "probe_worker_lookup_prefix.remote()" in content
-    assert 'probe["prefix"] != "policy_1_vllm_"' in content
-    assert main_body.index("_verify_worker_lookup_patch()") < main_body.index(
-        "trainer = MultiAgentsPPOTrainer(config=config)"
     )
 
 
@@ -422,13 +435,14 @@ def test_readme_points_to_training_entrypoint():
     assert "Ray worker `apply_worker_patch()`" in readme
     assert "worker_process_setup_hook" in readme
     assert "shared checkout" in readme
-    assert "gateway_count: 4" in readme
+    assert "gateway_count` (currently 8" in readme
     assert "fresh training Driver" in readme
     assert "policy_1_reward_loop_worker_0" in readme
     assert "policy_1_vllm_" in readme
     assert "vllm_policy_1_" not in readme
-    assert "bash examples/multi_agent_blackbox/scripts/run_verify_vllm_servers.sh" in readme
-    assert "bash examples/multi_agent_blackbox/scripts/run_train.sh" in readme
+    assert "pytest -q tests/test_multi_agent_blackbox_example.py" in readme
+    assert "bash examples/multi_agent_blackbox/scripts/run_e2e_train.sh" in readme
+    assert "bash examples/multi_agent_blackbox/scripts/run_external_mas_train.sh" in readme
     assert "python -m uni_agent.trainer.main_multi_agents_ppo" in readme
     assert "POLICY_1_MODEL_PATH" in readme
     assert "POLICY_2_MODEL_PATH" in readme

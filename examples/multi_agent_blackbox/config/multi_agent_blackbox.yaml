@@ -1,7 +1,7 @@
 # Starter multi-agent blackbox training config.
 #
-# Each policy root-composes verl's public PPO trainer config independently,
-# then applies policy-specific overrides before constructing its v1 PPOTrainer.
+# The outer config selects one verl PPO trainer base shared by all policies;
+# each policy then applies its own overrides before constructing its v1 PPOTrainer.
 #
 # ── 模型路径（必须提供）───────────────────────────────────────────────
 # 每个 policy 的 model.path 在 policies.*.ppo_trainer_overrides 里是 ???，
@@ -15,6 +15,9 @@ example_patch_fqn: examples.multi_agent_blackbox.verl_patch
 
 # Hydra config module that provides verl's trainer configs (ppo_trainer, ppo_megatron_trainer).
 ppo_trainer_config_source: verl.trainer.config
+# verl Hydra config shared by every policy. Policy entries select differences
+# through ppo_trainer_overrides and cannot replace this trainer base.
+ppo_trainer_config_name: ppo_trainer
 
 data:
   train_files: ???
@@ -79,8 +82,10 @@ trainer:
     trainer_mode: separate_async
     separate_async:
       # Async warmup batches pre-filled into TQ before the loop starts.
-      num_warmup_batches: 2
-      # Keep 1 for the default profile (train_batch_size 4 == parameter_sync_step 1 * ppo_mini_batch_size 4).
+      num_warmup_batches: 16
+      # One rollout-weight sync cycle contains this many local PPO updates.
+      # Must satisfy train_batch_size == parameter_sync_step * each policy's
+      # actor_rollout_ref.actor.ppo_mini_batch_size.
       parameter_sync_step: 1
 
 # TransferQueue (verl): KV queue bridging rollout <-> train; enable=true is
@@ -117,16 +122,21 @@ ray_kwargs:
   # Set a path to dump a Ray timeline for profiling; null = disabled.
   timeline_json_file: null
 
-# Shared rollout/framework wiring: n/top_p are projected into the per-policy
-# configs below; agent/custom.* are consumed by the outer trainer only.
+# Shared actor/rollout/framework wiring. Values projected into per-policy
+# configs below are the single source of truth; agent/custom.* are consumed by
+# the outer trainer only.
 actor_rollout_ref:
+  actor:
+    # Kept explicit to mirror v1 separate_async's configuration-and-assertion
+    # contract. It must satisfy data.train_batch_size ==
+    # trainer.v1.separate_async.parameter_sync_step * this value.
+    ppo_mini_batch_size: 4
   rollout:
     # GRPO group size: rollouts per prompt, shared by all policies (interpolated below).
     n: 4
     # Temperature is per-policy (policies.*.ppo_trainer_overrides.actor_rollout_ref
     # .rollout.temperature); the runner does not send it, so sampling uses each
     # policy's vLLM generation config, matching the log-prob recompute.
-    top_p: 1.0
 
     agent:
       # Extension-point contract for the agent loop manager class.
@@ -166,39 +176,15 @@ policies:
   #    per-policy 分叉当前不支持（会静默不一致）。
   # 完整字段修改指南见 examples/multi_agent_blackbox/README.md。
   policy_1:
-    # verl 配置名：ppo_trainer 或 ppo_megatron_trainer（从 verl.trainer.config 模块加载）。
-    ppo_trainer_config_name: ppo_trainer
     ppo_trainer_overrides:
       trainer:
         nnodes: 2
         n_gpus_per_node: 8
         default_local_dir: checkpoints/multi_agent_blackbox/policy_1
         total_training_steps: ${trainer.total_training_steps}  # 外层共享，改顶层
-        use_v1: true
-        v1:
-          trainer_mode: ${trainer.v1.trainer_mode}             # 外层共享，改顶层
-          separate_async:
-            parameter_sync_step: ${trainer.v1.separate_async.parameter_sync_step}  # 外层共享，改顶层
-          sampler:
-            sync_refill_failed_groups: ${sampler.sync_refill_failed_groups}  # 外层共享，改顶层
 
       data:
         train_batch_size: ${data.train_batch_size}             # 外层共享，改顶层
-
-      algorithm:
-        # 以下全部外层共享：改顶层 algorithm
-        adv_estimator: ${algorithm.adv_estimator}
-        gamma: ${algorithm.gamma}
-        lam: ${algorithm.lam}
-        use_kl_in_reward: ${algorithm.use_kl_in_reward}
-        filter_groups: ${algorithm.filter_groups}
-
-      reward:
-        # 以下全部外层共享：改顶层 reward
-        num_workers: ${reward.num_workers}
-        custom_reward_function:
-          path: ${reward.custom_reward_function.path}
-          name: ${reward.custom_reward_function.name}
 
       actor_rollout_ref:
         hybrid_engine: true
@@ -209,7 +195,7 @@ policies:
         actor:
           strategy: fsdp
           use_dynamic_bsz: true
-          ppo_mini_batch_size: 4                               # train_batch_size/parameter_sync_step 须能被其整除（当前 4/1/4）
+          ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # outer shared
           ppo_max_token_len_per_gpu: 40960
           use_kl_loss: false
           kl_loss_coef: 0.0
@@ -240,7 +226,7 @@ policies:
           # temperature for this policy (fallback used by vLLM generation
           # config when the runner request carries no temperature).
           temperature: 1.0
-          top_p: ${actor_rollout_ref.rollout.top_p}            # 外层共享，改顶层
+          top_p: 1.0
           prompt_length: 4096
           response_length: 32768
           max_model_len: 36864
@@ -255,39 +241,15 @@ policies:
 
   policy_2:
     # 结构与 policy_1 相同；字段所有权注释见 policy_1（下面同样适用）。
-    # verl 配置名：ppo_trainer 或 ppo_megatron_trainer（从 verl.trainer.config 模块加载）。
-    ppo_trainer_config_name: ppo_trainer
     ppo_trainer_overrides:
       trainer:
         nnodes: 2
         n_gpus_per_node: 8
         default_local_dir: checkpoints/multi_agent_blackbox/policy_2
         total_training_steps: ${trainer.total_training_steps}  # 外层共享，改顶层
-        use_v1: true
-        v1:
-          trainer_mode: ${trainer.v1.trainer_mode}             # 外层共享，改顶层
-          separate_async:
-            parameter_sync_step: ${trainer.v1.separate_async.parameter_sync_step}  # 外层共享，改顶层
-          sampler:
-            sync_refill_failed_groups: ${sampler.sync_refill_failed_groups}  # 外层共享，改顶层
 
       data:
         train_batch_size: ${data.train_batch_size}             # 外层共享，改顶层
-
-      algorithm:
-        # 以下全部外层共享：改顶层 algorithm
-        adv_estimator: ${algorithm.adv_estimator}
-        gamma: ${algorithm.gamma}
-        lam: ${algorithm.lam}
-        use_kl_in_reward: ${algorithm.use_kl_in_reward}
-        filter_groups: ${algorithm.filter_groups}
-
-      reward:
-        # 以下全部外层共享：改顶层 reward
-        num_workers: ${reward.num_workers}
-        custom_reward_function:
-          path: ${reward.custom_reward_function.path}
-          name: ${reward.custom_reward_function.name}
 
       actor_rollout_ref:
         hybrid_engine: true
@@ -298,7 +260,7 @@ policies:
         actor:
           strategy: fsdp
           use_dynamic_bsz: true
-          ppo_mini_batch_size: 4                               # train_batch_size/parameter_sync_step 须能被其整除（当前 4/1/4）
+          ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # outer shared
           ppo_max_token_len_per_gpu: 40960
           use_kl_loss: false
           kl_loss_coef: 0.0
@@ -328,7 +290,7 @@ policies:
           # temperature for this policy (fallback used by vLLM generation
           # config when the runner request carries no temperature).
           temperature: 1.0
-          top_p: ${actor_rollout_ref.rollout.top_p}            # 外层共享，改顶层
+          top_p: 1.0
           prompt_length: 4096
           response_length: 32768
           max_model_len: 36864

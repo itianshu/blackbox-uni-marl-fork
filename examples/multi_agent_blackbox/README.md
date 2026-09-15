@@ -184,17 +184,17 @@ used by the launch scripts.
 
 ## Verification
 
-Run the real two-policy verifier on the Linux Ray 2.55.1 GPU cluster:
+Check the example configuration, launchers, and replay-buffer contract before
+allocating policy GPUs:
 
 ```bash
-bash examples/multi_agent_blackbox/scripts/run_verify_vllm_servers.sh
+pytest -q tests/test_multi_agent_blackbox_example.py \
+  tests/uni_agent/trainer/test_multi_agent_replay_buffer_contract.py
 ```
 
-Before allocating policy GPUs, it runs a remote worker probe that must report
-the prefix `policy_1_vllm_`. It then initializes both policy trainers and
-checks their placement groups and vLLM server replicas. A successful run must
-not contain a placement-group collision, reward-actor collision, or
-`Failed to look up actor` error.
+For a cluster validation, launch either bundled recipe with deliberately small
+models and data. A successful run must not contain a placement-group collision,
+reward-actor collision, or `Failed to look up actor` error.
 
 ## Policy Resource Isolation
 
@@ -202,12 +202,14 @@ not contain a placement-group collision, reward-actor collision, or
 can map to the same policy, and only the unique policy names instantiate v1
 PPOTrainer runtimes.
 
-Each `policies.<policy_name>` block declares `ppo_trainer_config_name` and
-`ppo_trainer_overrides`. The multi-agent trainer composes the named verl PPO
-base at the policy config root, applies the overrides, and passes the resolved
-config to that policy's v1 PPOTrainer. Put policy-specific model paths, optional
-Prometheus served model names, Ray resource pools, GPU counts, tensor parallel
-sizes, rollout memory settings, and checkpoint directories in the overrides.
+The root `ppo_trainer_config_source` and `ppo_trainer_config_name` select the
+single verl PPO base shared by every policy. Each `policies.<policy_name>` block
+provides `ppo_trainer_overrides`; policy entries do not select a different
+Hydra source or PPO trainer base. The multi-agent trainer composes the
+root-selected base, applies each policy's overrides, and passes the resolved
+config to that policy's v1 PPOTrainer. Put policy-specific model paths, optional Prometheus served
+model names, Ray resource pools, GPU counts, tensor parallel sizes, rollout
+memory settings, and checkpoint directories in the overrides.
 
 ## Launch
 
@@ -264,17 +266,18 @@ configuration for your production system before launching a real training run.
 
 `config/multi_agent_blackbox.yaml` 里的字段分三类，改之前先分清所有权：
 
-### 1. 外层共享字段（改顶层，勿改 per-policy 插值）
+### 1. 外层共享字段（改顶层）
 
-这些字段在 `policies.*.ppo_trainer_overrides` 里以 `${...}` 插值形式出现
-（yaml 中标注"外层共享"）。改顶层即可，per-policy 自动跟随。不要在
-per-policy 里改成字面值。
+这些字段只在 outer trainer 配置中定义，由 `MultiAgentsPPOTrainer` 投影到每个
+policy 的 v1 runtime。`algorithm.*`、`reward.*` 和 `trainer.v1` 由
+`_compose_policy_ppo_config()` 统一合并；其余共享字段仍按 YAML interpolation
+处理。改顶层即可；不需要在 per-policy 配置中重复声明。
 
 | 想改什么 | 改哪里 |
 |---|---|
 | 训练总步数 | `trainer.total_training_steps` |
 | 训练模式 sync/separate_async | `trainer.v1.trainer_mode` |
-| 每步同步频率 | `trainer.v1.separate_async.parameter_sync_step`（当前只支持 1） |
+| 每步同步频率 | `trainer.v1.separate_async.parameter_sync_step` |
 | 每步 batch 大小 | `data.train_batch_size` |
 | 序列长度上限 | `data.max_prompt_length` / `data.max_response_length` |
 | GRPO 算法配置 | `algorithm.*` |
@@ -327,6 +330,7 @@ data.val_files=/path/to/val.parquet
 - `actor.fsdp_config.fsdp_size` 须整除训练总卡数
   （`trainer.nnodes × trainer.n_gpus_per_node`；默认取全部卡数）；
 - `rollout.tensor_model_parallel_size` 须与 rollout 卡数匹配；
-- `trainer.v1.trainer_mode` 必须所有 policy 与外层一致。
+- `trainer.v1.trainer_mode` 与 `parameter_sync_step` 以 outer 配置为准，旧的
+  per-policy 值会被覆盖。
 
 完整字段注释见 `config/multi_agent_blackbox.yaml` 的 `policies:` 段。

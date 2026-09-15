@@ -2,17 +2,38 @@ from __future__ import annotations
 
 import logging
 import os
+from uuid import uuid4
 import posixpath
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
-from uuid import uuid4
 
 import numpy as np
 import ray
+import torch
 import transfer_queue as tq
+from hydra import compose, initialize_config_module
 from omegaconf import DictConfig, OmegaConf, open_dict
 from packaging.version import InvalidVersion, Version
+from tensordict.tensorclass import NonTensorData
+from torchdata.stateful_dataloader import StatefulDataLoader
+
+from verl.protocol import DataProto
+from verl.trainer.ppo.metric_utils import (
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+)
+from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler
+from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
+from verl.trainer.ppo.v1.utils import MetricsAggregator
+from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.rl_dataset import collate_fn
+from verl.utils.debug import marked_timer
+from verl.utils.skip import SkipManager
+from verl.utils.tracking import Tracking
+
+from uni_agent.trainer.gateway.runtime import PolicyRoutingLLMClient
 
 
 logger = logging.getLogger(__name__)
@@ -47,49 +68,37 @@ class MultiAgentsPPOTrainer:
         # of re-walking the config tree on every access.
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
-        if self.parameter_sync_step <= 0:
-            raise ValueError(f"parameter_sync_step must be positive, got {self.parameter_sync_step}")
         self.train_batch_size = self.config.data.train_batch_size
         self.save_freq = self.config.trainer.save_freq
         self.total_training_steps = self.config.trainer.total_training_steps
-        if self.total_training_steps < 0:
-            raise ValueError(f"total_training_steps must be non-negative, got {self.total_training_steps}")
 
         self.policy_configs = self._resolve_policy_configs()
-        self.replay_buffer = None
 
         self.policy_trainers: dict[str, Any] = {}
-        self.agent_loop_manager = None
-        self.train_dataset = None
-        self.val_dataset = None
-        self.train_dataloader = None
-        self.val_dataloader = None
-        self.train_dataloader_it = None
         self.global_steps = 0
         self.timing_raw: dict[str, Any] = {}
 
         self._create_policy_trainers()
-        # Per-policy phase methods (compute_log_prob / update_actor /
-        # update_weights) run on disjoint GPU sets, so they are submitted to
-        # this pool to overlap instead of idling one policy's GPUs. verl's
-        # phase methods are synchronous (they block on ray.get), so threads are
-        # the natural parallelism unit; TQ creates a fresh zmq socket per call
-        # and ray.get is thread-safe, making this safe.
+        # Different policies use disjoint GPU sets, so their training phases
+        # run concurrently in this pool.
         self._policy_pool = ThreadPoolExecutor(max_workers=max(1, len(self.policy_trainers)))
 
     def _resolve_policy_configs(self) -> dict[str, Any]:
         policies = self.config.get("policies")
+        # The PPO trainer base is an outer-level runtime choice shared by
+        # every policy. Policy entries may customize the composed config
+        # through ``ppo_trainer_overrides`` but cannot select a different
+        # trainer implementation.
+        config_name = self.config.get("ppo_trainer_config_name")
+        if not config_name:
+            raise ValueError(
+                "config.ppo_trainer_config_name is required "
+                "(e.g. 'ppo_trainer' or 'ppo_megatron_trainer')"
+            )
+
         resolved = {}
         for policy_key, policy_entry in (policies.items() if policies is not None else []):
-            # The policy name is the dict key itself; the yaml has no per-policy
-            # "name" override field.
             policy_name = policy_key
-            config_name = policy_entry.get("ppo_trainer_config_name")
-            if not config_name:
-                raise ValueError(
-                    f"policy '{policy_name}' requires config.policies['{policy_name}'].ppo_trainer_config_name "
-                    "(e.g. 'ppo_trainer' or 'ppo_megatron_trainer')"
-                )
             resolved[policy_name] = self._compose_policy_ppo_config(
                 policy_name=policy_name,
                 config_name=config_name,
@@ -97,19 +106,14 @@ class MultiAgentsPPOTrainer:
             )
 
         if not resolved:
-            raise ValueError("MultiAgentsPPOTrainer requires config.policies[*].ppo_trainer_config_name")
+            raise ValueError("MultiAgentsPPOTrainer requires config.policies")
         return resolved
 
     def _compose_policy_ppo_config(self, *, policy_name: str, config_name: str, policy_entry: Any):
-        from hydra import compose, initialize_config_module
-
-        # Policy trainer configs come from a hydra config module (e.g. verl's
-        # "verl.trainer.config"); per-policy source overrides the outer default.
-        source = (
-            policy_entry.get("ppo_trainer_config_source")
-            or self.config.get("ppo_trainer_config_source")
-            or "verl.trainer.config"
-        )
+        # Policy trainer configs come from one outer-selected Hydra config
+        # module (e.g. verl's ``verl.trainer.config``). Policy entries cannot
+        # replace this source; they only provide config overrides below.
+        source = self.config.get("ppo_trainer_config_source") or "verl.trainer.config"
         with initialize_config_module(config_module=source, version_base=None):
             policy_config = compose(config_name=config_name)
 
@@ -119,8 +123,29 @@ class MultiAgentsPPOTrainer:
             if callable(set_struct):
                 set_struct(policy_config, False)
             if isinstance(overrides, DictConfig):
+                # Resolve policy overrides in the outer Hydra context. This
+                # preserves existing ${...} projections (for example,
+                # data.train_batch_size) before merging them into the
+                # resolved per-policy PPO config.
                 overrides = OmegaConf.to_container(overrides, resolve=True)
             policy_config = OmegaConf.merge(policy_config, OmegaConf.create(overrides))
+
+        # ``algorithm``, ``reward``, and ``trainer.v1`` are outer-owned in the
+        # multi-agent trainer. Merge (rather than replace) these sections so
+        # every policy receives identical shared semantics while verl defaults
+        # not declared by the outer config remain available.
+        outer_owned_sections = {}
+        for section_name in ("algorithm", "reward"):
+            section = OmegaConf.select(self.config, section_name, default=None)
+            if section is not None:
+                outer_owned_sections[section_name] = OmegaConf.to_container(section, resolve=True)
+        outer_v1 = OmegaConf.select(self.config, "trainer.v1", default=None)
+        if outer_v1 is not None:
+            outer_owned_sections["trainer"] = {
+                "v1": OmegaConf.to_container(outer_v1, resolve=True),
+            }
+        if outer_owned_sections:
+            policy_config = OmegaConf.merge(policy_config, OmegaConf.create(outer_owned_sections))
 
         with open_dict(policy_config):
             policy_config.policy_name = policy_name
@@ -137,22 +162,14 @@ class MultiAgentsPPOTrainer:
                 with open_dict(trainer_config):
                     trainer_config.resume_mode = "disable"
 
-            trainer_mode = policy_config.trainer.v1.trainer_mode
-            if trainer_mode == "sync":
+            if self.trainer_mode == "sync":
                 from uni_agent.trainer.single_ppo_trainer import SinglePPOTrainer
                 trainer_cls = SinglePPOTrainer
-            elif trainer_mode == "separate_async":
-                parameter_sync_step = policy_config.trainer.v1.separate_async.parameter_sync_step
-                if parameter_sync_step != 1:
-                    raise ValueError(
-                        "MultiAgentsPPOTrainer separate_async mode only supports parameter_sync_step=1 "
-                        "for now (Decoupled PPO is a deferred phase); got "
-                        f"parameter_sync_step={parameter_sync_step}."
-                    )
+            elif self.trainer_mode == "separate_async":
                 from uni_agent.trainer.single_async_ppo_trainer import SingleAsyncPPOTrainer
                 trainer_cls = SingleAsyncPPOTrainer
             else:
-                raise ValueError(f"Unsupported trainer.v1.trainer_mode: {trainer_mode!r}")
+                raise ValueError(f"Unsupported trainer.v1.trainer_mode: {self.trainer_mode!r}")
             self.policy_trainers[policy_name] = trainer_cls(config=policy_config)
         return self.policy_trainers
 
@@ -179,8 +196,6 @@ class MultiAgentsPPOTrainer:
             policy_trainer.on_init_end()
 
     def get_multi_policy_llm_client(self) -> list[Any] | None:
-        from uni_agent.trainer.gateway.runtime import PolicyRoutingLLMClient
-
         policy_clients = {}
         for policy_name, trainer in self.policy_trainers.items():
             get_llm_client = getattr(trainer, "get_llm_client", None)
@@ -247,7 +262,6 @@ class MultiAgentsPPOTrainer:
             agent_loop_manager: The agent loop manager to generate sequences.
         """
         self.agent_loop_manager = agent_loop_manager
-        from verl.utils.tracking import Tracking
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -265,8 +279,6 @@ class MultiAgentsPPOTrainer:
         try:
             while self.global_steps <= self.total_training_steps:
                 step_metrics = self.train_step()
-                if self._should_save_checkpoint():
-                    self._save_checkpoint()
                 # Mirror verl v1 trainer.fit(): record per-step metrics
                 # (loss/adv/grad_norm, prefixed per policy) to the configured
                 # backend. Sorting keeps the two policies' metrics grouped.
@@ -283,14 +295,17 @@ class MultiAgentsPPOTrainer:
     def train_step(self) -> dict[str, Any]:
         metrics: dict[str, Any] = {}
         self.timing_raw = {}
-        self._sync_policy_runtime_context()
-        self.on_step_begin()
-        batch = self.step(metrics=metrics, timing_raw=self.timing_raw)
-        self.on_step_end()
-        # separate_async: each policy's on_step_end stores the standalone
-        # checkpoint manager's weight-sync metrics in _pending_sync_metrics;
-        # verl's native fit() merges them via _consume_sync_metrics().
-        metrics.update(self._consume_sync_metrics())
+        with marked_timer("step", self.timing_raw):
+            self._sync_policy_runtime_context()
+            self.on_step_begin()
+            batch = self.step(metrics=metrics, timing_raw=self.timing_raw)
+            if self._should_save_checkpoint():
+                with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+                    self._save_checkpoint()
+            self.on_step_end()
+            # Collect separate_async weight-sync metrics from the policy trainers.
+            metrics.update(self._consume_sync_metrics())
+        self._add_data_metrics(batch, metrics, timing_raw=self.timing_raw)
         # Mirror verl v1 trainer.fit(): evict the sampled trajectory records
         # from TransferQueue at the end of each step. ReplayBuffer.sample()
         # only clears the prompt uids, so without this the per-trajectory
@@ -328,6 +343,7 @@ class MultiAgentsPPOTrainer:
     def step(self, metrics: dict[str, Any] | None = None, timing_raw: dict[str, Any] | None = None):
         metrics = metrics if metrics is not None else {}
         timing_raw = timing_raw if timing_raw is not None else {}
+        self.timing_raw = timing_raw
         train_batch_size = self.train_batch_size
         parameter_sync_step = self.parameter_sync_step
         if train_batch_size % parameter_sync_step != 0:
@@ -338,12 +354,67 @@ class MultiAgentsPPOTrainer:
         sample_batch_size = train_batch_size // parameter_sync_step
 
         self._add_batch_to_generate()
-        step_batches = [
-            self._step_once(metrics, timing_raw, sample_batch_size)
-            for _ in range(parameter_sync_step)
-        ]
-        if len(step_batches) == 1:
-            return step_batches[0]
+
+        # Decoupled PPO uses a stable pi_old within one parameter-sync cycle.
+        # A local MAS batch may not contain trajectories for every policy, so
+        # each policy advances its trigger step only when it participates.
+        policy_local_trigger_steps = {policy_name: 0 for policy_name in self.policy_trainers}
+        if parameter_sync_step == 1:
+            if self.trainer_mode == "separate_async":
+                for policy_name, trainer in self.policy_trainers.items():
+                    trainer.local_trigger_step = policy_local_trigger_steps[policy_name]
+            return self._step_once(metrics, timing_raw, sample_batch_size)
+
+        metrics_aggregator = MetricsAggregator()
+        policy_metrics_aggregators = {
+            policy_name: MetricsAggregator() for policy_name in self.policy_trainers
+        }
+        step_batches = []
+        for _ in range(parameter_sync_step):
+            if self.trainer_mode == "separate_async":
+                for policy_name, trainer in self.policy_trainers.items():
+                    trainer.local_trigger_step = policy_local_trigger_steps[policy_name]
+            iter_metrics: dict[str, Any] = {}
+            batch = self._step_once(iter_metrics, timing_raw, sample_batch_size)
+            step_batches.append(batch)
+
+            non_padding_mask = np.array(
+                [not tag.get("is_padding", False) for tag in batch.tags],
+                dtype=bool,
+            )
+            metrics_aggregator.add_step_metrics(
+                {
+                    key: value
+                    for key, value in iter_metrics.items()
+                    if not any(key.startswith(f"{policy_name}/") for policy_name in self.policy_trainers)
+                },
+                sample_count=int(non_padding_mask.sum()),
+            )
+            for policy_name, aggregator in policy_metrics_aggregators.items():
+                prefix = f"{policy_name}/"
+                policy_metrics = {
+                    key.removeprefix(prefix): value
+                    for key, value in iter_metrics.items()
+                    if key.startswith(prefix)
+                }
+                policy_sample_count = sum(
+                    not tag.get("is_padding", False) and tag.get("policy_name") == policy_name
+                    for tag in batch.tags
+                )
+                aggregator.add_step_metrics(policy_metrics, sample_count=policy_sample_count)
+
+            updated_policy_names = {
+                tag.get("policy_name")
+                for tag in batch.tags
+                if tag.get("policy_name") in policy_local_trigger_steps
+            }
+            for policy_name in updated_policy_names:
+                policy_local_trigger_steps[policy_name] += 1
+
+        metrics.update(metrics_aggregator.get_aggregated_metrics())
+        for policy_name, aggregator in policy_metrics_aggregators.items():
+            for key, value in aggregator.get_aggregated_metrics().items():
+                metrics[f"{policy_name}/{key}"] = value
 
         return self._make_batch_like(
             step_batches[0],
@@ -352,20 +423,23 @@ class MultiAgentsPPOTrainer:
         )
 
     def _step_once(self, metrics: dict[str, Any], timing_raw: dict[str, Any], sample_batch_size: int):
-        del timing_raw
-        multi_agent_batch = self.sample_multi_agent_batch(sample_batch_size=sample_batch_size, metrics=metrics)
+        self.timing_raw = timing_raw
+        with marked_timer("gen", timing_raw, color="red"):
+            multi_agent_batch = self.sample_multi_agent_batch(
+                sample_batch_size=sample_batch_size,
+                metrics=metrics,
+            )
         per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
         per_policy_batches = self.prepare_policy_batches_for_ppo_update(per_policy_batches, metrics)
-        multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
-            per_policy_batches,
-            metrics,
-        )
-        self._add_data_metrics(multi_agent_batch, metrics)
+        with marked_timer("adv", timing_raw, color="brown"):
+            multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
+                per_policy_batches,
+                metrics,
+            )
         # Chain the advantage-computed batch into the update, mirroring verl's
         # standard flow (`batch = _compute_advantage(batch); _update_actor(batch)`).
-        # Without this, per-policy batches never carry the advantages that
-        # _compute_advantage wrote back, and worker-side ppo_loss fails with
-        # KeyError('advantages').
+        # Without this, the per-policy update batches would not contain the
+        # advantages produced by _compute_advantage.
         per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
         self.update_policy_trainers(per_policy_batches, metrics=metrics)
         return multi_agent_batch
@@ -387,9 +461,6 @@ class MultiAgentsPPOTrainer:
         if metrics is not None and off_policy_metrics:
             metrics.update(off_policy_metrics)
 
-        # NOTE: sampling temperature is intentionally NOT attached here. The
-        # outer config has no actor_rollout_ref.rollout.temperature (it is
-        # per-policy), and verl's per-policy _compute_old_log_prob writes the
         return batch
 
     def build_per_policy_batches(self, multi_agent_batch):
@@ -439,37 +510,26 @@ class MultiAgentsPPOTrainer:
         self, policy_name: str, batch
     ) -> tuple[str, Any, dict[str, Any], dict[str, float]]:
         """Run one policy's pre-update stages (balance + old/ref log-probs + values)."""
-        from verl.utils.debug import marked_timer
-
         trainer = self.policy_trainers[policy_name]
         policy_metrics: dict[str, Any] = {}
         timing_raw: dict[str, float] = {}
 
-        balance_batch = getattr(trainer, "_balance_batch", None)
-        if callable(balance_batch):
-            batch = self._call_v1_stage(
-                balance_batch,
-                batch,
-                policy_metrics,
-                logging_prefix="global_seqlen",
-            )
+        batch = trainer._balance_batch(
+            batch,
+            metrics=policy_metrics,
+            logging_prefix="global_seqlen",
+        )
 
-        compute_old_log_prob = getattr(trainer, "_compute_old_log_prob", None)
-        if callable(compute_old_log_prob):
-            with marked_timer(f"{policy_name}/old_log_prob", timing_raw, color="blue"):
-                batch = self._call_v1_stage(compute_old_log_prob, batch, policy_metrics)
+        with marked_timer(f"{policy_name}/old_log_prob", timing_raw, color="blue"):
+            batch = trainer._compute_old_log_prob(batch, metrics=policy_metrics)
 
-        if getattr(trainer, "use_reference_policy", False):
-            compute_ref_log_prob = getattr(trainer, "_compute_ref_log_prob", None)
-            if callable(compute_ref_log_prob):
-                with marked_timer(f"{policy_name}/ref_log_prob", timing_raw, color="olive"):
-                    batch = self._call_v1_stage(compute_ref_log_prob, batch, policy_metrics)
+        if trainer.use_reference_policy:
+            with marked_timer(f"{policy_name}/ref_log_prob", timing_raw, color="olive"):
+                batch = trainer._compute_ref_log_prob(batch, metrics=policy_metrics)
 
-        if getattr(trainer, "use_critic", False):
-            compute_values = getattr(trainer, "_compute_values", None)
-            if callable(compute_values):
-                with marked_timer(f"{policy_name}/values", timing_raw, color="cyan"):
-                    batch = self._call_v1_stage(compute_values, batch, policy_metrics)
+        if trainer.use_critic:
+            with marked_timer(f"{policy_name}/values", timing_raw, color="cyan"):
+                batch = trainer._compute_values(batch, metrics=policy_metrics)
 
         return policy_name, batch, policy_metrics, timing_raw
 
@@ -479,13 +539,12 @@ class MultiAgentsPPOTrainer:
         # written back to the shared trajectory records.
         multi_agent_batch = self._merge_policy_batches(per_policy_batches)
         return self.compute_multi_agent_advantage(multi_agent_batch, metrics)
+
     def compute_multi_agent_advantage(self, multi_agent_batch, metrics: dict[str, Any]):
         for trainer in self.policy_trainers.values():
-            compute_advantage = getattr(trainer, "_compute_advantage", None)
-            if callable(compute_advantage):
-                batch = self._call_v1_stage(compute_advantage, multi_agent_batch, metrics)
-                self._add_advantage_metrics(multi_agent_batch, metrics)
-                return batch
+            multi_agent_batch = trainer._compute_advantage(multi_agent_batch, metrics=metrics)
+            self._add_advantage_metrics(multi_agent_batch, metrics)
+            return multi_agent_batch
         raise AttributeError("At least one policy trainer must provide _compute_advantage()")
 
     def _add_advantage_metrics(self, batch, metrics: dict[str, Any]) -> None:
@@ -500,8 +559,6 @@ class MultiAgentsPPOTrainer:
         if batch is None or not getattr(batch, "keys", None) or not getattr(batch, "tags", None):
             return
         try:
-            import torch
-
             data = tq.kv_batch_get(
                 keys=batch.keys,
                 partition_id=getattr(batch, "partition_id", "train"),
@@ -542,7 +599,12 @@ class MultiAgentsPPOTrainer:
             for key, value in stats.items():
                 metrics[f"{policy_name}/actor/{key}"] = value
 
-    def _add_data_metrics(self, batch, metrics: dict[str, Any]) -> None:
+    def _add_data_metrics(
+        self,
+        batch,
+        metrics: dict[str, Any],
+        timing_raw: dict[str, float] | None = None,
+    ) -> None:
         """Mirror verl v1 ``_compute_metrics``' data-metrics portion, per policy.
 
         Fetches score/reward/advantage/return/length/num-turns fields from the
@@ -550,14 +612,52 @@ class MultiAgentsPPOTrainer:
         ``compute_data_metrics`` (token-level masked, identical semantics to
         native verl), split per policy. Keys are prefixed ``policy_X/``, e.g.
         ``policy_1/critic/score/mean`` / ``policy_1/response_length/mean``.
+        Trajectory version-span and staleness metrics use the corresponding
+        records' tags, matching verl v1's separate_async definitions.
         """
         if batch is None or not getattr(batch, "keys", None) or not getattr(batch, "tags", None):
             return
-        try:
-            import torch
-            from verl import DataProto
-            from verl.trainer.ppo.metric_utils import compute_data_metrics
 
+        non_padding_mask = np.array(
+            [not tag.get("is_padding", False) for tag in batch.tags],
+            dtype=bool,
+        )
+        policy_masks = {}
+        for policy_name in self.policy_trainers:
+            mask = non_padding_mask & np.array(
+                [tag.get("policy_name") == policy_name for tag in batch.tags],
+                dtype=bool,
+            )
+            policy_masks[policy_name] = mask
+
+        if all(
+            tag.get("is_padding", False)
+            or ("min_global_steps" in tag and "max_global_steps" in tag)
+            for tag in batch.tags
+        ):
+            min_global_steps = np.asarray(
+                [tag.get("min_global_steps", 0) for tag in batch.tags],
+                dtype=np.int64,
+            )
+            max_global_steps = np.asarray(
+                [tag.get("max_global_steps", 0) for tag in batch.tags],
+                dtype=np.int64,
+            )
+            staleness_metric_values = (
+                ("trajectory_spans", max_global_steps - min_global_steps + 1),
+                ("trajectory_staleness", (self.global_steps - 1) - max_global_steps),
+                ("trajectory_staleness_worst", (self.global_steps - 1) - min_global_steps),
+            )
+            for metric_prefix, mask in [("training", non_padding_mask), *policy_masks.items()]:
+                if not mask.any():
+                    continue
+                for metric_name, values in staleness_metric_values:
+                    selected = values[mask]
+                    metrics[f"{metric_prefix}/off_policy/{metric_name}/mean"] = selected.mean().item()
+                    metrics[f"{metric_prefix}/off_policy/{metric_name}/max"] = selected.max().item()
+                    metrics[f"{metric_prefix}/off_policy/{metric_name}/min"] = selected.min().item()
+
+        try:
             data = tq.kv_batch_get(
                 keys=batch.keys,
                 partition_id=getattr(batch, "partition_id", "train"),
@@ -583,19 +683,27 @@ class MultiAgentsPPOTrainer:
                 data["token_level_rewards"] = data["rm_scores"]
             data["prompt_length"] = prompt_length.float()
             data["response_length"] = response_length.float()
-            dp = DataProto(batch=data)
+            global_token_num = (prompt_length + response_length).tolist()
+            dp = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
         except Exception as exc:
             logger.warning("failed to compute data metrics: %s", exc)
             return
 
+        if timing_raw and "step" in timing_raw:
+            try:
+                metrics.update(compute_timing_metrics(batch=dp, timing_raw=timing_raw))
+                metrics.update(
+                    compute_throughout_metrics(
+                        batch=dp,
+                        timing_raw=timing_raw,
+                        n_gpus=self._get_n_gpus_for_throughput(),
+                    )
+                )
+            except Exception as exc:
+                logger.warning("failed to compute timing metrics: %s", exc)
+
         for policy_name in self.policy_trainers:
-            mask = np.array(
-                [
-                    not tag.get("is_padding", False) and tag.get("policy_name") == policy_name
-                    for tag in batch.tags
-                ],
-                dtype=bool,
-            )
+            mask = policy_masks[policy_name]
             if not mask.any():
                 continue
             try:
@@ -627,27 +735,29 @@ class MultiAgentsPPOTrainer:
             updated[policy_name] = batch
         self.timing_raw.update(timing_raw)
         return updated
+
+    def _get_n_gpus_for_throughput(self) -> int:
+        """Return the total GPU count represented by all policy trainers."""
+        return sum(
+            trainer._get_n_gpus_for_throughput()
+            for trainer in self.policy_trainers.values()
+        )
+
     def _update_one_policy(
         self, policy_name: str, batch, critic_warmup: int
     ) -> tuple[str, Any, dict[str, Any], dict[str, float]]:
         """Run one policy's critic/actor update."""
-        from verl.utils.debug import marked_timer
-
         trainer = self.policy_trainers[policy_name]
         policy_metrics: dict[str, Any] = {}
         timing_raw: dict[str, float] = {}
 
-        if getattr(trainer, "use_critic", False):
-            update_critic = getattr(trainer, "_update_critic", None)
-            if callable(update_critic):
-                with marked_timer(f"{policy_name}/update_critic", timing_raw, color="pink"):
-                    batch = self._call_v1_stage(update_critic, batch, policy_metrics)
+        if trainer.use_critic:
+            with marked_timer(f"{policy_name}/update_critic", timing_raw, color="pink"):
+                batch = trainer._update_critic(batch, metrics=policy_metrics)
 
         if critic_warmup <= self.global_steps:
-            update_actor = getattr(trainer, "_update_actor", None)
-            if callable(update_actor):
-                with marked_timer(f"{policy_name}/update_actor", timing_raw, color="red"):
-                    batch = self._call_v1_stage(update_actor, batch, policy_metrics)
+            with marked_timer(f"{policy_name}/update_actor", timing_raw, color="red"):
+                batch = trainer._update_actor(batch, metrics=policy_metrics)
 
         return policy_name, batch, policy_metrics, timing_raw
 
@@ -670,10 +780,6 @@ class MultiAgentsPPOTrainer:
             )
         tokenizer = source_trainer.tokenizer
         processor = getattr(source_trainer, "processor", None)
-
-        from verl.trainer.ppo.utils import create_rl_dataset, create_rl_sampler
-        from torchdata.stateful_dataloader import StatefulDataLoader
-        from verl.utils.dataset.rl_dataset import collate_fn
 
         self.train_dataset = create_rl_dataset(
             self.config.data.train_files,
@@ -737,8 +843,6 @@ class MultiAgentsPPOTrainer:
         filtering / sync_refill_failed_groups refills never route through a
         per-policy trainer that lacks an agent_loop_manager.
         """
-        from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer, ReplayBufferAsync
-
         trainer_mode = self.trainer_mode
         buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
 
@@ -851,11 +955,9 @@ class MultiAgentsPPOTrainer:
                 )
 
         dataloader_path = os.path.join(checkpoint_dir, "data.pt")
-        if self.train_dataloader is not None and os.path.exists(dataloader_path):
-            import torch
-
+        if os.path.exists(dataloader_path):
             self.train_dataloader.load_state_dict(torch.load(dataloader_path, weights_only=False))
-        elif self.train_dataloader is not None:
+        else:
             logger.warning("No dataloader state found at %s; starting its state from scratch", dataloader_path)
 
         if self.trainer_mode != "sync" and _tq_supports_checkpoint():
@@ -881,9 +983,6 @@ class MultiAgentsPPOTrainer:
         ]
         if not inflight_uids:
             return 0
-        if self.agent_loop_manager is None:
-            raise RuntimeError("agent_loop_manager must be initialized before reissuing prompts")
-
         batch = tq.kv_batch_get(keys=inflight_uids, partition_id=partition_id)
         trajectory_prefixes = tuple(f"{uid}_" for uid in inflight_uids)
         old_trajectory_keys = [
@@ -893,8 +992,6 @@ class MultiAgentsPPOTrainer:
         ]
         if old_trajectory_keys:
             tq.kv_clear(keys=old_trajectory_keys, partition_id=partition_id)
-
-        from verl.utils import tensordict_utils as tu
 
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         tags = [
@@ -1008,11 +1105,8 @@ class MultiAgentsPPOTrainer:
                     max_ckpt_to_keep=max_critic_ckpt_to_keep,
                 )
 
-        if self.train_dataloader is not None:
-            import torch
-
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            torch.save(self.train_dataloader.state_dict(), os.path.join(checkpoint_dir, "data.pt"))
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        torch.save(self.train_dataloader.state_dict(), os.path.join(checkpoint_dir, "data.pt"))
 
         if self.trainer_mode != "sync" and _tq_supports_checkpoint():
             tq.save_checkpoint(
@@ -1067,8 +1161,6 @@ class MultiAgentsPPOTrainer:
         return self.global_steps >= self.total_training_steps or self.global_steps % save_freq == 0
 
     def _fetch_one_gen_batch(self):
-        if self.train_dataloader is None:
-            return None
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
@@ -1076,8 +1168,6 @@ class MultiAgentsPPOTrainer:
         except StopIteration:
             self.train_dataloader_it = iter(self.train_dataloader)
             batch_dict = next(self.train_dataloader_it)
-
-        from verl.utils import tensordict_utils as tu
 
         batch_dict["uid"] = np.array([str(uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         return tu.get_tensordict(batch_dict)
@@ -1089,8 +1179,6 @@ class MultiAgentsPPOTrainer:
         multiple of ``data.gen_batch_size`` (defaults to ``data.train_batch_size``),
         and is submitted in whole gen-batch dataloader fetches.
         """
-        if self.train_dataloader is None:
-            return None
         train_batch_size = self.train_batch_size
         if num_prompts is None:
             num_prompts = train_batch_size
@@ -1105,8 +1193,6 @@ class MultiAgentsPPOTrainer:
                 f"num_prompts ({num_prompts}) must be a positive multiple of gen_batch_size "
                 f"({gen_batch_size}); it is submitted in whole gen_batch_size dataloader fetches."
             )
-
-        from verl.utils import tensordict_utils as tu
 
         chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
         if any(chunk is None for chunk in chunks):
@@ -1138,8 +1224,6 @@ class MultiAgentsPPOTrainer:
         if batch is None:
             return 0
 
-        from verl.utils import tensordict_utils as tu
-
         uid_values = tu.get(batch, "uid")
         if uid_values is None:
             raise ValueError("MultiAgentsPPOTrainer requires batch['uid'] before rollout submission")
@@ -1164,15 +1248,11 @@ class MultiAgentsPPOTrainer:
         # prompts can be re-issued after a checkpoint resume.
         trainer_mode = self.trainer_mode
         if trainer_mode != "sync":
-            from tensordict.tensorclass import NonTensorData
-
             fields = batch.select(
                 *[key for key in batch.keys() if not isinstance(batch.get(key), NonTensorData)]
             )
             put_kwargs["fields"] = fields
         tq.kv_batch_put(**put_kwargs)
-        if self.agent_loop_manager is None:
-            raise RuntimeError("agent_loop_manager must be passed to fit() before rollout submission")
         self.agent_loop_manager.generate_sequences(batch)
         return len(uid_values)
 
@@ -1183,8 +1263,6 @@ class MultiAgentsPPOTrainer:
 
     def on_train_begin(self) -> None:
         if self.config.get("skip") is not None:
-            from verl.utils.skip import SkipManager
-
             SkipManager.init(self.config)
         if self.trainer_mode == "sync":
             return
@@ -1275,8 +1353,6 @@ class MultiAgentsPPOTrainer:
 
     def _update_weights_one_policy(self, policy_name: str) -> tuple[None, dict[str, Any]]:
         """Wake one policy's vLLM replicas with the current weights."""
-        from verl.utils.debug import marked_timer
-
         timing_raw: dict[str, Any] = {}
         trainer = self.policy_trainers[policy_name]
         checkpoint_manager = getattr(trainer, "checkpoint_manager", None)
@@ -1295,8 +1371,6 @@ class MultiAgentsPPOTrainer:
     def on_sample_end(self) -> None:
         self._sync_policy_runtime_context()
         if self.trainer_mode == "sync":
-            from verl.utils.debug import marked_timer
-
             for policy_name, trainer in self.policy_trainers.items():
                 checkpoint_manager = getattr(trainer, "checkpoint_manager", None)
                 if checkpoint_manager is None:
@@ -1307,19 +1381,15 @@ class MultiAgentsPPOTrainer:
                 with marked_timer(f"{policy_name}/sleep_replicas", self.timing_raw, color="red"):
                     sleep_replicas()
             return
-        # separate_async: delegate to verl's per-policy on_sample_end
-        # (hybrid replicas switch to trainer mode; standalone replicas keep running).
+        # separate_async: delegate to verl's per-policy on_sample_end.
+        # On the first completed sample, hybrid replicas switch from rollout
+        # to trainer mode while standalone replicas remain available for rollout.
         futures = [
             self._policy_pool.submit(self._run_trainer_hook, policy_name, "on_sample_end")
             for policy_name in self.policy_trainers
         ]
         for future in futures:
             future.result()
-
-    @staticmethod
-    def _call_v1_stage(method, batch, metrics: dict[str, Any], **kwargs):
-        result = method(batch, metrics=metrics, **kwargs)
-        return batch if result is None else result
 
     @staticmethod
     def _prefix_metrics(metrics: dict[str, Any], policy_name: str, policy_metrics: dict[str, Any]) -> None:
@@ -1329,24 +1399,13 @@ class MultiAgentsPPOTrainer:
     @staticmethod
     def _make_batch_like(template, *, keys: list[str], tags: list[dict[str, Any]]):
         kwargs = {
-            "partition_id": getattr(template, "partition_id", "train"),
+            "partition_id": template.partition_id,
             "keys": list(keys),
             "tags": [dict(tag) for tag in tags],
+            "fields": template.fields,
+            "extra_info": dict(template.extra_info or {}),
         }
-        if hasattr(template, "fields"):
-            kwargs["fields"] = getattr(template, "fields")
-        if hasattr(template, "extra_info"):
-            kwargs["extra_info"] = dict(getattr(template, "extra_info") or {})
-
-        try:
-            return template.__class__(**kwargs)
-        except TypeError:
-            try:
-                from transfer_queue import KVBatchMeta
-            except ImportError:
-                from verl.utils.transferqueue_utils import KVBatchMeta
-
-            return KVBatchMeta(**kwargs)
+        return template.__class__(**kwargs)
 
     def _merge_policy_batches(self, per_policy_batches: Mapping[str, Any]):
         merged_keys: list[str] = []
@@ -1372,25 +1431,18 @@ class MultiAgentsPPOTrainer:
         best-effort and isolated from one another:
 
         1. stop framework background rollouts and remote MAS tasks;
-        2. per-policy v1 trainer cleanup (no-op with current verl, kept for
-           forward compatibility);
+        2. invoke per-policy v1 trainer cleanup hooks when available;
         3. remove per-policy placement groups (frees vLLM/worker GPU actors);
         4. shut down gateway actors owned by the agent framework runtime.
         """
-        framework = (
-            getattr(self.agent_loop_manager, "framework", None)
-            if self.agent_loop_manager is not None
-            else None
-        )
+        framework = getattr(getattr(self, "agent_loop_manager", None), "framework", None)
         shutdown_framework = getattr(framework, "shutdown", None)
         if callable(shutdown_framework):
             try:
                 shutdown_framework()
             except Exception as exc:
                 logger.warning("multi-agent framework shutdown failed: %s", exc)
-                # Active rollout tasks may still access policies and Gateway.
-                # Preserve those resources and surface the failure so callers
-                # do not treat a partial cleanup as successful.
+                # Stop cleanup so partial teardown is not reported as success.
                 raise
 
         for trainer in self.policy_trainers.values():
@@ -1450,7 +1502,7 @@ class MultiAgentsPPOTrainer:
 
     def _shutdown_gateway_actors(self) -> None:
         """Shut down gateway Ray actors owned by the agent framework runtime."""
-        framework = getattr(self.agent_loop_manager, "framework", None) if self.agent_loop_manager is not None else None
+        framework = getattr(getattr(self, "agent_loop_manager", None), "framework", None)
         session_runtime = getattr(framework, "session_runtime", None)
         actors = getattr(session_runtime, "owned_gateway_actors", None) or []
         for gateway in actors:

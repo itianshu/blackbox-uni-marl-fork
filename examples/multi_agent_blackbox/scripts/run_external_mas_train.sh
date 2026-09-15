@@ -18,24 +18,39 @@ VAL_DATA="${VAL_DATA:-${MOCK_DATA_DIR}/mock_mas_val.parquet}"
 
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-30}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}"
+PARAMETER_SYNC_STEP="${PARAMETER_SYNC_STEP:-1}"
+if (( PARAMETER_SYNC_STEP <= 0 )); then
+    echo "ERROR: PARAMETER_SYNC_STEP must be positive" >&2
+    exit 1
+fi
+if (( TRAIN_BATCH_SIZE % PARAMETER_SYNC_STEP != 0 )); then
+    echo "ERROR: TRAIN_BATCH_SIZE must be divisible by PARAMETER_SYNC_STEP" >&2
+    exit 1
+fi
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-$((TRAIN_BATCH_SIZE / PARAMETER_SYNC_STEP))}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 NUM_WARMUP_BATCHES="${NUM_WARMUP_BATCHES:-2}"
 PROMPT_LENGTH="${PROMPT_LENGTH:-4096}"
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-16384}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((PROMPT_LENGTH + RESPONSE_LENGTH + 512))}"
 
+if (( TRAIN_BATCH_SIZE != PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE )); then
+    echo "ERROR: TRAIN_BATCH_SIZE must equal PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE" >&2
+    exit 1
+fi
+
 POLICY_1_NNODES="${POLICY_1_NNODES:-1}"
-POLICY_1_N_GPUS_PER_NODE="${POLICY_1_N_GPUS_PER_NODE:-2}"
-POLICY_1_FSDP_SIZE="${POLICY_1_FSDP_SIZE:-${POLICY_1_N_GPUS_PER_NODE}}"
+POLICY_1_N_GPUS_PER_NODE="${POLICY_1_N_GPUS_PER_NODE:-4}"
+POLICY_1_FSDP_SIZE="${POLICY_1_FSDP_SIZE:-2}"
 POLICY_1_ROLLOUT_NNODES="${POLICY_1_ROLLOUT_NNODES:-1}"
-POLICY_1_ROLLOUT_N_GPUS_PER_NODE="${POLICY_1_ROLLOUT_N_GPUS_PER_NODE:-2}"
+POLICY_1_ROLLOUT_N_GPUS_PER_NODE="${POLICY_1_ROLLOUT_N_GPUS_PER_NODE:-4}"
 POLICY_1_TENSOR_PARALLEL_SIZE="${POLICY_1_TENSOR_PARALLEL_SIZE:-2}"
 
 POLICY_2_NNODES="${POLICY_2_NNODES:-1}"
-POLICY_2_N_GPUS_PER_NODE="${POLICY_2_N_GPUS_PER_NODE:-2}"
-POLICY_2_FSDP_SIZE="${POLICY_2_FSDP_SIZE:-${POLICY_2_N_GPUS_PER_NODE}}"
+POLICY_2_N_GPUS_PER_NODE="${POLICY_2_N_GPUS_PER_NODE:-4}"
+POLICY_2_FSDP_SIZE="${POLICY_2_FSDP_SIZE:-2}"
 POLICY_2_ROLLOUT_NNODES="${POLICY_2_ROLLOUT_NNODES:-1}"
-POLICY_2_ROLLOUT_N_GPUS_PER_NODE="${POLICY_2_ROLLOUT_N_GPUS_PER_NODE:-2}"
+POLICY_2_ROLLOUT_N_GPUS_PER_NODE="${POLICY_2_ROLLOUT_N_GPUS_PER_NODE:-4}"
 POLICY_2_TENSOR_PARALLEL_SIZE="${POLICY_2_TENSOR_PARALLEL_SIZE:-2}"
 
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/examples/multi_agent_blackbox/logs}"
@@ -98,14 +113,15 @@ echo "============================================"
     trainer.total_training_steps=${TOTAL_TRAINING_STEPS} \
     trainer.default_local_dir=${CKPT_DIR} \
     trainer.v1.trainer_mode=separate_async \
+    trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP} \
     trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.config.template_path=${MAS_TEMPLATE_PATH} \
     \
     policies.policy_1.ppo_trainer_overrides.trainer.nnodes=${POLICY_1_NNODES} \
     policies.policy_1.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_1_N_GPUS_PER_NODE} \
     policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.model.path=${POLICY_1_MODEL_PATH} \
-    policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BATCH_SIZE} \
     policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.actor.fsdp_config.fsdp_size=${POLICY_1_FSDP_SIZE} \
     policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \
     policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH} \
@@ -117,7 +133,6 @@ echo "============================================"
     policies.policy_2.ppo_trainer_overrides.trainer.nnodes=${POLICY_2_NNODES} \
     policies.policy_2.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_2_N_GPUS_PER_NODE} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.model.path=${POLICY_2_MODEL_PATH} \
-    policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BATCH_SIZE} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.actor.fsdp_config.fsdp_size=${POLICY_2_FSDP_SIZE} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH} \

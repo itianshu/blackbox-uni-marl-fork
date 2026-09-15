@@ -510,6 +510,28 @@ def test_trainer_cleanup_stops_framework_before_releasing_ray_resources():
     ]
 
 
+def test_trainer_cleanup_before_fit_handles_missing_agent_loop_manager():
+    from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+    events = []
+    trainer = object.__new__(MultiAgentsPPOTrainer)
+    trainer.policy_trainers = {}
+    trainer._collect_placement_groups = lambda: []
+    trainer._remove_placement_groups = lambda groups: events.append(("placement_groups", groups))
+    trainer._shutdown_gateway_actors = lambda: events.append("gateways")
+    trainer._policy_pool = SimpleNamespace(
+        shutdown=lambda *, wait: events.append(("policy_pool", wait))
+    )
+
+    trainer.cleanup()
+
+    assert events == [
+        ("placement_groups", []),
+        "gateways",
+        ("policy_pool", True),
+    ]
+
+
 def test_trainer_cleanup_does_not_release_resources_if_framework_shutdown_fails():
     from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
 
