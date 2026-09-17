@@ -28,8 +28,8 @@ from verl.trainer.ppo.v1.trainer_sync import PPOTrainerSync
 class SinglePPOTrainer(PPOTrainerSync):
     """Synchronous v1 PPO trainer without outer-owned dataloader/replay buffer."""
 
-    def init_runtime(self) -> None:
-        """Initialize the per-policy runtime without syncing rollout weights."""
+    def init_training_runtime(self) -> None:
+        """Initialize the colocated trainer/rollout runtime without syncing weights."""
         self._setup()
 
     def _build_replay_buffer(self):

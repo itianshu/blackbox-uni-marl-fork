@@ -6,7 +6,8 @@ from uuid import uuid4
 import posixpath
 from collections import defaultdict
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -121,9 +122,7 @@ class MultiAgentsPPOTrainer:
 
         overrides = policy_entry.get("ppo_trainer_overrides")
         if overrides is not None:
-            set_struct = getattr(OmegaConf, "set_struct", None)
-            if callable(set_struct):
-                set_struct(policy_config, False)
+            OmegaConf.set_struct(policy_config, False)
             if isinstance(overrides, DictConfig):
                 # Resolve policy overrides in the outer Hydra context. This
                 # preserves existing ${...} projections (for example,
@@ -159,10 +158,8 @@ class MultiAgentsPPOTrainer:
             # checkpoints/.../policies/<policy>), so a per-policy trainer must
             # never self-resume; verl's default resume_mode is "auto", which
             # would conflict with the outer ownership.
-            trainer_config = policy_config.get("trainer")
-            if trainer_config is not None:
-                with open_dict(trainer_config):
-                    trainer_config.resume_mode = "disable"
+            with open_dict(policy_config.trainer):
+                policy_config.trainer.resume_mode = "disable"
 
             if self.trainer_mode == "sync":
                 from uni_agent.trainer.single_ppo_trainer import SinglePPOTrainer
@@ -178,32 +175,215 @@ class MultiAgentsPPOTrainer:
     def init(self) -> None:
         """Initialize all components of the multi-agent trainer.
 
-        1. Per-policy v1 runtime setup for each policy; ``on_init_end()`` is
-           intentionally deferred.
+        1. Initialize every policy's trainer/FSDP runtime concurrently before
+           any standalone rollout placement group is created.
         2. Shared outer dataloader: single prompt stream for all policies.
         3. Shared outer replay buffer over the TransferQueue.
         4. Outer checkpoint phase; the outer trainer owns the shared checkpoint
            lifecycle and establishes actor/critic state and ``global_steps``.
-        5. Invoke each policy's ``on_init_end()`` after the outer
+        5. Initialize every policy's standalone rollout runtime concurrently.
+        6. Invoke every policy's ``on_init_end()`` concurrently after the outer
            initialization phase to synchronize current actor weights to that
            policy's rollout replicas.
         """
-        for policy_trainer in self.policy_trainers.values():
-            policy_trainer.init_runtime()
+        self._validate_stage_resources("training")
+        futures = [
+            self._policy_pool.submit(policy_trainer.init_training_runtime)
+            for policy_trainer in self.policy_trainers.values()
+        ]
+        wait(futures)
+        for future in futures:
+            future.result()
+
         self._build_dataloader()
         self._build_replay_buffer()
         self._load_checkpoint()
 
-        for policy_trainer in self.policy_trainers.values():
-            policy_trainer.on_init_end()
+        if self.trainer_mode == "separate_async":
+            self._validate_stage_resources("rollout")
+            futures = [
+                self._policy_pool.submit(policy_trainer.init_standalone_rollout_runtime)
+                for policy_trainer in self.policy_trainers.values()
+            ]
+            wait(futures)
+            for future in futures:
+                future.result()
 
-    def get_multi_policy_llm_client(self) -> list[Any] | None:
-        policy_clients = {}
-        for policy_name, trainer in self.policy_trainers.items():
-            get_llm_client = getattr(trainer, "get_llm_client", None)
-            if not callable(get_llm_client):
-                raise AttributeError(f"PPO trainer for policy '{policy_name}' has no get_llm_client()")
-            policy_clients[policy_name] = get_llm_client()
+        futures = [
+            self._policy_pool.submit(policy_trainer.on_init_end)
+            for policy_trainer in self.policy_trainers.values()
+        ]
+        wait(futures)
+        for future in futures:
+            future.result()
+
+    def _get_stage_resource_requests(self, stage: str) -> list[tuple[str, str, int]]:
+        """Return ``(policy, pool, GPUs-per-node)`` for every stage placement group."""
+        if stage not in {"training", "rollout"}:
+            raise ValueError(f"Unsupported resource preflight stage: {stage!r}")
+
+        requests: list[tuple[str, str, int]] = []
+
+        def add_requests(policy_name: str, pool_name: str, nnodes: Any, gpus_per_node: Any) -> None:
+            nnodes = int(nnodes)
+            gpus_per_node = int(gpus_per_node)
+            if nnodes <= 0 or gpus_per_node <= 0:
+                raise ValueError(
+                    f"Invalid {stage} resource request for {policy_name}/{pool_name}: "
+                    f"nnodes={nnodes}, n_gpus_per_node={gpus_per_node}"
+                )
+            requests.extend((policy_name, pool_name, gpus_per_node) for _ in range(nnodes))
+
+        for policy_name, policy_config in self.policy_configs.items():
+            if stage == "training":
+                add_requests(
+                    policy_name,
+                    "global_pool",
+                    OmegaConf.select(policy_config, "trainer.nnodes"),
+                    OmegaConf.select(policy_config, "trainer.n_gpus_per_node"),
+                )
+
+                if OmegaConf.select(
+                    policy_config,
+                    "reward.reward_model.enable_resource_pool",
+                    default=False,
+                ):
+                    add_requests(
+                        policy_name,
+                        "reward_pool",
+                        OmegaConf.select(policy_config, "reward.reward_model.nnodes"),
+                        OmegaConf.select(policy_config, "reward.reward_model.n_gpus_per_node"),
+                    )
+
+                if OmegaConf.select(policy_config, "distillation.enabled", default=False):
+                    add_requests(
+                        policy_name,
+                        "teacher_pool",
+                        OmegaConf.select(policy_config, "distillation.nnodes"),
+                        OmegaConf.select(policy_config, "distillation.n_gpus_per_node"),
+                    )
+                continue
+
+            rollout_config = OmegaConf.select(policy_config, "actor_rollout_ref.rollout")
+            rollout_nnodes = int(OmegaConf.select(rollout_config, "nnodes"))
+            rollout_gpus_per_node = int(OmegaConf.select(rollout_config, "n_gpus_per_node"))
+            total_gpus = rollout_nnodes * rollout_gpus_per_node
+            tensor_parallel_size = int(
+                OmegaConf.select(rollout_config, "tensor_model_parallel_size", default=1)
+            )
+            data_parallel_size = int(
+                OmegaConf.select(rollout_config, "data_parallel_size", default=1)
+            )
+            pipeline_parallel_size = int(
+                OmegaConf.select(rollout_config, "pipeline_model_parallel_size", default=1)
+            )
+
+            if OmegaConf.select(rollout_config, "disaggregation.enabled", default=False):
+                decode_parallel_size = OmegaConf.select(
+                    rollout_config,
+                    "disaggregation.decode_tensor_model_parallel_size",
+                    default=None,
+                )
+                if decode_parallel_size is None:
+                    decode_parallel_size = tensor_parallel_size
+                rollout_world_size = (
+                    tensor_parallel_size
+                    * int(OmegaConf.select(rollout_config, "disaggregation.prefill_replicas"))
+                    + int(decode_parallel_size)
+                    * int(OmegaConf.select(rollout_config, "disaggregation.decode_replicas"))
+                ) * data_parallel_size * pipeline_parallel_size
+            else:
+                rollout_world_size = (
+                    tensor_parallel_size * data_parallel_size * pipeline_parallel_size
+                )
+
+            if rollout_world_size <= 0 or total_gpus % rollout_world_size != 0:
+                raise ValueError(
+                    f"Invalid rollout resource request for {policy_name}: total_gpus={total_gpus} "
+                    f"must be divisible by rollout_world_size={rollout_world_size}"
+                )
+
+            num_replicas = total_gpus // rollout_world_size
+            gpus_per_replica_node = min(rollout_gpus_per_node, rollout_world_size)
+            if rollout_world_size % gpus_per_replica_node != 0:
+                raise ValueError(
+                    f"Invalid rollout resource request for {policy_name}: rollout_world_size="
+                    f"{rollout_world_size} must be divisible by replica GPUs per node="
+                    f"{gpus_per_replica_node}"
+                )
+            replica_nnodes = rollout_world_size // gpus_per_replica_node
+            requests.extend(
+                (policy_name, "standalone_rollout", gpus_per_replica_node)
+                for _ in range(num_replicas * replica_nnodes)
+            )
+
+        return requests
+
+    def _validate_stage_resources(self, stage: str) -> None:
+        """Fail fast when the current Ray snapshot cannot place a whole stage.
+
+        This is a feasibility check, not a reservation: Ray remains the source
+        of truth when the policy runtimes create their placement groups.
+        """
+        requests = self._get_stage_resource_requests(stage)
+        node_resources = ray._private.state.available_resources_per_node()
+        node_capacities = {
+            node_id: int(resources.get("GPU", resources.get("NPU", 0)))
+            for node_id, resources in node_resources.items()
+        }
+        required_gpus = sum(gpus for _, _, gpus in requests)
+        available_gpus = sum(node_capacities.values())
+
+        request_counts: dict[tuple[str, str, int], int] = defaultdict(int)
+        for request in requests:
+            request_counts[request] += 1
+        request_summary = ", ".join(
+            f"{policy_name}/{pool_name}={count}x{gpus}GPU"
+            for (policy_name, pool_name, gpus), count in sorted(request_counts.items())
+        )
+        node_summary = ", ".join(
+            f"{node_id}={gpus}GPU" for node_id, gpus in sorted(node_capacities.items())
+        )
+
+        if available_gpus < required_gpus:
+            raise ValueError(
+                f"Insufficient Ray GPU resources for multi-policy {stage} initialization: "
+                f"required {required_gpus}, available {available_gpus}; "
+                f"requests=[{request_summary}]; nodes=[{node_summary}]"
+            )
+
+        demands = tuple(sorted((gpus for _, _, gpus in requests), reverse=True))
+        capacities = tuple(sorted(node_capacities.values(), reverse=True))
+
+        @lru_cache(maxsize=None)
+        def can_strict_pack(request_index: int, remaining: tuple[int, ...]) -> bool:
+            if request_index == len(demands):
+                return True
+
+            demand = demands[request_index]
+            tried_capacities = set()
+            for node_index, capacity in enumerate(remaining):
+                if capacity < demand or capacity in tried_capacities:
+                    continue
+                tried_capacities.add(capacity)
+                next_remaining = list(remaining)
+                next_remaining[node_index] -= demand
+                next_remaining.sort(reverse=True)
+                if can_strict_pack(request_index + 1, tuple(next_remaining)):
+                    return True
+            return False
+
+        if not can_strict_pack(0, capacities):
+            raise ValueError(
+                f"Ray GPU topology for multi-policy {stage} initialization cannot satisfy "
+                f"STRICT_PACK placement; requests=[{request_summary}]; nodes=[{node_summary}]"
+            )
+
+    def get_multi_policy_llm_client(self) -> PolicyRoutingLLMClient:
+        policy_clients = {
+            policy_name: trainer.get_llm_client()
+            for policy_name, trainer in self.policy_trainers.items()
+        }
         return PolicyRoutingLLMClient(policy_clients)
 
     def get_reward_handles(self) -> list[Any] | None:
@@ -227,11 +407,11 @@ class MultiAgentsPPOTrainer:
         policy_processors = {}
         policy_tool_parser_names = {}
         for policy_name, trainer in self.policy_trainers.items():
-            tokenizer = getattr(trainer, "tokenizer", None)
+            tokenizer = trainer.tokenizer
             if tokenizer is None:
                 raise RuntimeError(f"PPO trainer for policy '{policy_name}' has no tokenizer")
             policy_tokenizers[policy_name] = tokenizer
-            processor = getattr(trainer, "processor", None)
+            processor = trainer.processor
             policy_processors[policy_name] = processor
             tool_parser_name = OmegaConf.select(
                 self.policy_configs[policy_name],
@@ -273,7 +453,11 @@ class MultiAgentsPPOTrainer:
             # first training step. Validation is outer-owned because one MAS
             # rollout can produce records for multiple policies.
             if self.config.trainer.get("val_before_train", True):
-                val_metrics = self._validate()
+                self.on_validate_begin()
+                try:
+                    val_metrics = self._validate()
+                finally:
+                    self.on_validate_end()
                 if not val_metrics:
                     raise RuntimeError("Validation produced no metrics")
                 self.logger.log(data=val_metrics, step=self.global_steps)
@@ -293,7 +477,11 @@ class MultiAgentsPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
                 test_freq = self.config.trainer.get("test_freq", -1)
                 if test_freq > 0 and (is_last_step or self.global_steps % test_freq == 0):
-                    step_metrics.update(self._validate())
+                    self.on_validate_begin()
+                    try:
+                        step_metrics.update(self._validate())
+                    finally:
+                        self.on_validate_end()
                 # Mirror verl v1 trainer.fit(): record per-step metrics
                 # (loss/adv/grad_norm, prefixed per policy) to the configured
                 # backend. Sorting keeps the two policies' metrics grouped.
@@ -303,9 +491,7 @@ class MultiAgentsPPOTrainer:
             succeeded = True
         finally:
             self.on_train_end()
-            tracking = getattr(self, "logger", None)
-            if tracking is not None:
-                tracking.finish(exit_code=0 if succeeded else 1)
+            self.logger.finish(exit_code=0 if succeeded else 1)
 
     def train_step(self) -> dict[str, Any]:
         metrics: dict[str, Any] = {}
@@ -344,15 +530,11 @@ class MultiAgentsPPOTrainer:
         """
         metrics: dict[str, Any] = {}
         for policy_name, trainer in self.policy_trainers.items():
-            pending = getattr(trainer, "_pending_sync_metrics", None)
+            pending = trainer._consume_sync_metrics()
             if not pending:
                 continue
             for key, value in pending.items():
                 metrics[f"{policy_name}/sync/{key}"] = value
-            try:
-                trainer._pending_sync_metrics = {}
-            except Exception:
-                pass
         return metrics
 
     def step(self, metrics: dict[str, Any] | None = None, timing_raw: dict[str, Any] | None = None):
@@ -783,18 +965,9 @@ class MultiAgentsPPOTrainer:
         level: SinglePPOTrainer skips per-policy dataloader creation, so the
         full dataset is loaded only once instead of once per policy.
         """
-        source_trainer = None
-        for trainer in self.policy_trainers.values():
-            if getattr(trainer, "tokenizer", None) is not None:
-                source_trainer = trainer
-                break
-        if source_trainer is None:
-            raise RuntimeError(
-                "MultiAgentsPPOTrainer requires at least one policy trainer with a tokenizer "
-                "to build the shared dataloader"
-            )
+        source_trainer = next(iter(self.policy_trainers.values()))
         tokenizer = source_trainer.tokenizer
-        processor = getattr(source_trainer, "processor", None)
+        processor = source_trainer.processor
 
         self.train_dataset = create_rl_dataset(
             self.config.data.train_files,
@@ -1067,17 +1240,17 @@ class MultiAgentsPPOTrainer:
         os.makedirs(policies_dir, exist_ok=True)
 
         default_hdfs_dir = self.config.trainer.default_hdfs_dir
-        remove_previous = self._trainer_option("remove_previous_ckpt_in_save", False)
+        remove_previous = self.config.trainer.get("remove_previous_ckpt_in_save", False)
         if remove_previous:
             logger.warning(
                 "remove_previous_ckpt_in_save is deprecated; use max_actor_ckpt_to_keep=1 "
                 "and max_critic_ckpt_to_keep=1 instead"
             )
         max_actor_ckpt_to_keep = (
-            1 if remove_previous else self._trainer_option("max_actor_ckpt_to_keep", None)
+            1 if remove_previous else self.config.trainer.get("max_actor_ckpt_to_keep", None)
         )
         max_critic_ckpt_to_keep = (
-            1 if remove_previous else self._trainer_option("max_critic_ckpt_to_keep", None)
+            1 if remove_previous else self.config.trainer.get("max_critic_ckpt_to_keep", None)
         )
         for policy_name, trainer in self.policy_trainers.items():
             policy_checkpoint_dir = os.path.join(policies_dir, policy_name)
@@ -1142,32 +1315,17 @@ class MultiAgentsPPOTrainer:
         with open(latest_path, "w", encoding="utf-8") as file:
             file.write(str(self.global_steps))
 
-    def _trainer_option(self, name: str, default: Any = None) -> Any:
-        trainer_config = self.config.trainer
-        getter = getattr(trainer_config, "get", None)
-        if callable(getter):
-            return getter(name, default)
-        return getattr(trainer_config, name, default)
-
     def _has_async_checkpoint_save(self) -> bool:
         """Return whether any policy model checkpoint is written asynchronously."""
         checkpoint_paths = (
             "actor_rollout_ref.actor.checkpoint.async_save",
             "critic.checkpoint.async_save",
         )
-        for policy_config in getattr(self, "policy_configs", {}).values():
-            for path in checkpoint_paths:
-                value = policy_config
-                for component in path.split("."):
-                    if isinstance(value, Mapping):
-                        value = value.get(component)
-                    else:
-                        value = getattr(value, component, None)
-                    if value is None:
-                        break
-                if bool(value):
-                    return True
-        return False
+        return any(
+            bool(OmegaConf.select(policy_config, path, default=False))
+            for policy_config in self.policy_configs.values()
+            for path in checkpoint_paths
+        )
 
     def _should_save_checkpoint(self) -> bool:
         save_freq = self.save_freq
@@ -1365,15 +1523,14 @@ class MultiAgentsPPOTrainer:
                     select_fields=["uid", "rm_scores", "num_turns", "data_source", "extra_fields"],
                 )
                 uid_values = self._validation_values(fields, "uid")
-                score_values = self._validation_values(fields, "rm_scores")
+                score_values = fields["rm_scores"].sum(dim=1).tolist()
                 turn_values = self._validation_values(fields, "num_turns")
                 source_values = self._validation_values(fields, "data_source")
                 extra_values = self._validation_values(fields, "extra_fields")
                 if len(score_values) != len(final_keys):
                     raise RuntimeError("Validation trajectories are missing rm_scores")
                 for index, score in enumerate(score_values):
-                    score_tensor = torch.as_tensor(score)
-                    reward = float(score_tensor.sum().item())
+                    reward = float(score)
                     reward_values.append(reward)
                     sample_uids.append(str(uid_values[index]) if index < len(uid_values) else final_keys[index])
                     sample_turns.append(float(turn_values[index]) if index < len(turn_values) else 0.0)
@@ -1435,9 +1592,8 @@ class MultiAgentsPPOTrainer:
     def _sync_policy_runtime_context(self) -> None:
         for trainer in self.policy_trainers.values():
             trainer.global_steps = self.global_steps
-            # In separate_async, lifecycle hooks receive a private timing
-            # context in _run_trainer_hook; never share the outer dict across
-            # concurrently executing policy hooks.
+            # Sync hooks share the outer timing context. Separate-async step
+            # hooks receive private contexts in on_step_end before dispatch.
             if self.trainer_mode == "sync":
                 trainer.timing_raw = self.timing_raw
 
@@ -1459,6 +1615,25 @@ class MultiAgentsPPOTrainer:
         # surfaces as ``RuntimeError: DataLoader worker ... killed by signal:
         # Killed`` from the atexit path, making a successful run exit non-zero.
         self._close_dataloader()
+
+    def on_validate_begin(self) -> None:
+        """Prepare every policy runtime for outer multi-agent validation."""
+        self._sync_policy_runtime_context()
+        futures = [
+            self._policy_pool.submit(policy_trainer.on_validate_begin)
+            for policy_trainer in self.policy_trainers.values()
+        ]
+        for future in futures:
+            future.result()
+
+    def on_validate_end(self) -> None:
+        """Finish every policy's native validation lifecycle."""
+        futures = [
+            self._policy_pool.submit(policy_trainer.on_validate_end)
+            for policy_trainer in self.policy_trainers.values()
+        ]
+        for future in futures:
+            future.result()
 
     def _close_dataloader(self) -> None:
         """Terminate dataloader workers cleanly and drop iterator references.
@@ -1517,42 +1692,17 @@ class MultiAgentsPPOTrainer:
             return
         # separate_async: delegate to verl's per-policy on_step_end (standalone
         # checkpoint manager; update_weights contains abort/resume internally).
-        futures = [
-            self._policy_pool.submit(self._run_trainer_hook, policy_name, "on_step_end")
-            for policy_name in self.policy_trainers
-        ]
-        for future in futures:
-            policy_name, per_policy_timing = future.result()
-            self._merge_policy_timing(policy_name, per_policy_timing)
-
-    def _run_trainer_hook(self, policy_name: str, hook_name: str) -> tuple[str, dict[str, Any]]:
-        """Run one policy trainer lifecycle hook with an isolated timing context.
-
-        Native ``separate_async`` hooks record stages such as ``update_weights``
-        in ``trainer.timing_raw``.  Because policy hooks run concurrently, each
-        policy receives a private dictionary; the caller merges it back into the
-        outer timing context with a policy-qualified key.
-        """
-        trainer = self.policy_trainers[policy_name]
-        timing_raw: dict[str, Any] = {}
-        if self.trainer_mode == "separate_async":
-            trainer.timing_raw = timing_raw
-        if hook_name == "on_step_end":
-            trainer.on_step_end()
-        elif hook_name == "on_sample_end":
-            trainer.on_sample_end()
-        else:
-            raise ValueError(f"Unsupported trainer lifecycle hook: {hook_name!r}")
-        return policy_name, timing_raw
-
-    def _merge_policy_timing(self, policy_name: str, timing_raw: Mapping[str, Any] | None) -> None:
-        """Merge one policy's hook timings into outer ``timing_raw`` safely."""
-        if not timing_raw:
-            return
-        prefix = f"{policy_name}/"
-        for key, value in timing_raw.items():
-            qualified_key = key if str(key).startswith(prefix) else f"{prefix}{key}"
-            self.timing_raw[qualified_key] = value
+        futures = []
+        policy_timings = {}
+        for policy_name, trainer in self.policy_trainers.items():
+            policy_timing = {}
+            trainer.timing_raw = policy_timing
+            policy_timings[policy_name] = policy_timing
+            futures.append((policy_name, self._policy_pool.submit(trainer.on_step_end)))
+        for policy_name, future in futures:
+            future.result()
+            for key, value in policy_timings[policy_name].items():
+                self.timing_raw[f"{policy_name}/{key}"] = value
 
     def _update_weights_one_policy(self, policy_name: str) -> tuple[None, dict[str, Any]]:
         """Wake one policy's vLLM replicas with the current weights."""
@@ -1576,12 +1726,11 @@ class MultiAgentsPPOTrainer:
         # On the first completed sample, hybrid replicas switch from rollout
         # to trainer mode while standalone replicas remain available for rollout.
         futures = [
-            self._policy_pool.submit(self._run_trainer_hook, policy_name, "on_sample_end")
-            for policy_name in self.policy_trainers
+            self._policy_pool.submit(policy_trainer.on_sample_end)
+            for policy_trainer in self.policy_trainers.values()
         ]
         for future in futures:
-            policy_name, per_policy_timing = future.result()
-            self._merge_policy_timing(policy_name, per_policy_timing)
+            future.result()
 
     @staticmethod
     def _prefix_metrics(metrics: dict[str, Any], policy_name: str, policy_metrics: dict[str, Any]) -> None:
@@ -1661,19 +1810,25 @@ class MultiAgentsPPOTrainer:
             logger.warning("policy thread pool shutdown failed: %s", exc)
 
     def _collect_placement_groups(self) -> list:
-        """Collect all placement groups owned by per-policy trainers."""
+        """Collect trainer and standalone-rollout placement groups."""
         pgs = []
         for policy_trainer in self.policy_trainers.values():
             rp_mgr = getattr(policy_trainer, "resource_pool_manager", None)
-            if rp_mgr is None:
-                continue
-            try:
-                pools = rp_mgr.resource_pool_dict.values()
-            except Exception:
-                pools = []
+            pools = rp_mgr.resource_pool_dict.values() if rp_mgr is not None else []
             for pool in pools:
                 try:
                     pgs.extend(pool.get_placement_groups())
+                except Exception:
+                    continue
+
+            standalone_manager = getattr(policy_trainer, "standalone_server_manager", None)
+            replicas = standalone_manager.rollout_replicas if standalone_manager is not None else []
+            for replica in replicas:
+                resource_pool = getattr(replica, "resource_pool", None)
+                if resource_pool is None:
+                    continue
+                try:
+                    pgs.extend(resource_pool.get_placement_groups())
                 except Exception:
                     continue
         return pgs

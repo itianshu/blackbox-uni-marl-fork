@@ -140,6 +140,9 @@ actor_rollout_ref:
     val_kwargs:
       n: 1
       do_sample: false
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
     # Temperature is per-policy (policies.*.ppo_trainer_overrides.actor_rollout_ref
     # .rollout.temperature); the runner does not send it, so sampling uses each
     # policy's vLLM generation config, matching the log-prob recompute.
@@ -184,7 +187,7 @@ policies:
   policy_1:
     ppo_trainer_overrides:
       trainer:
-        nnodes: 2
+        nnodes: 1
         n_gpus_per_node: 8
         default_local_dir: checkpoints/multi_agent_blackbox/policy_1
         total_training_steps: ${trainer.total_training_steps}  # 外层共享，改顶层
@@ -224,8 +227,8 @@ policies:
               nccl:
                 group_name: checkpoint_policy_1
           n: ${actor_rollout_ref.rollout.n}
-          # Standalone rollout replica allocation (separate_async): each replica
-          # spans nnodes × n_gpus_per_node GPUs; launch scripts override per env.
+          # Standalone rollout allocation: 8 GPUs total. TP=2 creates four
+          # independent vLLM replicas for this policy.
           nnodes: 1
           n_gpus_per_node: 8
           # Per-policy sampling temperature == training-side recompute
@@ -237,7 +240,7 @@ policies:
           response_length: 32768
           max_model_len: 36864
           load_format: safetensors
-          tensor_model_parallel_size: 4                        # 须与 rollout 卡数匹配
+          tensor_model_parallel_size: 2
           gpu_memory_utilization: 0.6
           calculate_log_probs: true
           enable_sleep_mode: true
@@ -249,7 +252,7 @@ policies:
     # 结构与 policy_1 相同；字段所有权注释见 policy_1（下面同样适用）。
     ppo_trainer_overrides:
       trainer:
-        nnodes: 2
+        nnodes: 1
         n_gpus_per_node: 8
         default_local_dir: checkpoints/multi_agent_blackbox/policy_2
         total_training_steps: ${trainer.total_training_steps}  # 外层共享，改顶层
@@ -288,8 +291,8 @@ policies:
               nccl:
                 group_name: checkpoint_policy_2
           n: ${actor_rollout_ref.rollout.n}
-          # Standalone rollout replica allocation (separate_async): each replica
-          # spans nnodes × n_gpus_per_node GPUs; launch scripts override per env.
+          # Standalone rollout allocation: 8 GPUs total. TP=2 creates four
+          # independent vLLM replicas for this policy.
           nnodes: 1
           n_gpus_per_node: 8
           # Per-policy sampling temperature == training-side recompute
@@ -301,7 +304,7 @@ policies:
           response_length: 32768
           max_model_len: 36864
           load_format: safetensors
-          tensor_model_parallel_size: 8                        # 须与 rollout 卡数匹配
+          tensor_model_parallel_size: 2
           gpu_memory_utilization: 0.6
           calculate_log_probs: true
           enable_sleep_mode: true
