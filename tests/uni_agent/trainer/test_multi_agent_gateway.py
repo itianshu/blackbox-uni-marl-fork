@@ -1356,6 +1356,24 @@ class TestBuildSamplingParams:
         from uni_agent.trainer.gateway.gateway import _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
 
         assert "logprobs" in _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
+        assert "min_tokens" in _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
+        assert "ignore_eos" in _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS
+
+    def test_deterministic_length_options_reach_backend_sampling_params(self):
+        _install_dependency_stubs()
+        from uni_agent.trainer.gateway.gateway import _build_sampling_params
+
+        params = _build_sampling_params(
+            payload={"max_tokens": 2048, "min_tokens": 2048, "ignore_eos": True},
+            base_sampling_params={},
+            allowed_request_sampling_param_keys=frozenset(
+                {"max_tokens", "min_tokens", "ignore_eos", "logprobs"}
+            ),
+        )
+
+        assert params["max_tokens"] == 2048
+        assert params["min_tokens"] == 2048
+        assert params["ignore_eos"] is True
 
     def test_rollout_routes_roles_to_policy_backends_and_finalizes_metadata(self):
         asyncio.run(self._run_rollout())

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from uuid import uuid4
 import posixpath
 from collections import defaultdict
@@ -96,6 +97,10 @@ class MultiAgentsPPOTrainer:
         self.timing_raw: dict[str, Any] = {}
 
         self._create_policy_trainers()
+        # Dynamic inference scheduling (cross-policy replica borrowing); None
+        # unless config.dynamic_inference_scheduling.enable is true. The
+        # controller is prepared before policy runtimes and activated after.
+        self._dynamic_inference = None
         # Different policies use disjoint GPU sets, so their training phases
         # run concurrently in this pool.
         self._policy_pool = ThreadPoolExecutor(max_workers=max(1, len(self.policy_trainers)))
@@ -232,18 +237,25 @@ class MultiAgentsPPOTrainer:
     def init(self) -> None:
         """Initialize all components of the multi-agent trainer.
 
-        1. Initialize every policy's trainer/FSDP runtime concurrently before
+        1. Prepare dynamic-inference placement-group layout when enabled.
+        2. Initialize every policy's trainer/FSDP runtime concurrently before
            any standalone rollout placement group is created.
-        2. Shared outer dataloader: single prompt stream for all policies.
-        3. Shared outer replay buffer over the TransferQueue.
+        3. Shared outer dataloader and replay buffer over the TransferQueue.
         4. Outer checkpoint phase; the outer trainer owns the shared checkpoint
            lifecycle and establishes actor/critic state and ``global_steps``.
         5. Initialize standalone rollout runtimes in descending per-replica
            node GPU footprint waves; policies in the same wave run concurrently.
-        6. Invoke every policy's ``on_init_end()`` concurrently after the outer
+        6. Activate dynamic inference after every rollout wave is ready.
+        7. Invoke every policy's ``on_init_end()`` concurrently after the outer
            initialization phase to synchronize current actor weights to that
            policy's rollout replicas.
         """
+        from uni_agent.trainer.dynamic_inference.controller import DynamicInferenceController
+
+        dynamic_inference = DynamicInferenceController.maybe_create(self)
+        if dynamic_inference is not None:
+            dynamic_inference.prepare_runtime_layout()
+
         self._validate_stage_resources("training")
         futures = [
             self._policy_pool.submit(policy_trainer.init_training_runtime)
@@ -252,7 +264,6 @@ class MultiAgentsPPOTrainer:
         wait(futures)
         for future in futures:
             future.result()
-
         self._build_dataloader()
         self._build_replay_buffer()
         self._load_checkpoint()
@@ -276,6 +287,7 @@ class MultiAgentsPPOTrainer:
                 for future in futures:
                     future.result()
 
+        self._init_dynamic_inference(dynamic_inference)
         futures = [
             self._policy_pool.submit(policy_trainer.on_init_end)
             for policy_trainer in self.policy_trainers.values()
@@ -283,6 +295,28 @@ class MultiAgentsPPOTrainer:
         wait(futures)
         for future in futures:
             future.result()
+
+    def _init_dynamic_inference(self, controller) -> None:
+        """Set up a prepared dynamic inference controller when enabled.
+
+        All policy runtimes (standalone replicas holding initial weights) must
+        already exist: setup pre-creates the guest replicas and probes the
+        worker-side sleep patch before training starts.
+        """
+        if controller is not None:
+            controller.setup()
+            self._dynamic_inference = controller
+
+    def _shutdown_dynamic_inference(self) -> None:
+        """Return every active lend, stop the poll loop, kill guest replicas."""
+        if self._dynamic_inference is None:
+            return
+        try:
+            self._dynamic_inference.shutdown()
+        except Exception as exc:
+            logger.warning("dynamic inference shutdown failed: %s", exc)
+        finally:
+            self._dynamic_inference = None
 
     def _get_stage_resource_requests(self, stage: str) -> list[tuple[str, str, int]]:
         """Return ``(policy, pool, GPUs-per-node)`` for every stage placement group."""
@@ -600,6 +634,8 @@ class MultiAgentsPPOTrainer:
             self.on_step_end()
             # Collect separate_async weight-sync metrics from the policy trainers.
             metrics.update(self._consume_sync_metrics())
+            if self._dynamic_inference is not None:
+                metrics.update(self._dynamic_inference.last_metrics or {})
         self._add_data_metrics(batch, metrics, timing_raw=self.timing_raw)
         # Mirror verl v1 trainer.fit(): evict the sampled trajectory records
         # from TransferQueue at the end of each step. ReplayBuffer.sample()
@@ -729,19 +765,33 @@ class MultiAgentsPPOTrainer:
                 sample_batch_size=sample_batch_size,
                 metrics=metrics,
             )
-        per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
-        per_policy_batches = self.prepare_policy_batches_for_ppo_update(per_policy_batches, metrics)
-        with marked_timer("adv", timing_raw, color="brown"):
-            multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
-                per_policy_batches,
-                metrics,
-            )
-        # Chain the advantage-computed batch into the update, mirroring verl's
-        # standard flow (`batch = _compute_advantage(batch); _update_actor(batch)`).
-        # Without this, the per-policy update batches would not contain the
-        # advantages produced by _compute_advantage.
-        per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
-        self.update_policy_trainers(per_policy_batches, metrics=metrics)
+        # A metrics-driven borrow performs a one-shot weight push through the
+        # donor's actor worker group.  Batch balancing, old-log-prob/advantage
+        # computation and the PPO update use those same actors.  Keep that
+        # whole actor phase under the boundary gate so a poll-thread borrow
+        # that started near the end of rollout must finish before actor CUDA
+        # work begins.  Otherwise NCCL checkpoint broadcasts and FSDP actor
+        # collectives can overlap on rank 0 and form a CUDA-stream cycle.
+        actor_phase = (
+            self._dynamic_inference.gate.boundary()
+            if self._dynamic_inference is not None
+            else nullcontext()
+        )
+        with actor_phase:
+            per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
+            per_policy_batches = self.prepare_policy_batches_for_ppo_update(per_policy_batches, metrics)
+            with marked_timer("adv", timing_raw, color="brown"):
+                multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
+                    per_policy_batches,
+                    metrics,
+                )
+            # Chain the advantage-computed batch into the update, mirroring verl's
+            # standard flow (`batch = _compute_advantage(batch); _update_actor(batch)`).
+            # Without this, per-policy batches never carry the advantages that
+            # _compute_advantage wrote back, and worker-side ppo_loss fails with
+            # KeyError('advantages').
+            per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
+            self.update_policy_trainers(per_policy_batches, metrics=metrics)
         return multi_agent_batch
 
     def sample_multi_agent_batch(
@@ -1820,6 +1870,11 @@ class MultiAgentsPPOTrainer:
             return
         # separate_async: delegate to verl's per-policy on_step_end (standalone
         # checkpoint manager; update_weights contains abort/resume internally).
+        # Dynamic inference borrows on fresh metrics; the step boundary only
+        # retries returns, updates home weights, and refreshes active guests.
+        if self._dynamic_inference is not None:
+            self._dynamic_inference.run_boundary(self)
+            return
         futures = []
         policy_timings = {}
         for policy_name, trainer in self.policy_trainers.items():
@@ -1921,6 +1976,11 @@ class MultiAgentsPPOTrainer:
                 logger.warning("multi-agent framework shutdown failed: %s", exc)
                 # Stop cleanup so partial teardown is not reported as success.
                 raise
+
+        # Return every active borrow, stop the poll loop and kill the guest
+        # replicas before the per-policy teardown removes their placement
+        # groups (guests ride the home replicas' pools but own Ray actors).
+        self._shutdown_dynamic_inference()
 
         for trainer in self.policy_trainers.values():
             cleanup = getattr(trainer, "cleanup", None)

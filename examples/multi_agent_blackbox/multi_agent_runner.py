@@ -80,6 +80,14 @@ async def _chat_completion(
         "messages": messages,
         "max_tokens": int(agent_cfg.get("max_tokens", max_tokens)),
     }
+    # These vLLM/OpenAI request fields are useful for deterministic load tests:
+    # min_tokens + ignore_eos keep a request alive long enough for the dynamic
+    # scheduler to observe sustained KV-cache pressure.  They remain opt-in so
+    # normal example behaviour is unchanged.
+    if "min_tokens" in agent_cfg:
+        payload["min_tokens"] = int(agent_cfg["min_tokens"])
+    if "ignore_eos" in agent_cfg:
+        payload["ignore_eos"] = bool(agent_cfg["ignore_eos"])
     tools = agent_cfg.get("tools")
     if tools:
         payload["tools"] = tools

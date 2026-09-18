@@ -42,6 +42,11 @@ _DEFAULT_ALLOWED_REQUEST_SAMPLING_PARAM_KEYS = frozenset({
     "top_p",
     "top_k",
     "max_tokens",
+    # vLLM request controls used by deterministic load tests and compatible
+    # OpenAI clients.  Keep them in the gateway whitelist so they reach the
+    # backend instead of being silently discarded.
+    "min_tokens",
+    "ignore_eos",
     "logprobs",
 })
 

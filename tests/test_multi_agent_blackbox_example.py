@@ -95,6 +95,85 @@ def test_multi_agent_runner_returns_rollout_result_for_reward_worker(monkeypatch
     }
 
 
+def test_chat_completion_forwards_deterministic_length_options(monkeypatch):
+    from examples.multi_agent_blackbox import multi_agent_runner as runner_module
+
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "done"}}]}
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, *, json):
+            captured["url"] = url
+            captured["payload"] = json
+            return FakeResponse()
+
+    monkeypatch.setitem(sys.modules, "httpx", types.SimpleNamespace(AsyncClient=FakeClient))
+
+    result = asyncio.run(
+        runner_module._chat_completion(
+            base_url="http://gateway/v1",
+            role="agent_1",
+            messages=[{"role": "user", "content": "load"}],
+            agent_cfg={"max_tokens": 64, "min_tokens": 63, "ignore_eos": True},
+            max_tokens=32,
+            request_timeout_seconds=12.0,
+        )
+    )
+
+    assert result == "done"
+    assert captured["payload"]["max_tokens"] == 64
+    assert captured["payload"]["min_tokens"] == 63
+    assert captured["payload"]["ignore_eos"] is True
+
+
+def test_borrow_verify_recipe_forces_asymmetric_load_and_one_way_pair():
+    mas_cfg = yaml.safe_load(
+        (EXAMPLE_DIR / "config" / "mas_config_borrow_verify.yaml").read_text(encoding="utf-8")
+    )
+    cfg = yaml.safe_load(
+        (EXAMPLE_DIR / "config" / "multi_agent_blackbox_borrow_verify.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert mas_cfg["agents"]["agent_1"]["min_tokens"] == 512
+    assert mas_cfg["agents"]["agent_2"]["ignore_eos"] is True
+    assert mas_cfg["agents"]["agent_3"]["min_tokens"] == 128
+    dynamic = cfg["dynamic_inference_scheduling"]
+    assert dynamic["resource_usage"]["kv_enter"] > dynamic["resource_usage"]["kv_post_lend_max"]
+    assert dynamic["borrowing"]["guest_master_port_range"] == [32000, 32768]
+    assert dynamic["borrowing"]["guest_master_port_stride"] == 4
+    assert dynamic["borrowing"]["pairs"] == [
+        {
+            "home": "policy_2",
+            "donor": "policy_1",
+            "home_replicas_per_unit": 1,
+            "guest_replicas_per_unit": 1,
+        }
+    ]
+    assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
+    assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
+
+    script = (EXAMPLE_DIR / "scripts" / "run_e2e_borrow_verify.sh").read_text(encoding="utf-8")
+    assert "TRAIN_CONFIG_NAME=multi_agent_blackbox_borrow_verify" in script
+    assert "DYNAMIC_INFERENCE_SCHEDULING=true" in script
+
+
 def test_multi_agent_reward_function_scores_injected_final_result():
     from examples.multi_agent_blackbox.reward import compute_score
 
