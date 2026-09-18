@@ -1,0 +1,21 @@
+# Deterministic asymmetric workload for dynamic replica-borrowing verification.
+# policy_1 serves agent_1/agent_2 first and stays KV-hot; policy_2 is initially
+# idle and can lend one of its two standalone replicas.  agent_3 then makes the
+# home policy hot, exercising the early-return path before training proceeds.
+
+agents:
+  agent_1:
+    system_prompt: "Produce a detailed plan. Keep writing until the token budget is exhausted."
+    max_tokens: 512
+    min_tokens: 512
+    ignore_eos: true
+  agent_2:
+    system_prompt: "Execute the plan in exhaustive detail. Keep writing until the token budget is exhausted."
+    max_tokens: 512
+    min_tokens: 512
+    ignore_eos: true
+  agent_3:
+    system_prompt: "Verify the previous outputs in detail, then give the final answer."
+    max_tokens: 128
+    min_tokens: 128
+    ignore_eos: true

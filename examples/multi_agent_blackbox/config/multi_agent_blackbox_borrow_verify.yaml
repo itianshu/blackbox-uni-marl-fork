@@ -1,0 +1,58 @@
+# @package _global_
+
+defaults:
+  - multi_agent_blackbox
+  - _self_
+
+# verl defaults this to true, which disables vLLM Prometheus statistics.
+# Dynamic scheduling consumes /metrics, so every standalone rollout replica
+# used by this recipe must keep runtime statistics enabled.
+policies:
+  policy_1:
+    ppo_trainer_overrides:
+      actor_rollout_ref:
+        rollout:
+          disable_log_stats: false
+          checkpoint_engine:
+            engine_kwargs:
+              nccl:
+                rebuild_group: true
+  policy_2:
+    ppo_trainer_overrides:
+      actor_rollout_ref:
+        rollout:
+          disable_log_stats: false
+          checkpoint_engine:
+            engine_kwargs:
+              nccl:
+                rebuild_group: true
+
+# This recipe is intentionally sensitive: any positive sustained KV usage on
+# policy_1 is enough to trigger a borrow while the unused policy_2 remains a
+# safe lender. EMA alpha 1 makes the later zero/non-zero transitions immediate.
+dynamic_inference_scheduling:
+  enable: true
+  mode: resource
+  resource_usage:
+    kv_enter: 0.0001
+    kv_exit: 0.0
+    kv_post_lend_max: 0.00005
+    ema_alpha: 1.0
+  bottleneck_confirm_polls: 1
+  rebalance_confirm_polls: 1
+  rebalance_settle_polls: 1
+  min_lend_polls: 1
+  borrow_cooldown_s: 0.0
+  # Keep the lend alive until policy_2 itself becomes busy; that exercises the
+  # safety early-return path instead of an immediate low-load normal return.
+  return_confirm_polls: 100
+  early_return_confirm_polls: 1
+  poll_interval_s: 0.1
+  metrics_scrape_interval_s: 0.1
+  weight_sync_timeout_s: 300.0
+  borrowing:
+    pairs:
+      - home: policy_2
+        donor: policy_1
+        home_replicas_per_unit: 1
+        guest_replicas_per_unit: 1

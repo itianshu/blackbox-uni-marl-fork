@@ -17,7 +17,7 @@ POLICY_1_N_GPUS_PER_NODE="${POLICY_1_N_GPUS_PER_NODE:-2}"              # 每节�
 POLICY_1_FSDP_SIZE="${POLICY_1_FSDP_SIZE:-${POLICY_1_N_GPUS_PER_NODE}}"  # FSDP 分片数（默认=每节点训练卡数；可自由调小，须整除训练总卡数）
 POLICY_1_ROLLOUT_NNODES="${POLICY_1_ROLLOUT_NNODES:-1}"                # rollout.nnodes（standalone rollout 节点数）
 POLICY_1_ROLLOUT_N_GPUS_PER_NODE="${POLICY_1_ROLLOUT_N_GPUS_PER_NODE:-2}"  # standalone rollout 每节点卡数
-POLICY_1_TENSOR_PARALLEL_SIZE="${POLICY_1_TENSOR_PARALLEL_SIZE:-2}"    # rollout TP
+POLICY_1_TENSOR_PARALLEL_SIZE="${POLICY_1_TENSOR_PARALLEL_SIZE:-1}"    # rollout TP；2 rollout 卡 / TP=1 => 2 replicas，满足动态调度借用要求
 POLICY_1_MODEL_PATH="${POLICY_1_MODEL_PATH:-/mnt/bn/chenghao1026/models/Qwen2.5-0.5B-Instruct}"
 
 # ── policy_2（资源 + 模型）───────────────────────────────────────────────
@@ -26,7 +26,7 @@ POLICY_2_N_GPUS_PER_NODE="${POLICY_2_N_GPUS_PER_NODE:-2}"              # 每节�
 POLICY_2_FSDP_SIZE="${POLICY_2_FSDP_SIZE:-${POLICY_2_N_GPUS_PER_NODE}}"  # FSDP 分片数（默认=每节点训练卡数；可自由调小，须整除训练总卡数）
 POLICY_2_ROLLOUT_NNODES="${POLICY_2_ROLLOUT_NNODES:-1}"                # rollout.nnodes（standalone rollout 节点数）
 POLICY_2_ROLLOUT_N_GPUS_PER_NODE="${POLICY_2_ROLLOUT_N_GPUS_PER_NODE:-2}"  # standalone rollout 每节点卡数
-POLICY_2_TENSOR_PARALLEL_SIZE="${POLICY_2_TENSOR_PARALLEL_SIZE:-2}"    # rollout TP
+POLICY_2_TENSOR_PARALLEL_SIZE="${POLICY_2_TENSOR_PARALLEL_SIZE:-1}"    # rollout TP；2 rollout 卡 / TP=1 => 2 replicas，满足动态调度借用要求
 POLICY_2_MODEL_PATH="${POLICY_2_MODEL_PATH:-/mnt/bn/chenghao1026/models/Qwen2.5-0.5B-Instruct}"
 
 # ── Data ──────────────────────────
@@ -36,6 +36,7 @@ VAL_DATA="${VAL_DATA:-${MOCK_DATA_DIR}/mock_mas_val.parquet}"
 
 # ── MAS 配置 ─────────────────────────────────────────────────────────────
 MAS_CONFIG_PATH="${MAS_CONFIG_PATH:-${REPO_ROOT}/examples/multi_agent_blackbox/config/mas_config_long.yaml}"
+TRAIN_CONFIG_NAME="${TRAIN_CONFIG_NAME:-multi_agent_blackbox}"
 
 # ── 训练参数 ─────────────────────────────────────────────────────────────
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-30}"
@@ -61,6 +62,14 @@ if (( TRAIN_BATCH_SIZE != PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE )); then
     exit 1
 fi
 
+# ── 动态推理调度 ────────────────────────────────────────────────────────
+DYNAMIC_INFERENCE_SCHEDULING="${DYNAMIC_INFERENCE_SCHEDULING:-true}"
+if [[ "${DYNAMIC_INFERENCE_SCHEDULING}" == "true" ]]; then
+    WORKER_PROCESS_SETUP_HOOK="uni_agent.trainer.dynamic_inference.patch.apply_worker_patch"
+else
+    WORKER_PROCESS_SETUP_HOOK="examples.multi_agent_blackbox.verl_patch.apply_worker_patch"
+fi
+
 # ── 解释器 ───────────────────────────────────────────────────────────────
 PYTHON="${PYTHON:-/mnt/bn/chenghao1026/resouces/libs/zzh_env/bin/python3}"
 
@@ -83,10 +92,26 @@ echo "Policy 2 model:   ${POLICY_2_MODEL_PATH}"
 echo "Train data:       ${TRAIN_DATA}"
 echo "Val data:         ${VAL_DATA}"
 echo "MAS config:       ${MAS_CONFIG_PATH}"
+echo "Trainer config:   ${TRAIN_CONFIG_NAME}"
+echo "Dynamic schedule: ${DYNAMIC_INFERENCE_SCHEDULING}"
 echo "Log file:         ${LOG_PATH}"
 echo "============================================"
 
 cd "${REPO_ROOT}"
+
+# Some environments inject another verl checkout ahead of the selected Python
+# environment.  Recipes that require the environment's own verl can opt in to
+# removing that one entry without changing the default behaviour.
+if [[ -n "${EXCLUDED_PYTHONPATH_ENTRY:-}" ]]; then
+    SANITIZED_PYTHONPATH=""
+    IFS=':' read -r -a PYTHONPATH_ENTRIES <<< "${PYTHONPATH:-}"
+    for entry in "${PYTHONPATH_ENTRIES[@]}"; do
+        if [[ -n "${entry}" && "${entry}" != "${EXCLUDED_PYTHONPATH_ENTRY}" ]]; then
+            SANITIZED_PYTHONPATH="${SANITIZED_PYTHONPATH:+${SANITIZED_PYTHONPATH}:}${entry}"
+        fi
+    done
+    export PYTHONPATH="${SANITIZED_PYTHONPATH}"
+fi
 
 export RAY_ADDRESS
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
@@ -113,7 +138,7 @@ done
 
 # ── 启动训练 ──────────────────────────────────────────
 "${PYTHON}" -u -m uni_agent.trainer.main_multi_agents_ppo \
-    --config-name=multi_agent_blackbox \
+    --config-name="${TRAIN_CONFIG_NAME}" \
     --config-path="${REPO_ROOT}/examples/multi_agent_blackbox/config" \
     \
     data.train_files="['${TRAIN_DATA}']" \
@@ -126,6 +151,8 @@ done
     trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP} \
     trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE} \
+    dynamic_inference_scheduling.enable=${DYNAMIC_INFERENCE_SCHEDULING} \
+    ray_kwargs.ray_init.runtime_env.worker_process_setup_hook=${WORKER_PROCESS_SETUP_HOOK} \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.mas_config_path=${MAS_CONFIG_PATH} \
     \

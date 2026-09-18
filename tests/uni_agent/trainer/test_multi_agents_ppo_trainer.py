@@ -2374,6 +2374,17 @@ class TestMultiAgentsPPOTrainer:
                 {"training/off_policy/dropped_samples": 0},
             )
         )
+        class RecordingGate:
+            def __init__(self):
+                self.boundary_calls = 0
+
+            @contextmanager
+            def boundary(self):
+                self.boundary_calls += 1
+                yield
+
+        gate = RecordingGate()
+        trainer._dynamic_inference = SimpleNamespace(gate=gate)
         metrics = {}
 
         result = trainer._step_once(metrics=metrics, timing_raw={}, sample_batch_size=1)
@@ -2390,6 +2401,7 @@ class TestMultiAgentsPPOTrainer:
         assert "policy_2/values/count" not in metrics
         assert "policy_2/update_critic/count" not in metrics
         assert metrics["policy_2/update_actor/count"] == 1
+        assert gate.boundary_calls == 1
 
         policy_1 = trainer.policy_trainers["policy_1"]
         policy_2 = trainer.policy_trainers["policy_2"]
