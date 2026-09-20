@@ -431,7 +431,7 @@ def test_multi_agents_trainer_initializes_v1_policy_runtimes(monkeypatch):
             )
             self.val_dataloader = SmokeDataloader([])
 
-        def init_runtime(self):
+        def init_training_runtime(self):
             self._setup()
 
         def on_init_end(self):
@@ -607,7 +607,7 @@ def test_multi_agents_trainer_initializes_v1_policy_runtimes_real_verl(monkeypat
             )
             self.val_dataloader = SmokeDataloader([])
 
-        def init_runtime(self):
+        def init_training_runtime(self):
             self._setup()
 
         def on_init_end(self):

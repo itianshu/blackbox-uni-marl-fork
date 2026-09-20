@@ -5,10 +5,10 @@ import os
 from uuid import uuid4
 import posixpath
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
 from functools import lru_cache
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import ray
@@ -17,8 +17,10 @@ import transfer_queue as tq
 from hydra import compose, initialize_config_module
 from omegaconf import DictConfig, OmegaConf, open_dict
 from packaging.version import InvalidVersion, Version
+from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transfer_queue import KVBatchMeta
 
 from verl.protocol import DataProto
 from verl.trainer.ppo.metric_utils import (
@@ -37,6 +39,15 @@ from verl.utils.skip import SkipManager
 from verl.utils.tracking import Tracking
 
 from uni_agent.trainer.gateway.runtime import PolicyRoutingLLMClient
+
+if TYPE_CHECKING:
+    from ray.util.placement_group import PlacementGroup
+
+    from uni_agent.trainer.framework.entry import AgentFrameworkRolloutAdapter
+    from uni_agent.trainer.single_async_ppo_trainer import SingleAsyncPPOTrainer
+    from uni_agent.trainer.single_ppo_trainer import SinglePPOTrainer
+
+    PolicyTrainer = SinglePPOTrainer | SingleAsyncPPOTrainer
 
 
 logger = logging.getLogger(__name__)
@@ -61,6 +72,7 @@ class MultiAgentsPPOTrainer:
     The class owns per-policy v1 PPO trainer runtimes and builds one shared
     AgentFrameworkRolloutAdapter for multi-agent rollout collection.
     """
+
     def __init__(
         self,
         config: DictConfig,
@@ -76,8 +88,10 @@ class MultiAgentsPPOTrainer:
         self.total_training_steps = self.config.trainer.total_training_steps
 
         self.policy_configs = self._resolve_policy_configs()
+        self.role_policy_mapping = self._resolve_role_policy_mapping()
+        self._validate_role_policy_mapping()
 
-        self.policy_trainers: dict[str, Any] = {}
+        self.policy_trainers: dict[str, PolicyTrainer] = {}
         self.global_steps = 0
         self.timing_raw: dict[str, Any] = {}
 
@@ -86,7 +100,7 @@ class MultiAgentsPPOTrainer:
         # run concurrently in this pool.
         self._policy_pool = ThreadPoolExecutor(max_workers=max(1, len(self.policy_trainers)))
 
-    def _resolve_policy_configs(self) -> dict[str, Any]:
+    def _resolve_policy_configs(self) -> dict[str, DictConfig]:
         policies = self.config.get("policies")
         # The PPO trainer base is an outer-level runtime choice shared by
         # every policy. Policy entries may customize the composed config
@@ -112,7 +126,13 @@ class MultiAgentsPPOTrainer:
             raise ValueError("MultiAgentsPPOTrainer requires config.policies")
         return resolved
 
-    def _compose_policy_ppo_config(self, *, policy_name: str, config_name: str, policy_entry: Any):
+    def _compose_policy_ppo_config(
+        self,
+        *,
+        policy_name: str,
+        config_name: str,
+        policy_entry: DictConfig,
+    ) -> DictConfig:
         # Policy trainer configs come from one outer-selected Hydra config
         # module (e.g. verl's ``verl.trainer.config``). Policy entries cannot
         # replace this source; they only provide config overrides below.
@@ -152,7 +172,44 @@ class MultiAgentsPPOTrainer:
             policy_config.policy_name = policy_name
         return policy_config
 
-    def _create_policy_trainers(self) -> dict[str, Any]:
+    def _resolve_role_policy_mapping(self) -> dict[str, str]:
+        config_path = "actor_rollout_ref.rollout.custom.agent_framework.role_policy_mapping"
+        mapping = OmegaConf.select(self.config, config_path, default=None)
+        if mapping is None:
+            raise ValueError(f"{config_path} is required")
+
+        mapping = OmegaConf.to_container(mapping, resolve=True)
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError(f"{config_path} must be a non-empty mapping")
+
+        resolved_mapping: dict[str, str] = {}
+        for role, policy_name in mapping.items():
+            if not isinstance(role, str) or not role.strip():
+                raise ValueError(f"{config_path} contains an invalid role: {role!r}")
+            if not isinstance(policy_name, str) or not policy_name.strip():
+                raise ValueError(f"{config_path}[{role!r}] must be a non-empty policy name")
+            resolved_mapping[role] = policy_name
+        return resolved_mapping
+
+    def _validate_role_policy_mapping(self) -> None:
+        configured_policies = set(self.policy_configs)
+        mapped_policies = set(self.role_policy_mapping.values())
+        unknown_policies = mapped_policies - configured_policies
+        if unknown_policies:
+            raise ValueError(
+                "role_policy_mapping references unknown policies: "
+                f"{sorted(unknown_policies)}. "
+                f"Configured policies: {sorted(configured_policies)}"
+            )
+
+        unused_policies = configured_policies - mapped_policies
+        if unused_policies:
+            logger.warning(
+                "Configured policies are not referenced by role_policy_mapping: %s",
+                sorted(unused_policies),
+            )
+
+    def _create_policy_trainers(self) -> dict[str, PolicyTrainer]:
         for policy_name, policy_config in self.policy_configs.items():
             # The outer trainer owns the checkpoint lifecycle (load/save under
             # checkpoints/.../policies/<policy>), so a per-policy trainer must
@@ -181,7 +238,8 @@ class MultiAgentsPPOTrainer:
         3. Shared outer replay buffer over the TransferQueue.
         4. Outer checkpoint phase; the outer trainer owns the shared checkpoint
            lifecycle and establishes actor/critic state and ``global_steps``.
-        5. Initialize every policy's standalone rollout runtime concurrently.
+        5. Initialize standalone rollout runtimes in descending per-replica
+           node GPU footprint waves; policies in the same wave run concurrently.
         6. Invoke every policy's ``on_init_end()`` concurrently after the outer
            initialization phase to synchronize current actor weights to that
            policy's rollout replicas.
@@ -201,13 +259,22 @@ class MultiAgentsPPOTrainer:
 
         if self.trainer_mode == "separate_async":
             self._validate_stage_resources("rollout")
-            futures = [
-                self._policy_pool.submit(policy_trainer.init_standalone_rollout_runtime)
-                for policy_trainer in self.policy_trainers.values()
-            ]
-            wait(futures)
-            for future in futures:
-                future.result()
+            for gpus_per_replica_node, policy_names in self._get_rollout_init_waves():
+                logger.info(
+                    "Initializing standalone rollout wave: "
+                    "gpus_per_replica_node=%d policies=%s",
+                    gpus_per_replica_node,
+                    policy_names,
+                )
+                futures = [
+                    self._policy_pool.submit(
+                        self.policy_trainers[policy_name].init_standalone_rollout_runtime
+                    )
+                    for policy_name in policy_names
+                ]
+                wait(futures)
+                for future in futures:
+                    future.result()
 
         futures = [
             self._policy_pool.submit(policy_trainer.on_init_end)
@@ -318,6 +385,33 @@ class MultiAgentsPPOTrainer:
             )
 
         return requests
+
+    def _get_rollout_init_waves(self) -> list[tuple[int, list[str]]]:
+        """Group policies by replica-node footprint, largest footprint first."""
+        policy_footprints: dict[str, int] = {}
+        for policy_name, pool_name, gpus_per_node in self._get_stage_resource_requests("rollout"):
+            if pool_name != "standalone_rollout":
+                continue
+            policy_footprints[policy_name] = max(
+                policy_footprints.get(policy_name, 0),
+                gpus_per_node,
+            )
+
+        missing_policies = set(self.policy_trainers) - set(policy_footprints)
+        if missing_policies:
+            raise ValueError(
+                "Missing standalone rollout resource requests for policies: "
+                f"{sorted(missing_policies)}"
+            )
+
+        policies_by_footprint: dict[int, list[str]] = defaultdict(list)
+        for policy_name in self.policy_trainers:
+            policies_by_footprint[policy_footprints[policy_name]].append(policy_name)
+
+        return [
+            (footprint, policies_by_footprint[footprint])
+            for footprint in sorted(policies_by_footprint, reverse=True)
+        ]
 
     def _validate_stage_resources(self, stage: str) -> None:
         """Fail fast when the current Ray snapshot cannot place a whole stage.
@@ -434,7 +528,7 @@ class MultiAgentsPPOTrainer:
             gateway_actor_kwargs["processor"] = default_processor
         return gateway_actor_kwargs
 
-    def fit(self, agent_loop_manager):
+    def fit(self, agent_loop_manager: AgentFrameworkRolloutAdapter) -> None:
         """Fit the trainer with the agent loop manager.
 
         Args:
@@ -537,7 +631,11 @@ class MultiAgentsPPOTrainer:
                 metrics[f"{policy_name}/sync/{key}"] = value
         return metrics
 
-    def step(self, metrics: dict[str, Any] | None = None, timing_raw: dict[str, Any] | None = None):
+    def step(
+        self,
+        metrics: dict[str, Any] | None = None,
+        timing_raw: dict[str, Any] | None = None,
+    ) -> KVBatchMeta:
         metrics = metrics if metrics is not None else {}
         timing_raw = timing_raw if timing_raw is not None else {}
         self.timing_raw = timing_raw
@@ -619,7 +717,12 @@ class MultiAgentsPPOTrainer:
             tags=[tag for batch in step_batches for tag in batch.tags],
         )
 
-    def _step_once(self, metrics: dict[str, Any], timing_raw: dict[str, Any], sample_batch_size: int):
+    def _step_once(
+        self,
+        metrics: dict[str, Any],
+        timing_raw: dict[str, Any],
+        sample_batch_size: int,
+    ) -> KVBatchMeta:
         self.timing_raw = timing_raw
         with marked_timer("gen", timing_raw, color="red"):
             multi_agent_batch = self.sample_multi_agent_batch(
@@ -641,7 +744,11 @@ class MultiAgentsPPOTrainer:
         self.update_policy_trainers(per_policy_batches, metrics=metrics)
         return multi_agent_batch
 
-    def sample_multi_agent_batch(self, sample_batch_size: int | None = None, metrics: dict[str, Any] | None = None):
+    def sample_multi_agent_batch(
+        self,
+        sample_batch_size: int | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> KVBatchMeta:
         self.on_sample_begin()
         result = self.replay_buffer.sample(
             global_steps=self.global_steps,
@@ -660,7 +767,10 @@ class MultiAgentsPPOTrainer:
 
         return batch
 
-    def build_per_policy_batches(self, multi_agent_batch):
+    def build_per_policy_batches(
+        self,
+        multi_agent_batch: KVBatchMeta,
+    ) -> dict[str, KVBatchMeta]:
         if not hasattr(multi_agent_batch, "keys") or not hasattr(multi_agent_batch, "tags"):
             raise TypeError("multi_agent_batch must be a KVBatchMeta-like object with keys and tags")
         if len(multi_agent_batch.keys) != len(multi_agent_batch.tags):
@@ -687,7 +797,11 @@ class MultiAgentsPPOTrainer:
             if policy_name in grouped
         }
 
-    def prepare_policy_batches_for_ppo_update(self, per_policy_batches, metrics: dict[str, Any]):
+    def prepare_policy_batches_for_ppo_update(
+        self,
+        per_policy_batches: Mapping[str, KVBatchMeta],
+        metrics: dict[str, Any],
+    ) -> dict[str, KVBatchMeta]:
         """Run per-policy balance/log-prob stages concurrently on disjoint GPUs."""
         futures = [
             self._policy_pool.submit(self._prepare_policy_batch_for_update, policy_name, batch)
@@ -704,8 +818,10 @@ class MultiAgentsPPOTrainer:
         return prepared
 
     def _prepare_policy_batch_for_update(
-        self, policy_name: str, batch
-    ) -> tuple[str, Any, dict[str, Any], dict[str, float]]:
+        self,
+        policy_name: str,
+        batch: KVBatchMeta,
+    ) -> tuple[str, KVBatchMeta, dict[str, Any], dict[str, float]]:
         """Run one policy's pre-update stages (balance + old/ref log-probs + values)."""
         trainer = self.policy_trainers[policy_name]
         policy_metrics: dict[str, Any] = {}
@@ -730,21 +846,28 @@ class MultiAgentsPPOTrainer:
 
         return policy_name, batch, policy_metrics, timing_raw
 
-    def compute_multi_agent_advantage_from_policy_batches(self, per_policy_batches, metrics: dict[str, Any]):
+    def compute_multi_agent_advantage_from_policy_batches(
+        self,
+        per_policy_batches: Mapping[str, KVBatchMeta],
+        metrics: dict[str, Any],
+    ) -> KVBatchMeta:
         # Advantage needs the merged rollout/group view. The per-policy batches
         # keep the same TQ keys, so updates can reuse them after advantage is
         # written back to the shared trajectory records.
         multi_agent_batch = self._merge_policy_batches(per_policy_batches)
         return self.compute_multi_agent_advantage(multi_agent_batch, metrics)
 
-    def compute_multi_agent_advantage(self, multi_agent_batch, metrics: dict[str, Any]):
-        for trainer in self.policy_trainers.values():
-            multi_agent_batch = trainer._compute_advantage(multi_agent_batch, metrics=metrics)
-            self._add_advantage_metrics(multi_agent_batch, metrics)
-            return multi_agent_batch
-        raise AttributeError("At least one policy trainer must provide _compute_advantage()")
+    def compute_multi_agent_advantage(
+        self,
+        multi_agent_batch: KVBatchMeta,
+        metrics: dict[str, Any],
+    ) -> KVBatchMeta:
+        advantage_trainer = next(iter(self.policy_trainers.values()))
+        multi_agent_batch = advantage_trainer._compute_advantage(multi_agent_batch, metrics=metrics)
+        self._add_advantage_metrics(multi_agent_batch, metrics)
+        return multi_agent_batch
 
-    def _add_advantage_metrics(self, batch, metrics: dict[str, Any]) -> None:
+    def _add_advantage_metrics(self, batch: KVBatchMeta, metrics: dict[str, Any]) -> None:
         """Log per-policy advantage distribution stats from the TransferQueue.
 
         verl's per-policy ``_compute_advantage`` writes token-level
@@ -798,7 +921,7 @@ class MultiAgentsPPOTrainer:
 
     def _add_data_metrics(
         self,
-        batch,
+        batch: KVBatchMeta,
         metrics: dict[str, Any],
         timing_raw: dict[str, float] | None = None,
     ) -> None:
@@ -915,7 +1038,11 @@ class MultiAgentsPPOTrainer:
             except Exception as exc:
                 logger.warning("failed to compute data metrics for %s: %s", policy_name, exc)
 
-    def update_policy_trainers(self, per_policy_batches, metrics: dict[str, Any] | None = None):
+    def update_policy_trainers(
+        self,
+        per_policy_batches: Mapping[str, KVBatchMeta],
+        metrics: dict[str, Any] | None = None,
+    ) -> dict[str, KVBatchMeta]:
         """Run per-policy critic/actor updates concurrently on disjoint GPUs."""
         metrics = metrics if metrics is not None else {}
         critic_warmup = self.config.trainer.get("critic_warmup", 0)
@@ -941,8 +1068,11 @@ class MultiAgentsPPOTrainer:
         )
 
     def _update_one_policy(
-        self, policy_name: str, batch, critic_warmup: int
-    ) -> tuple[str, Any, dict[str, Any], dict[str, float]]:
+        self,
+        policy_name: str,
+        batch: KVBatchMeta,
+        critic_warmup: int,
+    ) -> tuple[str, KVBatchMeta, dict[str, Any], dict[str, float]]:
         """Run one policy's critic/actor update."""
         trainer = self.policy_trainers[policy_name]
         policy_metrics: dict[str, Any] = {}
@@ -1021,7 +1151,7 @@ class MultiAgentsPPOTrainer:
             collate_fn=collate_fn,
         )
 
-    def _build_replay_buffer(self):
+    def _build_replay_buffer(self) -> ReplayBuffer | ReplayBufferAsync:
         """Build the outer shared ReplayBuffer used by multi-agent sampling.
 
         Mirrors verl PPOTrainer._build_replay_buffer but sources every knob
@@ -1333,7 +1463,7 @@ class MultiAgentsPPOTrainer:
             return False
         return self.global_steps >= self.total_training_steps or self.global_steps % save_freq == 0
 
-    def _fetch_one_gen_batch(self):
+    def _fetch_one_gen_batch(self) -> TensorDict:
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
@@ -1345,7 +1475,7 @@ class MultiAgentsPPOTrainer:
         batch_dict["uid"] = np.array([str(uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         return tu.get_tensordict(batch_dict)
 
-    def _next_train_batch(self, num_prompts: int | None = None):
+    def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
         """Fetch and coalesce the requested number of prompts.
 
         Mirrors verl's v1 trainer semantics: ``num_prompts`` must be a positive
@@ -1368,8 +1498,6 @@ class MultiAgentsPPOTrainer:
             )
 
         chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
-        if any(chunk is None for chunk in chunks):
-            return None
         batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         return batch
@@ -1389,7 +1517,7 @@ class MultiAgentsPPOTrainer:
             return
         self._submit_batch_to_rollout(batch)
 
-    def _submit_batch_to_rollout(self, batch) -> int:
+    def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
         """Register prompts in TransferQueue and dispatch them for generation.
 
         This is the training-only submission path, matching native v1's
@@ -1434,7 +1562,7 @@ class MultiAgentsPPOTrainer:
         return len(uid_values)
 
     @staticmethod
-    def _validation_final_record_keys(batch) -> list[str]:
+    def _validation_final_record_keys(batch: KVBatchMeta) -> list[str]:
         """Return the final record for each complete MAS rollout.
 
         A single ``{uid, sample_idx}`` is one MAS rollout and may contain one
@@ -1738,7 +1866,12 @@ class MultiAgentsPPOTrainer:
             metrics[f"{policy_name}/{key}"] = value
 
     @staticmethod
-    def _make_batch_like(template, *, keys: list[str], tags: list[dict[str, Any]]):
+    def _make_batch_like(
+        template: KVBatchMeta,
+        *,
+        keys: list[str],
+        tags: list[dict[str, Any]],
+    ) -> KVBatchMeta:
         kwargs = {
             "partition_id": template.partition_id,
             "keys": list(keys),
@@ -1748,7 +1881,10 @@ class MultiAgentsPPOTrainer:
         }
         return template.__class__(**kwargs)
 
-    def _merge_policy_batches(self, per_policy_batches: Mapping[str, Any]):
+    def _merge_policy_batches(
+        self,
+        per_policy_batches: Mapping[str, KVBatchMeta],
+    ) -> KVBatchMeta:
         merged_keys: list[str] = []
         merged_tags: list[dict[str, Any]] = []
         template = None
@@ -1809,17 +1945,22 @@ class MultiAgentsPPOTrainer:
         except Exception as exc:
             logger.warning("policy thread pool shutdown failed: %s", exc)
 
-    def _collect_placement_groups(self) -> list:
-        """Collect trainer and standalone-rollout placement groups."""
+    def _collect_placement_groups(self) -> list[PlacementGroup]:
+        """Collect placement groups that were already created by policy runtimes.
+
+        ``RayResourcePool.get_placement_groups()`` creates placement groups when
+        ``pool.pgs`` is ``None``. Cleanup must therefore inspect ``pgs``
+        directly so a partially initialized runtime cannot allocate or block on
+        new resources while it is being torn down.
+        """
         pgs = []
         for policy_trainer in self.policy_trainers.values():
             rp_mgr = getattr(policy_trainer, "resource_pool_manager", None)
             pools = rp_mgr.resource_pool_dict.values() if rp_mgr is not None else []
             for pool in pools:
-                try:
-                    pgs.extend(pool.get_placement_groups())
-                except Exception:
-                    continue
+                existing_pgs = getattr(pool, "pgs", None)
+                if existing_pgs:
+                    pgs.extend(existing_pgs)
 
             standalone_manager = getattr(policy_trainer, "standalone_server_manager", None)
             replicas = standalone_manager.rollout_replicas if standalone_manager is not None else []
@@ -1827,13 +1968,12 @@ class MultiAgentsPPOTrainer:
                 resource_pool = getattr(replica, "resource_pool", None)
                 if resource_pool is None:
                     continue
-                try:
-                    pgs.extend(resource_pool.get_placement_groups())
-                except Exception:
-                    continue
+                existing_pgs = getattr(resource_pool, "pgs", None)
+                if existing_pgs:
+                    pgs.extend(existing_pgs)
         return pgs
 
-    def _remove_placement_groups(self, pgs) -> None:
+    def _remove_placement_groups(self, pgs: Iterable[PlacementGroup]) -> None:
         """Best-effort removal of placement groups, deduplicated by PG id."""
         seen = set()
         for pg in pgs:

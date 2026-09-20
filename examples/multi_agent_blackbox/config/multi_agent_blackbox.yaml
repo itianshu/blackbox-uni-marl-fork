@@ -174,8 +174,8 @@ actor_rollout_ref:
         # ordering supplies the final result used for reward.
         role_policy_mapping:
           agent_1: policy_1
-          agent_2: policy_1
-          agent_3: policy_2
+          agent_2: policy_2
+          agent_3: policy_3
 
 policies:
   # ── policies 字段所有权约定 ─────────────────────────────────────────
@@ -290,6 +290,70 @@ policies:
             engine_kwargs:
               nccl:
                 group_name: checkpoint_policy_2
+          n: ${actor_rollout_ref.rollout.n}
+          # Standalone rollout allocation: 8 GPUs total. TP=2 creates four
+          # independent vLLM replicas for this policy.
+          nnodes: 1
+          n_gpus_per_node: 8
+          # Per-policy sampling temperature == training-side recompute
+          # temperature for this policy (fallback used by vLLM generation
+          # config when the runner request carries no temperature).
+          temperature: 1.0
+          top_p: 1.0
+          prompt_length: 4096
+          response_length: 32768
+          max_model_len: 36864
+          load_format: safetensors
+          tensor_model_parallel_size: 2
+          gpu_memory_utilization: 0.6
+          calculate_log_probs: true
+          enable_sleep_mode: true
+          free_cache_engine: true
+          multi_turn:
+            format: hermes
+
+  policy_3:
+    # 结构与 policy_1 相同；字段所有权注释见 policy_1（下面同样适用）。
+    ppo_trainer_overrides:
+      trainer:
+        nnodes: 1
+        n_gpus_per_node: 8
+        default_local_dir: checkpoints/multi_agent_blackbox/policy_3
+        total_training_steps: ${trainer.total_training_steps}  # 外层共享，改顶层
+
+      data:
+        train_batch_size: ${data.train_batch_size}             # 外层共享，改顶层
+
+      actor_rollout_ref:
+        hybrid_engine: true
+        model:
+          path: ???                                            # 必须 hydra override 提供（见文件头）
+          trust_remote_code: true
+
+        actor:
+          strategy: fsdp
+          use_dynamic_bsz: true
+          ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}  # outer shared
+          ppo_max_token_len_per_gpu: 40960
+          use_kl_loss: false
+          kl_loss_coef: 0.0
+          optim:
+            lr: 1e-6
+            weight_decay: 0.01
+          fsdp_config:
+            fsdp_size: 8                                       # FSDP 分片数；须整除训练总卡数（nnodes×n_gpus_per_node）
+            param_offload: true
+            optimizer_offload: true
+
+        rollout:
+          name: vllm
+          mode: async
+          checkpoint_engine:
+            backend: nccl
+            # Must be unique per policy (must differ from policy_1's value).
+            engine_kwargs:
+              nccl:
+                group_name: checkpoint_policy_3
           n: ${actor_rollout_ref.rollout.n}
           # Standalone rollout allocation: 8 GPUs total. TP=2 creates four
           # independent vLLM replicas for this policy.

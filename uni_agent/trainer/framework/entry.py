@@ -19,6 +19,7 @@ instead of relying on a local ReplayBuffer.
 from __future__ import annotations
 
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
 from uni_agent.trainer.framework.framework import AgentFramework
 from uni_agent.trainer.gateway.runtime import GatewayServingRuntime
@@ -115,7 +116,7 @@ class AgentFrameworkRolloutAdapter:
         return instance
 
     @auto_await
-    async def generate_sequences(self, prompts) -> None:
+    async def generate_sequences(self, prompts: TensorDict) -> None:
         if self.framework is None:
             raise RuntimeError("framework must be initialized before generate_sequences")
         return await self.framework.generate_sequences(prompts)
