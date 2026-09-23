@@ -6,8 +6,9 @@ aggregate N smaller home replicas into M larger guests, or split one larger
 home replica into multiple smaller guests. It belongs to no
 ``CheckpointEngineManager`` and no load balancer
 (invariant I1) until a borrow wakes it, receives a directed weight push, and
-joins the donor's LB. In-place renewals refresh its weights at each boundary;
-on return it sleeps again without any weight write-back.
+joins the donor's checkpoint manager and LB. Regular policy synchronization
+refreshes its weights at each boundary; on return it leaves that manager and
+sleeps again without any weight write-back.
 
 Placement (the mechanism verl itself uses for colocated engines): the home
 replica's PG is created with ``max_colocate_count = 1 + outgoing_edges``.
@@ -39,6 +40,7 @@ import asyncio
 import copy
 import itertools
 import logging
+import random
 import time
 from contextlib import AsyncExitStack, asynccontextmanager
 
@@ -391,10 +393,9 @@ class GuestEngineManager:
             for lock in locks:
                 await stack.enter_async_context(lock)
             try:
-                for guest in unit.guests:
-                    await guest.init_standalone()
+                for guest_idx in range(len(unit.guests)):
+                    guest = await self._initialize_guest_with_retry(unit, guest_idx)
                     initialized_guests.append(guest)
-                    await guest.sleep()
             except BaseException:
                 if initialized_guests:
                     await asyncio.gather(*[
@@ -402,6 +403,98 @@ class GuestEngineManager:
                     ], return_exceptions=True)
                 self._kill_guest_actors(unit.guests)
                 raise
+
+    @staticmethod
+    def _is_retryable_port_collision(exc: BaseException) -> bool:
+        """Recognize the vLLM/TCPStore check-then-bind race through wrappers."""
+        seen = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            message = f"{type(current).__name__}: {current}".lower()
+            if any(marker in message for marker in (
+                "eaddrinuse",
+                "address already in use",
+                "server socket has failed to listen",
+            )):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    async def _wait_guest_actors_stopped(self, guest, timeout=30.0):
+        """Do not rebuild on shared GPUs until killed Ray actors are unreachable."""
+        import ray
+        async def wait_one(actor):
+            while True:
+                try:
+                    await actor.__ray_ready__.remote()
+                except ray.exceptions.ActorDiedError:
+                    return
+                await asyncio.sleep(0.1)
+        actors = list(getattr(guest, 'servers', []) or []) + list(getattr(guest, 'workers', []) or [])
+        await asyncio.wait_for(asyncio.gather(*(wait_one(a) for a in actors)), timeout)
+
+    async def _initialize_guest_with_retry(
+        self,
+        unit: GuestUnit,
+        guest_idx: int,
+    ):
+        """Initialize one guest, rebuilding it after a transient port race.
+
+        A failed ``init_standalone`` has already appended Ray worker/server
+        handles to the replica. Reusing that object would duplicate actors, so
+        every retry first kills its partial actors and constructs a fresh
+        replica on the same placement-pool view.
+        """
+        cfg = self.config.borrowing
+        max_attempts = cfg.guest_init_max_attempts
+        for attempt in range(1, max_attempts + 1):
+            guest = unit.guests[guest_idx]
+            initialized = False
+            try:
+                await guest.init_standalone()
+                initialized = True
+                await guest.sleep()
+                return guest
+            except BaseException as exc:
+                # vLLM's subprocess wrapper can hide EADDRINUSE entirely.
+                # Retry only failed startup, never a failed post-init sleep.
+                wrapped_startup = "engine core initialization failed" in str(exc).lower()
+                retryable = not initialized and (self._is_retryable_port_collision(exc) or wrapped_startup)
+                killed = self._kill_guest_actors([guest])
+                if not retryable or attempt >= max_attempts:
+                    raise
+                expected = len(getattr(guest, 'servers', []) or []) + len(getattr(guest, 'workers', []) or [])
+                if killed != expected:
+                    raise RuntimeError("Cannot retry guest initialization: partial actor cleanup") from exc
+                await self._wait_guest_actors_stopped(guest)
+
+                delay = (
+                    cfg.guest_init_retry_backoff_s * (2 ** (attempt - 1))
+                    + random.uniform(0.0, cfg.guest_init_retry_jitter_s)
+                )
+                logger.warning(
+                    "dynamic_inference.guest_engine: guest %s->%s index=%d "
+                    "failed during startup (attempt %d/%d); "
+                    "rebuilding after %.2fs; cause=%s",
+                    unit.home_policy,
+                    unit.donor,
+                    guest_idx,
+                    attempt,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                unit.guests[guest_idx] = await self._make_guest(
+                    unit.home_policy,
+                    unit.donor,
+                    unit.home_replicas,
+                    guest._guest_external_pool,
+                    guest_idx,
+                )
+
+        raise AssertionError("unreachable")
 
     async def _probe_sleep(self, home: str, replicas: list, dt: float) -> None:
         """Fail fast unless every home vLLM engine reports that it is sleeping."""

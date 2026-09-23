@@ -5,14 +5,13 @@ Cross-policy replica borrowing over a many-to-many directed graph, triggered
 by fresh serving metrics: an underloaded policy's (``home``) standalone
 replicas are put to level-2 sleep and pre-created donor-architecture ``guest``
 replicas are woken on the same cards,
-receiving one directed weight push and joining the bottleneck (``donor``)
-policy's load balancer for one step.
+cloning published weights from an active same-policy vLLM and joining the bottleneck (``donor``)
+policy's load balancer and checkpoint manager until returned.
 
-Serving signals are scraped from each replica's vLLM ``/metrics`` endpoint.
-KV cache utilisation remains the scheduling input; queue, latency, throughput,
-request, and cache statistics are retained for observation and future policies.
-Borrow quantity uses discrete load equalisation across all topology-valid units
-(:mod:`uni_agent.trainer.dynamic_inference.quantity`).
+Serving signals are sampled together from each load balancer and replica vLLM
+``/metrics`` endpoint. A policy enters overload on either high KV utilisation
+or a deep, long-lived request queue. Each borrow event selects at most one safe
+atomic replica unit (:mod:`uni_agent.trainer.dynamic_inference.quantity`).
 
 Public entry point: :class:`DynamicInferenceController`
 (:meth:`DynamicInferenceController.maybe_create`), wired into
@@ -31,7 +30,7 @@ from .metrics import (
     VLLMMetricsSnapshot,
     parse_vllm_metrics,
 )
-from .quantity import EqualisationStrategy
+from .quantity import EqualisationStrategy, SingleUnitStrategy
 from .scheduler import MultiPolicyInferenceScheduler
 from .signals import PolicySample, ServingSignalSource, SignalStore
 from .types import (
@@ -62,6 +61,7 @@ __all__ = [
     "BorrowingConfig",
     "DynamicInferenceController",
     "EqualisationStrategy",
+    "SingleUnitStrategy",
     "GuestEngineManager",
     "GuestUnit",
     "LendEvent",

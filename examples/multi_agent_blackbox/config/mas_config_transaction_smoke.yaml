@@ -1,0 +1,14 @@
+harness:
+  entry_agent: agent_1
+  min_rounds: 3
+  max_rounds: 5
+  random_seed: 42
+  route_weights: {agent_1: 1.0, agent_2: 1.0, agent_3: 1.0}
+  output_tokens_min: 512
+  output_tokens_max: 1024
+  output_tokens_step: 256
+  minimum_completion_ratio: 0.9
+agents:
+  agent_1: {system_prompt: 'Solve the problem and preserve a clear final answer.'}
+  agent_2: {system_prompt: 'Review the previous work and improve the answer.'}
+  agent_3: {system_prompt: 'Verify the reasoning and provide a final answer.'}

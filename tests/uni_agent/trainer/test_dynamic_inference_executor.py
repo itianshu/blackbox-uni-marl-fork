@@ -83,6 +83,9 @@ class FakeSCM:
         self._tag = tag
         self.replicas = list(replicas)
         self.config = f"scm-config:{tag}"
+        self._dynamic_published_version = (0, 1)
+        for replica in self.replicas:
+            replica._dynamic_weight_version = (0, 1)
 
     def remove_replicas(self, replicas):
         self._log.append((f"scm:{self._tag}:remove", tuple(r.server_address for r in replicas)))
@@ -108,38 +111,21 @@ class FakeGuestEngine:
         self._log.append(("guest_release", home, donor))
 
 
-class FakePushManager:
-    """Injected as verl.checkpoint_engine.base.CheckpointEngineManager."""
-
-    instances = []
-    fail_next = False
-    log = None  # set by the test to the shared op log for ordering asserts
-
-    def __init__(self, *, config, actor_wg, replicas):
-        self.config = config
-        self.actor_wg = actor_wg
-        self.replicas = list(replicas)
-        self.update_calls = []
-        FakePushManager.instances.append(self)
-
-    async def update_weights(self, global_steps=None):
-        self.update_calls.append(global_steps)
-        if FakePushManager.log is not None:
-            FakePushManager.log.append(("push", self.actor_wg, global_steps))
-        if FakePushManager.fail_next:
-            FakePushManager.fail_next = False
-            raise RuntimeError("push failed")
-
-
 @pytest.fixture()
-def push_stub(monkeypatch):
-    module = types.ModuleType("verl.checkpoint_engine.base")
-    module.CheckpointEngineManager = FakePushManager
-    FakePushManager.instances = []
-    FakePushManager.fail_next = False
-    FakePushManager.log = None
-    monkeypatch.setitem(sys.modules, "verl.checkpoint_engine.base", module)
-    return FakePushManager
+def clone_stub(monkeypatch):
+    from uni_agent.trainer.dynamic_inference import replica_clone
+    state = types.SimpleNamespace(instances=[], fail_next=False, log=None)
+    async def clone(source, target, **kwargs):
+        state.instances.append((source, target, kwargs))
+        if state.log is not None:
+            state.log.append(("clone", source.server_address, target.server_address))
+        if state.fail_next:
+            state.fail_next = False
+            raise RuntimeError("clone failed")
+        target._dynamic_weight_version = kwargs['version']
+        return {'source': source.server_address, 'target': target.server_address}
+    monkeypatch.setattr(replica_clone, 'clone_replica', clone)
+    return state
 
 
 class Registry:
@@ -195,300 +181,146 @@ class Env:
         return [entry[0] for entry in self.log]
 
 
-# ---------------------------------------------------------------------- tests
-class TestBorrow:
-    def test_borrow_full_sequence(self, push_stub):
-        env = Env()
-        push_stub.log = env.log
-        home = env.handles["b"].replicas[0]
-        plan = BorrowPlan(home_policy="b", donor="a", home_replicas=[home])
-        lend = env.executor.borrow(plan, step=7)
 
-        assert lend is not None
-        # exact choreography: I6 (LB removal first), I3 (home asleep before
-        # guest wakes), I5 (push before the donor LB add)
-        assert env.log == [
-            ("lb:b:remove", ["b:0"]),
-            ("abort:b:0",),
-            ("scm:b:remove", ("b:0",)),
-            ("sleep:b:0",),
-            ("guests_for", "b", "a", ("b:0",)),
-            ("wake:guest-ba:0",),
-            ("push", "actor_wg:a", 7),
-            ("lb:a:add", {"guest-ba:0": "h:guest-ba:0"}),
-        ]
-
-        # scheduler bookkeeping
-        assert env.scheduler.active_lends == [lend]
-        # home scm no longer holds the replica; donor scm never gained it (I1)
-        assert home not in env.handles["b"].standalone_checkpoint_manager.replicas
-        assert all(r.server_address != "guest-ba:0"
-                   for p in env.handles.values()
-                   for r in p.standalone_checkpoint_manager.replicas)
-
-    def test_push_failure_rolls_back(self, push_stub):
-        env = Env()
-        home = env.handles["b"].replicas[0]
-        plan = BorrowPlan(home_policy="b", donor="a", home_replicas=[home])
-        push_stub.fail_next = True
-
-        lend = env.executor.borrow(plan, step=7)
-        assert lend is None
-        assert env.scheduler.active_lends == []
-        ops = env.ops()
-        # rollback: guest sleep -> guest release -> home wake -> scm add -> lb add
-        assert ops.index("sleep:guest-ba:0") < ops.index("wake:b:0") \
-            < ops.index("scm:b:add") < ops.index("lb:b:add")
-        # home fully restored
-        assert home in env.handles["b"].standalone_checkpoint_manager.replicas
-        # pair blocked for a long window
-        assert env.scheduler.pair_block_until[("b", "a")] > 7
-
-    def test_partial_home_sleep_failure_wakes_entire_unit(self, push_stub):
-        env = Env()
-        homes = env.handles["b"].replicas
-        homes[1]._fail["sleep"] = RuntimeError("sleep failed")
-        plan = BorrowPlan(home_policy="b", donor="a", home_replicas=homes)
-
-        assert env.executor.borrow(plan, step=7) is None
-        ops = env.ops()
-        assert "wake:b:0" in ops
-        assert "wake:b:1" in ops
-        assert all(home in env.handles["b"].standalone_checkpoint_manager.replicas
-                   for home in homes)
-
-    def test_guest_wake_failure_releases_reserved_unit(self, push_stub):
-        env = Env()
-        guest = env.guest_engine._guest_map[("b", "a")][0]
-        guest._fail["wake_up"] = RuntimeError("wake failed")
-        home = env.handles["b"].replicas[0]
-        plan = BorrowPlan(home_policy="b", donor="a", home_replicas=[home])
-
-        assert env.executor.borrow(plan, step=7) is None
-        ops = env.ops()
-        assert "sleep:guest-ba:0" in ops
-        assert "guest_release" in ops
-        assert "wake:b:0" in ops
-        assert home in env.handles["b"].standalone_checkpoint_manager.replicas
-
-    def test_repeated_failures_disable_scheduling(self, push_stub):
-        env = Env()
-        plan = BorrowPlan(home_policy="b", donor="a",
-                          home_replicas=[env.handles["b"].replicas[0]])
-        for _ in range(2):
-            push_stub.fail_next = True
-            env.executor.borrow(plan, step=7)
-        assert env.scheduler.disabled is True
+# Transaction contract: membership is committed once, and failures are fatal.
+def borrow(env):
+    return env.executor.borrow(BorrowPlan(home_policy="b", donor="a",
+        home_replicas=[env.handles["b"].replicas[0]]), step=7)
 
 
-class TestReturn:
-    def _lend(self, env):
-        home = env.handles["b"].replicas[0]
-        guest = env.guest_engine._guest_map[("b", "a")][0]
-        from uni_agent.trainer.dynamic_inference.types import LendRecord
+def test_membership_roundtrip(clone_stub):
+    env = Env()
+    lend = borrow(env)
+    assert lend.guests[0] in env.handles["a"].standalone_checkpoint_manager.replicas
+    assert lend.home_replicas[0] not in env.handles["b"].standalone_checkpoint_manager.replicas
+    env.executor.validate_membership()
+    env.executor.return_(lend, 8)
+    assert lend.guests[0] not in env.handles["a"].standalone_checkpoint_manager.replicas
+    assert lend.home_replicas[0] in env.handles["b"].standalone_checkpoint_manager.replicas
+    assert not env.scheduler.active_lends
+    env.executor.validate_membership()
+    assert len(clone_stub.instances) == 2  # initial guest + home refresh only
 
-        lend = LendRecord(lend_id=1, home_policy="b", donor="a",
-                          home_replicas=[home], guests=[guest], since_step=7)
-        env.scheduler.note_borrow_started(lend)
-        return lend
 
-    def test_return_full_sequence(self, push_stub):
-        env = Env()
-        lend = self._lend(env)
-        assert env.executor.return_(lend, step=8) is True
+@pytest.mark.parametrize("operation", ["abort_all_requests", "sleep", "wake_up"])
+def test_borrow_failure_stops_transaction(clone_stub, operation):
+    env = Env()
+    target = (env.guest_engine._guest_map[("b", "a")][0] if operation == "wake_up"
+              else env.handles["b"].replicas[0])
+    target._fail[operation] = TimeoutError("injected")
+    with pytest.raises(RuntimeError, match="TimeoutError"):
+        borrow(env)
+    before = list(env.log)
+    with pytest.raises(RuntimeError, match="restart required"):
+        env.executor.validate_membership()
+    with pytest.raises(RuntimeError):
+        borrow(env)
+    assert env.log == before
+    assert not env.scheduler.active_lends
 
-        ops = env.ops()
-        # I6: donor LB removal first; guests asleep before home wakes (I3).
-        # A directed home push occurs before SCM/LB re-attachment; the fake
-        # push logger is disabled here, so only the surrounding operations show.
-        assert ops == [
-            "lb:a:remove",
-            "abort:guest-ba:0",
-            "sleep:guest-ba:0",
-            "wake:b:0",
-            "scm:b:add",
-            "lb:b:add",
-            "guest_release",
-        ]
-        assert len(push_stub.instances) == 1
-        assert push_stub.instances[0].actor_wg == "actor_wg:b"
-        assert env.scheduler.active_lends == []
-        assert lend.home_replicas[0] in env.handles["b"].standalone_checkpoint_manager.replicas
 
-    def test_early_return_pushes_home_weights(self, push_stub):
-        env = Env()
-        push_stub.log = env.log
-        lend = self._lend(env)
-        assert env.executor.return_(lend, step=8, early=True) is True
-        # exactly one push, from the home policy's actor to the home replicas,
-        # after the home wake and before the home scm/LB re-attach
-        ops = env.ops()
-        assert ops == [
-            "lb:a:remove", "abort:guest-ba:0", "sleep:guest-ba:0", "wake:b:0",
-            "push", "scm:b:add", "lb:b:add", "guest_release",
-        ]
-        push = push_stub.instances[0]
-        assert push.actor_wg == "actor_wg:b"
-        assert [r.server_address for r in push.replicas] == ["b:0"]
-        assert push.update_calls == [8]
+@pytest.mark.parametrize("operation,stage", [("abort_all_requests", 1), ("sleep", 2), ("wake_up", 3)])
+def test_return_failure_never_advances_or_retries_unknown_work(clone_stub, operation, stage):
+    env = Env()
+    lend = borrow(env)
+    target = lend.home_replicas[0] if operation == "wake_up" else lend.guests[0]
+    target._fail[operation] = TimeoutError("injected")
+    with pytest.raises(RuntimeError, match="TimeoutError"):
+        env.executor.return_(lend, 8)
+    assert lend.return_stage == stage
+    assert lend in env.scheduler.active_lends
+    before = list(env.log)
+    with pytest.raises(RuntimeError, match="restart required"):
+        env.executor.return_(lend, 9)
+    assert env.log == before
 
-    def test_direct_handoff_skips_home_wake_and_weight_push(self, push_stub):
-        env = Env()
-        push_stub.log = env.log
-        lend = self._lend(env)
-        home = lend.home_replicas[0]
-        env.handles["b"].standalone_checkpoint_manager.remove_replicas([home])
-        env.log.clear()
 
-        assert env.executor.return_(
-            lend, step=8, reactivate_home=False,
-        ) is True
-        replacement = env.executor.borrow(
-            BorrowPlan(home_policy="b", donor="a", home_replicas=[home]),
-            step=8,
-            home_already_sleeping=True,
-        )
+def test_sync_failure_does_not_wake_home_for_rollback(clone_stub):
+    env = Env()
+    clone_stub.fail_next = True
+    with pytest.raises(RuntimeError, match="clone failed"):
+        borrow(env)
+    assert "wake:b:0" not in env.ops()
+    assert env.executor.failure is not None
 
-        assert replacement is not None
-        assert env.ops() == [
-            "lb:a:remove", "abort:guest-ba:0", "sleep:guest-ba:0",
-            "guest_release", "guests_for", "wake:guest-ba:0", "push", "lb:a:add",
-        ]
-        assert "wake:b:0" not in env.ops()
-        assert all(instance.actor_wg != "actor_wg:b" for instance in push_stub.instances)
 
-    def test_failed_direct_handoff_refreshes_home_during_rollback(self, push_stub):
-        env = Env()
-        push_stub.log = env.log
-        lend = self._lend(env)
-        home = lend.home_replicas[0]
-        env.handles["b"].standalone_checkpoint_manager.remove_replicas([home])
-        assert env.executor.return_(lend, step=8, reactivate_home=False) is True
-        env.log.clear()
-        push_stub.fail_next = True
+def test_duplicate_membership_rejected(clone_stub):
+    env = Env()
+    lend = borrow(env)
+    env.handles["a"].standalone_checkpoint_manager.replicas.extend(lend.guests)
+    with pytest.raises(RuntimeError, match="Duplicate"):
+        env.executor.validate_membership()
 
-        replacement = env.executor.borrow(
-            BorrowPlan(home_policy="b", donor="a", home_replicas=[home]),
-            step=8,
-            home_already_sleeping=True,
-        )
 
-        assert replacement is None
-        ops = env.ops()
-        push_indices = [index for index, op in enumerate(ops) if op == "push"]
-        assert len(push_indices) == 2
-        assert ops.index("wake:b:0") < push_indices[-1] \
-            < ops.index("scm:b:add") < ops.index("lb:b:add")
-        home_pushes = [
-            instance for instance in push_stub.instances
-            if instance.actor_wg == "actor_wg:b"
-        ]
-        assert len(home_pushes) == 1
-        assert home in env.handles["b"].standalone_checkpoint_manager.replicas
+def test_add_is_idempotent(clone_stub):
+    env = Env()
+    manager = env.handles["a"].standalone_checkpoint_manager
+    env.executor._add_replicas(manager, list(manager.replicas))
+    assert len(manager.replicas) == 2
 
-    def test_renew_only_pushes_latest_donor_weights(self, push_stub):
-        env = Env()
-        push_stub.log = env.log
-        lend = self._lend(env)
-        env.log.clear()
 
-        assert env.executor.renew(lend, step=8) is True
-        assert env.log == [("push", "actor_wg:a", 8)]
-        assert env.scheduler.active_lends == [lend]
-        assert env.scheduler.metrics_snapshot()["renewals"] == 1
+def test_borrow_return_order_keeps_home_and_guest_exclusive(clone_stub):
+    env = Env()
+    clone_stub.log = env.log
+    lend = borrow(env)
+    ops = env.ops()
+    assert ops.index('sleep:b:0') < ops.index('wake:guest-ba:0')
+    assert ops.index('scm:a:add') < ops.index('lb:a:add')
+    env.log.clear()
+    env.executor.return_(lend, 8)
+    ops = env.ops()
+    assert ops.index('lb:a:remove') < ops.index('abort:guest-ba:0')
+    assert ops.index('scm:a:remove') < ops.index('sleep:guest-ba:0')
+    assert ops.index('sleep:guest-ba:0') < ops.index('wake:b:0')
+    assert ops.index('scm:b:add') < ops.index('lb:b:add')
 
-    def test_renewal_batches_all_units_for_the_same_donor(self, push_stub):
-        env = Env()
-        from uni_agent.trainer.dynamic_inference.types import LendRecord
 
-        first = self._lend(env)
-        second = LendRecord(
-            lend_id=2, home_policy="b", donor="a",
-            home_replicas=[env.handles["b"].replicas[1]],
-            guests=[FakeReplica(env.log, "guest-ba", 1)], since_step=7,
-        )
-        env.scheduler.note_borrow_started(second)
+def test_boundary_uses_donor_manager_once_with_guest(clone_stub):
+    from concurrent.futures import ThreadPoolExecutor
+    from uni_agent.trainer.dynamic_inference.controller import DynamicInferenceController, BoundaryGate
+    env = Env()
+    lend = borrow(env)
+    syncs = []
+    trainer = types.SimpleNamespace(global_steps=8, timing_raw={}, policy_trainers={})
+    for policy, handle in env.handles.items():
+        trainer.policy_trainers[policy] = types.SimpleNamespace(on_step_end=
+            lambda policy=policy, handle=handle: syncs.append((policy,
+                tuple(handle.standalone_checkpoint_manager.replicas))))
+    controller = DynamicInferenceController(env.config, trainer)
+    controller.executor = env.executor
+    controller.scheduler = env.scheduler
+    controller.gate = BoundaryGate()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        trainer._policy_pool = pool
+        controller.run_boundary(trainer)
+    assert len(syncs) == 2
+    assert lend.guests[0] in dict(syncs)['a']
+    assert lend.home_replicas[0] not in dict(syncs)['b']
+    assert len(clone_stub.instances) == 1  # no additional guest-only transfer
 
-        assert env.executor.renew_many([first, second], step=8) is True
-        assert len(push_stub.instances) == 1
-        assert [r.server_address for r in push_stub.instances[0].replicas] == [
-            "guest-ba:0", "guest-ba:1",
-        ]
-        assert env.scheduler.metrics_snapshot()["renewals"] == 2
 
-    def test_failed_renewal_keeps_lend_active_for_safe_return(self, push_stub):
-        env = Env()
-        lend = self._lend(env)
-        push_stub.fail_next = True
+def test_last_seed_cannot_be_lent(clone_stub):
+    env = Env()
+    unit = list(env.handles['b'].replicas)
+    with pytest.raises(RuntimeError, match='last published seed'):
+        env.executor.borrow(BorrowPlan('b', 'a', unit), 7)
+    assert not env.log
 
-        assert env.executor.renew(lend, step=8) is False
-        assert env.scheduler.active_lends == [lend]
-        assert env.scheduler.pair_block_until[("b", "a")] > 8
 
-    def test_one_failed_batch_counts_once_for_multiple_lends_on_same_pair(self, push_stub):
-        env = Env()
-        first = self._lend(env)
-        from uni_agent.trainer.dynamic_inference.types import LendRecord
+def test_stale_source_is_rejected(clone_stub):
+    env = Env()
+    for r in env.handles['a'].replicas:
+        r._dynamic_weight_version = (0, 0)
+    with pytest.raises(RuntimeError, match='No verified published'):
+        borrow(env)
+    assert not clone_stub.instances
+    assert 'lb:a:add' not in env.ops()
 
-        second = LendRecord(
-            lend_id=2, home_policy="b", donor="a",
-            home_replicas=[env.handles["b"].replicas[1]],
-            guests=[FakeReplica(env.log, "guest-ba", 1)], since_step=7,
-        )
-        env.scheduler.note_borrow_started(second)
-        push_stub.fail_next = True
 
-        assert env.executor.renew_many([first, second], step=8) is False
-        assert env.executor._pair_failures[("b", "a")] == 1
-        assert env.scheduler.disabled is False
-
-    def test_successful_return_clears_previous_pair_failure(self, push_stub):
-        env = Env()
-        lend = self._lend(env)
-        env.executor._pair_failures[("b", "a")] = 1
-
-        assert env.executor.return_(lend, step=8) is True
-        assert ("b", "a") not in env.executor._pair_failures
-
-    def test_lb_add_failure_retries_without_duplicate_scm_entry(self, push_stub):
-        env = Env()
-        lend = self._lend(env)
-        calls = 0
-
-        class FlakyAdd:
-            def remote(self, servers):
-                nonlocal calls
-                calls += 1
-                if calls == 1:
-                    raise RuntimeError("LB add failed")
-                return Ref(dict(servers))
-
-        env.handles["b"].lb_handle.add_servers = FlakyAdd()
-        assert env.executor.return_(lend, step=8) is False
-        assert lend.return_stage == 6
-        scm = env.handles["b"].standalone_checkpoint_manager
-        assert sum(r is lend.home_replicas[0] for r in scm.replicas) == 2
-
-        assert env.executor.return_(lend, step=9) is True
-        assert sum(r is lend.home_replicas[0] for r in scm.replicas) == 2
-
-    def test_partial_failure_resumes_from_recorded_stage(self, push_stub):
-        env = Env()
-        lend = self._lend(env)
-        lend.guests[0]._fail["sleep"] = RuntimeError("guest sleep hung")
-
-        assert env.executor.return_(lend, step=8) is False
-        assert lend.return_stage == 2  # LB removed + aborted, sleep pending
-        assert env.scheduler.active_lends == [lend]  # still active
-
-        # the guest recovers; the retry must NOT redo stages 1-2
-        del lend.guests[0]._fail["sleep"]
-        env.log.clear()
-        assert env.executor.return_(lend, step=9) is True
-        assert env.ops() == [
-            "sleep:guest-ba:0",
-            "wake:b:0",
-            "scm:b:add",
-            "lb:b:add",
-            "guest_release",
-        ]
+def test_incoming_guest_does_not_replace_home_seed(clone_stub):
+    env = Env()
+    env.handles['b'].standalone_checkpoint_manager.replicas.append(
+        FakeReplica(env.log, 'incoming', 9))
+    with pytest.raises(RuntimeError, match='last published seed'):
+        env.executor.borrow(BorrowPlan('b', 'a', list(env.handles['b'].replicas)), 7)
+    assert not env.log

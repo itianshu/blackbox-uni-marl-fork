@@ -944,6 +944,7 @@ class TestMultiAgentsPPOTrainer:
         source_path = Path(__file__).parents[3] / "uni_agent" / "trainer" / "multi_agents_ppo_trainer.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         allowed_inline_modules = {
+            "uni_agent.trainer.dynamic_inference.controller",
             "uni_agent.trainer.single_async_ppo_trainer",
             "uni_agent.trainer.single_ppo_trainer",
         }
@@ -2822,6 +2823,9 @@ class TestMultiAgentsPPOTrainer:
         monkeypatch.setattr(
             trainer_module.tq, "kv_clear", lambda **kwargs: calls["clear"].append(kwargs)
         )
+        # Exercise the deterministic local fallback regardless of whether a
+        # previous test imported verl's real metric formatter.
+        monkeypatch.setattr(trainer_module, "process_validation_metrics", lambda *_: {})
 
         metrics = trainer._validate()
 
@@ -3153,7 +3157,7 @@ class TestMultiAgentsPPOTrainer:
         assert "policy_2/values/count" not in metrics
         assert "policy_2/update_critic/count" not in metrics
         assert metrics["policy_2/update_actor/count"] == 1
-        assert gate.boundary_calls == 1
+        assert gate.boundary_calls == 0
 
         policy_1 = trainer.policy_trainers["policy_1"]
         policy_2 = trainer.policy_trainers["policy_2"]

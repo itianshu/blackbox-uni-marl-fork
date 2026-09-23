@@ -4,14 +4,14 @@ Owns the four runtime pieces and enforces the serialization invariant (I2)
 between everything physical:
 
 - ``BoundaryGate`` — mutual exclusion between metrics-driven rebalancing,
-  early returns, actor compute, and step-boundary weight updates;
+  early returns and step-boundary weight updates (not actor compute);
 - ``PollLoop`` — daemon thread sampling serving signals and immediately
   applying a confirmed useful allocation after a complete fresh KV scrape;
-- the step boundary (see ``run_boundary``): retry incomplete returns, execute
-  policy hooks, then refresh retained guests with the newest donor weights.
+- the step boundary (see ``run_boundary``): finish requested returns, validate
+  ownership and execute one combined weight update per policy.
 
-Everything runs in the trainer process because the executor needs the
-non-serializable ``actor_wg`` handles. The gate keeps poll-thread decisions
+Topology ownership stays in the trainer process alongside the persistent
+checkpoint managers. Borrow/return transfers only read published vLLM weights. The gate keeps poll-thread decisions
 serialized with boundaries owned by the outer trainer.
 """
 
@@ -42,38 +42,49 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 # rolling-statistics window for the KV signal, in scrape periods
-_SIGNAL_WINDOW_SCRAPES = 20
+_SIGNAL_WINDOW_SAMPLES = 20
 
 
 class BoundaryGate:
-    """Boundary vs early-return mutual exclusion (invariant I2)."""
+    """Topology transactions vs step-end publication; never actor training."""
 
     def __init__(self):
         self._lock = threading.RLock()
         self._pending_lock = threading.Lock()
         self._in_boundary = False
         self._generation = 0
+        self.failure: BaseException | None = None
         self._pending_early_returns: list[Any] = []
 
     @contextmanager
     def boundary(self):
         with self._lock:
+            self.raise_if_failed()
+            was_in_boundary = self._in_boundary
             self._in_boundary = True
             try:
                 yield
+            except BaseException as exc:
+                self.failure = exc
+                raise
             finally:
-                self._in_boundary = False
+                self._in_boundary = was_in_boundary
                 self._generation += 1
 
+    def raise_if_failed(self):
+        if self.failure is not None:
+            raise RuntimeError("Dynamic topology gate failed; refusing further work") from self.failure
+
     def snapshot_generation(self) -> int:
-        with self._lock:
-            return self._generation
+        # Reading an integer does not need to block metric sampling on publish.
+        return self._generation
 
     def run_exclusive(self, fn, *, expected_generation: int | None = None) -> bool:
         """Run ``fn`` unless a boundary is active; defer then, return False."""
         if not self._lock.acquire(blocking=False):
             return False
         try:
+            self.raise_if_failed()
             if self._in_boundary:
                 return False
             if (expected_generation is not None
@@ -81,6 +92,9 @@ class BoundaryGate:
                 return False
             fn()
             return True
+        except BaseException as exc:
+            self.failure = exc
+            raise
         finally:
             self._lock.release()
 
@@ -127,6 +141,8 @@ class PollLoop(threading.Thread):
                 )
             except Exception:
                 logger.warning("dynamic_inference: poll iteration failed", exc_info=True)
+                if self._gate.failure is not None:
+                    self.stop()
 
     def _commit(self, samples):
         self._store.record_all(samples)
@@ -233,7 +249,7 @@ class DynamicInferenceController:
         # 4. signals + decision wiring
         self.store = SignalStore(
             policies=list(handles),
-            window_s=_SIGNAL_WINDOW_SCRAPES * max(self.config.metrics_scrape_interval_s, 0.2),
+            window_s=_SIGNAL_WINDOW_SAMPLES * self.config.metrics_scrape_interval_s,
             max_num_seqs={n: h.max_num_seqs for n, h in handles.items()},
         )
         self.scheduler.signals = self.store
@@ -253,11 +269,11 @@ class DynamicInferenceController:
         source = ServingSignalSource(
             handles,
             scraper=VLLMMetricsScraper(self.config.resource_usage.kv_metric_names),
-            scrape_interval_s=self.config.metrics_scrape_interval_s,
+            scrape_interval_s=0.0,
         )
         self.poll_loop = PollLoop(
             source, self.store, self.scheduler, self.gate,
-            self.config.poll_interval_s,
+            self.config.metrics_scrape_interval_s,
             on_metrics_ready=self._rebalance_now,
         )
         self.poll_loop.start()
@@ -311,6 +327,7 @@ class DynamicInferenceController:
             if inconsistent:
                 raise ValueError(
                     f"policy '{name}' has inconsistent standalone replica topologies")
+            checkpoint_manager._dynamic_sync_timeout_s = self.config.weight_sync_timeout_s
             handles[name] = PolicyInferenceHandles(
                 actor_rollout_wg=actor_wg,
                 standalone_checkpoint_manager=checkpoint_manager,
@@ -326,15 +343,17 @@ class DynamicInferenceController:
 
     # ================================================================ boundary
     def run_boundary(self, trainer) -> None:
-        """Retry returns, update policies, then refresh retained guests."""
+        """Require stable ownership, then synchronize each policy exactly once."""
         stats = self._build_stats(trainer)
         self._last_step = stats.step
         with self.gate.boundary():
             plan = self._boundary_maintenance_plan()
             deferred_early_ids = self._fold_deferred_early_returns(plan)
+            self.executor.assert_stable()
             self._run_returns(plan.returns, stats.step, deferred_early_ids)
+            self.executor.validate_membership()
             self._run_policy_hooks(trainer)
-            self._run_renewals(plan.renewals, stats.step)
+            self.executor.validate_membership()
 
         self.last_metrics = self.metrics_snapshot()
 
@@ -343,6 +362,12 @@ class DynamicInferenceController:
         step = int(self.trainer.global_steps)
         self._last_step = step
         plan = self.scheduler.decide(StepStats(step=step))
+        if (plan.borrows or plan.returns) and getattr(self.scheduler, "trace", None) is not None:
+            self.scheduler.trace.emit(self.scheduler, "decision", step,
+                borrows=[{"lender": p.home_policy, "borrower": p.donor,
+                          "home_servers": [getattr(r, "server_address", None) for r in p.home_replicas]}
+                         for p in plan.borrows],
+                returns=[p.lend_id for p in plan.returns])
 
         borrows_by_unit = {
             self._allocation_unit_key(plan.home_policy, plan.home_replicas): plan
@@ -402,10 +427,7 @@ class DynamicInferenceController:
         active = list(self.scheduler.active_lends)
         if getattr(self.scheduler, "disabled", False):
             return BoundaryPlan(returns=active)
-        return BoundaryPlan(
-            returns=[lend for lend in active if lend.return_stage > 0],
-            renewals=[lend for lend in active if lend.return_stage == 0],
-        )
+        return BoundaryPlan(returns=[lend for lend in active if lend.return_stage > 0])
 
     def _fold_deferred_early_returns(self, plan) -> set[int]:
         """Move still-active deferred returns out of renewals and into returns."""
@@ -421,45 +443,35 @@ class DynamicInferenceController:
         return {id(lend) for lend in pending}
 
     def _run_returns(self, lends, step: int, early_ids: set[int]) -> bool:
-        """Return every requested lend; failures only block new borrows."""
+        """Return every requested lend; any failure prevents boundary progression."""
         succeeded = True
         for lend in lends:
             if not self.executor.return_(lend, step, early=id(lend) in early_ids):
-                succeeded = False
+                raise RuntimeError("Return executor reported failure")
         return succeeded
 
     @staticmethod
     def _run_policy_hooks(trainer) -> None:
         """Update every policy and wait for all hooks before surfacing errors."""
-        futures = [
-            trainer._policy_pool.submit(
-                trainer._run_trainer_hook, name, "on_step_end")
-            for name in trainer.policy_trainers
-        ]
+        futures = []
+        policy_timings = {}
+        for name, policy_trainer in trainer.policy_trainers.items():
+            policy_timing = {}
+            policy_trainer.timing_raw = policy_timing
+            policy_timings[name] = policy_timing
+            futures.append((name, trainer._policy_pool.submit(policy_trainer.on_step_end)))
         errors = []
-        for future in futures:
+        for name, future in futures:
             try:
                 future.result()
             except Exception as exc:
                 # A still-running update could race with cleanup or an early return.
                 errors.append(exc)
+            finally:
+                for key, value in policy_timings[name].items():
+                    trainer.timing_raw[f"{name}/{key}"] = value
         if errors:
             raise errors[0]
-
-    def _run_renewals(self, lends, step: int) -> bool:
-        """Refresh retained guests in donor batches and return failed batches."""
-        by_donor = {}
-        for lend in lends:
-            by_donor.setdefault(lend.donor, []).append(lend)
-
-        succeeded = True
-        for batch in by_donor.values():
-            if self.executor.renew_many(batch, step):
-                continue
-            succeeded = False
-            for lend in batch:
-                self.executor.return_(lend, step, early=True)
-        return succeeded
 
     def _build_stats(self, trainer) -> StepStats:
         return StepStats(step=trainer.global_steps)

@@ -1,9 +1,7 @@
-# Sequential long generations shift KV pressure between the three policies.
 agents:
   agent_1:
-    system_prompt: Produce a detailed plan. Keep writing until the token budget is
-      exhausted.
-    max_tokens: 4096
+    system_prompt: Produce a detailed plan. Keep writing until the token budget is exhausted.
+    max_tokens: 10240
     ignore_eos: true
   agent_2:
     system_prompt: Summarize the execution of the plan concisely within the token budget.

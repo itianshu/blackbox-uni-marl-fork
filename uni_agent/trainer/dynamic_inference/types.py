@@ -41,15 +41,21 @@ class BorrowPairSpec:
     donor: str
     home_replicas_per_unit: int = 1
     guest_replicas_per_unit: int = 1
+    max_units: int | None = None          # optional per-directed-edge allocation cap
 
 
 @dataclass
 class ResourceUsageConfig:
-    """KV-cache-utilisation thresholds for scheduling decisions."""
+    """KV and queue thresholds for scheduling decisions."""
 
+    queue_signal_enabled: bool = True
     kv_enter: float = 0.85                # KV utilisation above which a policy may be judged bottleneck
     kv_exit: float = 0.6                  # bottleneck state exits at or below this
     kv_post_lend_max: float = 0.7         # predicted post-lend lender cap; below kv_enter for hysteresis
+    waiting_enter_per_replica: float = 8.0
+    waiting_exit_per_replica: float = 1.0
+    queue_time_enter_s: float = 2.0
+    queue_time_exit_s: float = 0.5
     kv_metric_names: list[str] = field(default_factory=lambda: [
         "kv_cache_usage_perc", "gpu_cache_usage_perc", "kv_cache_usage_ratio",
     ])                                    # candidate /metrics gauge names (vLLM version dependent)
@@ -68,6 +74,11 @@ class BorrowingConfig:
     # guests whose rendezvous masters are on different nodes may reuse a slot.
     guest_master_port_range: list[int] | None = None
     guest_master_port_stride: int = 4
+    # vLLM discovers an internal TCPStore port with a check-then-bind sequence.
+    # Concurrent engine starts can race after both observe the same free port.
+    guest_init_max_attempts: int = 3
+    guest_init_retry_backoff_s: float = 2.0
+    guest_init_retry_jitter_s: float = 1.0
 
 
 @dataclass
@@ -75,7 +86,7 @@ class SchedulingConfig:
     """Top-level dynamic-inference-scheduling configuration."""
 
     enable: bool = False
-    # --- bottleneck detection (KV cache utilisation) ---
+    # --- bottleneck detection (KV cache utilisation or sustained queueing) ---
     bottleneck_confirm_polls: int = 10
     # --- rebalance anti-jitter ---
     rebalance_confirm_polls: int = 2
@@ -86,11 +97,17 @@ class SchedulingConfig:
     # --- early return (home exhausted while lent out) ---
     early_return_confirm_polls: int = 10
     # --- polling / execution ---
-    poll_interval_s: float = 0.2
-    metrics_scrape_interval_s: float = 1.0  # vLLM /metrics scrape period
-    borrow_drain_timeout_s: float = 10.0
-    weight_sync_timeout_s: float = 300.0    # full actor -> rollout/guest weight transfer
+    # ``metrics_scrape_interval_s`` is the single cadence for the aligned LB
+    # and vLLM sample. ``poll_interval_s`` remains as a compatibility alias and
+    # is normalized to the same value by ``parse_scheduling_config``.
+    poll_interval_s: float = 1.0
+    metrics_scrape_interval_s: float = 1.0
+    borrow_drain_timeout_s: float = 60.0
+    weight_sync_timeout_s: float = 300.0    # full publication or vLLM replica clone deadline
+    clone_bucket_megabytes: int = 64      # bounded vLLM clone staging buffer per worker
     sleep_patch_mode: str = "patched"      # patched | collective_rpc (DP=1 fallback)
+    trace_path: str | None = None          # append-only JSONL; disabled by default
+    trace_interval_s: float = 5.0
     # --- sub-blocks ---
     resource_usage: ResourceUsageConfig = field(default_factory=ResourceUsageConfig)
     borrowing: BorrowingConfig = field(default_factory=BorrowingConfig)
@@ -110,7 +127,7 @@ class PolicyInferenceHandles:
     """
 
     actor_rollout_wg: Any                         # trainer.actor_rollout_wg (weight-push sender)
-    standalone_checkpoint_manager: Any            # CheckpointEngineManager (home replicas only)
+    standalone_checkpoint_manager: Any            # current owned homes + borrowed guests
     lb_handle: Any                                # global_load_balancer Ray actor handle
     rollout_config: Any                           # actor_rollout_ref.rollout (dataclass or DictConfig)
     model_config: Any
@@ -152,8 +169,8 @@ class LendRecord:
     since_step: int
     # early-return bookkeeping
     home_kv_hot_polls: int = 0
-    # resumable return: physical steps already completed (executor retries from
-    # here when a return failed mid-sequence)
+    # Last completed return stage, retained for failure diagnosis. A failed
+    # executor is terminal; this does not authorize retry after remote timeout.
     return_stage: int = 0
 
 
@@ -162,6 +179,8 @@ class BoundaryPlan:
     """Incremental allocation changes for one scheduling decision."""
 
     returns: list[LendRecord] = field(default_factory=list)
+    # Legacy name for retained allocations in the scheduler's plan; these do
+    # not execute a separate weight transfer or renewal operation.
     renewals: list[LendRecord] = field(default_factory=list)
     borrows: list[BorrowPlan] = field(default_factory=list)
 
@@ -290,6 +309,8 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
     if config.sleep_patch_mode not in ("patched", "collective_rpc"):
         raise ValueError(f"unknown sleep_patch_mode '{config.sleep_patch_mode}'")
     ru = config.resource_usage
+    if not isinstance(ru.queue_signal_enabled, bool):
+        raise ValueError("resource_usage.queue_signal_enabled must be a boolean")
     if (
         not _is_finite_number(ru.kv_exit)
         or not _is_finite_number(ru.kv_enter)
@@ -306,6 +327,19 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
             "resource_usage thresholds must satisfy "
             "kv_exit < kv_post_lend_max < kv_enter"
         )
+    for low_name, high_name in (
+        ("waiting_exit_per_replica", "waiting_enter_per_replica"),
+        ("queue_time_exit_s", "queue_time_enter_s"),
+    ):
+        low, high = getattr(ru, low_name), getattr(ru, high_name)
+        if (
+            not _is_finite_number(low)
+            or not _is_finite_number(high)
+            or not 0 <= low < high
+        ):
+            raise ValueError(
+                f"resource_usage must satisfy 0 <= {low_name} < {high_name}"
+            )
     if not _is_finite_number(ru.ema_alpha) or not 0.0 < ru.ema_alpha <= 1.0:
         raise ValueError("resource_usage.ema_alpha must be in (0, 1]")
     if (
@@ -316,6 +350,7 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
     ):
         raise ValueError("resource_usage.kv_metric_names must be a non-empty list of names")
     for key in (
+        "clone_bucket_megabytes",
         "bottleneck_confirm_polls",
         "rebalance_confirm_polls",
         "rebalance_settle_polls",
@@ -331,6 +366,7 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
         "metrics_scrape_interval_s",
         "borrow_drain_timeout_s",
         "weight_sync_timeout_s",
+        "trace_interval_s",
     ):
         value = getattr(config, key)
         if not _is_finite_number(value) or value <= 0:
@@ -349,6 +385,15 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
     guest_port_stride = config.borrowing.guest_master_port_stride
     if not _is_int(guest_port_stride) or guest_port_stride < 1:
         raise ValueError("borrowing.guest_master_port_stride must be a positive integer")
+    if (
+        not _is_int(config.borrowing.guest_init_max_attempts)
+        or config.borrowing.guest_init_max_attempts < 1
+    ):
+        raise ValueError("borrowing.guest_init_max_attempts must be a positive integer")
+    for key in ("guest_init_retry_backoff_s", "guest_init_retry_jitter_s"):
+        value = getattr(config.borrowing, key)
+        if not _is_finite_number(value) or value < 0:
+            raise ValueError(f"borrowing.{key} must be non-negative")
     if guest_port_range is not None:
         if (
             not isinstance(guest_port_range, (list, tuple))
@@ -371,8 +416,14 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
             )
         # Normalize tuples and OmegaConf list-like values for downstream code.
         config.borrowing.guest_master_port_range = [start, end]
+    # One poll now produces one aligned LB + vLLM sample. Preserve the old key
+    # in parsed configs, but prevent two independent clocks from producing
+    # differently weighted windows.
+    config.poll_interval_s = config.metrics_scrape_interval_s
     seen = set()
     for pair in config.borrowing.pairs:
+        if pair.max_units is not None and (not _is_int(pair.max_units) or pair.max_units < 1):
+            raise ValueError("borrowing.pairs[].max_units must be a positive integer or null")
         if pair.home == pair.donor:
             raise ValueError(f"borrow pair {pair.home}->{pair.donor} is a self-pair")
         key = (pair.home, pair.donor)

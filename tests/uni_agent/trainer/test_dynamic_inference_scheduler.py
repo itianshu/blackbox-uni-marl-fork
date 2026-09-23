@@ -148,12 +148,41 @@ def _prepared_scheduler(*, kv_a, kv_b, b_replicas=2, a_replicas=2):
     return sched
 
 
+def test_one_quantity_plan_selects_only_the_requested_borrowers_best_unit():
+    sched = _scheduler(policies=('a', 'b', 'c'), borrowing={'pairs': [
+        {'home': 'b', 'donor': 'a', 'max_units': 1},
+        {'home': 'b', 'donor': 'c', 'max_units': 1},
+    ]})
+    sched.handles['b'].replicas = [FakeReplica('b', i) for i in range(4)]
+    sched.ema_kv.update(a=.9, b=.01, c=.95)
+    plans = sched.quantity.plan(sched, 'c', step=1)
+    assert [plan.donor for plan in plans] == ['c']
+    assert sum(len(plan.home_replicas) for plan in plans) == 1
+
+
+def test_diluted_incumbent_does_not_block_another_borrower_or_move_physical_units():
+    sched = _scheduler(policies=('a', 'b', 'c'), borrowing={'pairs': [
+        {'home': 'b', 'donor': 'a', 'max_units': 1},
+        {'home': 'b', 'donor': 'c', 'max_units': 1},
+    ]}, resource_usage={'kv_enter': .01, 'kv_exit': .003, 'kv_post_lend_max': .007})
+    sched.handles['b'].replicas = [FakeReplica('b', i) for i in range(4)]
+    incumbent_replica = sched.handles['b'].replicas[-1]
+    lend = LendRecord(lend_id=1, home_policy='b', donor='a',
+        home_replicas=[incumbent_replica], guests=[FakeReplica('a', 10000)], since_step=1)
+    sched.note_borrow_started(lend)
+    sched.ema_kv.update(a=.007, b=.002, c=.03)
+    plans = sched._guard_normal_returns(sched.quantity.plan(sched, 'c', step=2))
+    assert sorted(plan.donor for plan in plans) == ['a', 'c']
+    assert next(plan for plan in plans if plan.donor == 'a').home_replicas == [incumbent_replica]
+    assert incumbent_replica not in next(plan for plan in plans if plan.donor == 'c').home_replicas
+
+
 # ------------------------------------------------------------ SignalStore
 class TestSignalStore:
-    def test_kv_util_takes_hottest_replica(self):
+    def test_kv_util_uses_policy_replica_mean(self):
         store = SignalStore(["a"], max_num_seqs={"a": 32})
         _feed(store, "a", {"s0": 4, "s1": 4}, kv={"s0": 0.4, "s1": 0.9})
-        assert store.kv_util("a") == pytest.approx(0.9)
+        assert store.kv_util("a") == pytest.approx(0.65)
 
     def test_kv_util_p90_window(self):
         store = SignalStore(["a"], max_num_seqs={"a": 32})
@@ -249,6 +278,56 @@ class TestBottleneckDetection:
         sched.decide(_stats(step=13))
         assert sched.bottleneck == "b"
 
+    def test_long_deep_queue_can_trigger_when_kv_is_low(self):
+        sched = _scheduler()
+        sched.ema_kv.update({"a": 0.2, "b": 0.1})
+        sched.waiting_per_replica["a"] = sched.ru.waiting_enter_per_replica + 1
+        sched.queue_time_s["a"] = sched.ru.queue_time_enter_s + 1
+
+        sched.decide(_stats(step=10))
+        sched.decide(_stats(step=11))
+
+        assert sched.bottleneck == "a"
+
+    def test_queue_trigger_requires_both_depth_and_duration(self):
+        sched = _scheduler()
+        sched.ema_kv.update({"a": 0.2, "b": 0.1})
+        sched.waiting_per_replica["a"] = sched.ru.waiting_enter_per_replica + 1
+        sched.queue_time_s["a"] = sched.ru.queue_time_enter_s - 0.1
+        assert sched._pick_candidate() is None
+
+        sched.waiting_per_replica["a"] = sched.ru.waiting_enter_per_replica - 0.1
+        sched.queue_time_s["a"] = sched.ru.queue_time_enter_s + 1
+        assert sched._pick_candidate() is None
+
+    def test_queue_signal_can_be_disabled_for_kv_only_experiments(self):
+        sched = _scheduler(resource_usage={
+            "queue_signal_enabled": False,
+            "kv_enter": 0.85,
+            "kv_exit": 0.6,
+            "kv_post_lend_max": 0.7,
+        })
+        sched.ema_kv.update({"a": 0.2, "b": 0.1})
+        sched.waiting_per_replica["a"] = 1000
+        sched.queue_time_s["a"] = 1000
+
+        assert sched._pick_candidate() is None
+        assert sched._is_relieved("a") is True
+
+    def test_composite_exit_requires_kv_and_queue_to_recover(self):
+        sched = _scheduler()
+        sched.bottleneck = "a"
+        sched.ema_kv["a"] = sched.ru.kv_exit
+        sched.waiting_per_replica["a"] = sched.ru.waiting_exit_per_replica + 1
+        sched.queue_time_s["a"] = sched.ru.queue_time_exit_s + 1
+        sched.decide(_stats(step=10))
+        assert sched.bottleneck == "a"
+
+        sched.waiting_per_replica["a"] = 0
+        sched.queue_time_s["a"] = 0
+        sched.decide(_stats(step=11))
+        assert sched.bottleneck is None
+
 
 # ------------------------------------------------------------- borrow planning
 class TestBorrowPlanning:
@@ -331,20 +410,17 @@ class TestBorrowPlanning:
         assert len(plan.borrows) == 1
 
 
-class TestDiscreteEqualisation:
-    """Detailed tests for ranked allocation with lender safety guards."""
+class TestSingleUnitPlanning:
+    """Detailed tests for single-unit selection and lender safety guards."""
 
-    def test_all_safe_units_are_selected_even_if_peak_would_worsen(self):
-        # The fourth unit would worsen the predicted global peak, but global
-        # improvement is no longer an admission condition.
+    def test_only_one_safe_unit_is_selected_per_event(self):
         sched = _prepared_scheduler(kv_a=0.95, kv_b=0.1, b_replicas=5)
         plan = _decides(sched, [10, 11, 12])
-        assert len(plan.borrows) == 4
+        assert len(plan.borrows) == 1
         ids = [id(r) for bp in plan.borrows for r in bp.home_replicas]
-        assert len(set(ids)) == 4
+        assert len(set(ids)) == 1
 
-        # Even a small predicted improvement is sufficient; there is no gain
-        # dead zone in the admission decision.
+        # A small overloaded policy can still receive one safe unit.
         small_gain = _prepared_scheduler(
             kv_a=0.86, kv_b=0.1, a_replicas=100, b_replicas=2)
         small_gain_plan = _decides(small_gain, [10, 11, 12])
@@ -388,13 +464,10 @@ class TestDiscreteEqualisation:
         _saturate_kv(sched)
         plan = _decides(sched, [10, 11, 12])
 
-        # donor a: 2 reps x 16 cards = 32, kv .99; unit = 2 x 8 = 16 cards.
-        # u1: donor_after .66 > lender_after .075 -> borrow
-        # u2 (a at 48 cards): donor_after .495 > lender_after .15 -> borrow
-        assert len(plan.borrows) == 2
+        assert len(plan.borrows) == 1
         assert all(len(borrow.home_replicas) == 2 for borrow in plan.borrows)
         borrowed = {id(r) for borrow in plan.borrows for r in borrow.home_replicas}
-        assert len(borrowed) == 4
+        assert len(borrowed) == 2
         assert id(handles["b"].replicas[4]) not in borrowed
 
 
@@ -421,6 +494,7 @@ class TestReturns:
         assert sched.bottleneck == "a"
         lend = self._active_lend(sched)
         _saturate_kv(sched, n=sched.config.rebalance_settle_polls)
+        sched.decide(_stats(step=12))
         plan = sched.decide(_stats(step=12))
         assert plan.returns == []
         assert plan.renewals == [lend]
@@ -632,7 +706,7 @@ class TestBorrowBatchAndCooldown:
         plan = sched.decide(_stats(step=10))
 
         assert [(item.home_policy, item.donor) for item in plan.borrows] == [
-            ("b", "a"), ("b", "a"),
+            ("b", "a"),
         ]
 
     def test_successful_borrow_blocks_only_new_borrows_for_ten_seconds(

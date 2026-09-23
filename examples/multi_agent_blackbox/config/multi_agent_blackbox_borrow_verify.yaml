@@ -1,62 +1,145 @@
 # @package _global_
-
+# Three independent policies; 4/4/4 train GPUs and 2/6/2 TP2 standalone replicas.
+# All directions are legal; capacity asymmetry makes policy_2 the likely lender.
 defaults:
-  - multi_agent_blackbox
-  - _self_
-
-# verl defaults this to true, which disables vLLM Prometheus statistics.
-# Dynamic scheduling consumes /metrics, so every standalone rollout replica
-# used by this recipe must keep runtime statistics enabled.
+- multi_agent_blackbox
+- _self_
+data:
+  seed: 42
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        UNI_AGENT_MASTER_PORT_RANGE: '21000:22000'
 policies:
   policy_1:
     ppo_trainer_overrides:
+      trainer:
+        n_gpus_per_node: 4
+        default_local_dir: ${trainer.default_local_dir}/policy_1
       actor_rollout_ref:
+        actor:
+          fsdp_config:
+            fsdp_size: 4
         rollout:
+          n_gpus_per_node: 4
+          tensor_model_parallel_size: 2
+          prompt_length: 9216
+          response_length: 4096
+          max_model_len: 13824
           disable_log_stats: false
           checkpoint_engine:
+            backend: nccl
             engine_kwargs:
               nccl:
+                group_name: checkpoint_policy_1
                 rebuild_group: true
   policy_2:
     ppo_trainer_overrides:
+      trainer:
+        n_gpus_per_node: 4
+        default_local_dir: ${trainer.default_local_dir}/policy_2
       actor_rollout_ref:
+        actor:
+          fsdp_config:
+            fsdp_size: 4
         rollout:
+          n_gpus_per_node: 12
+          tensor_model_parallel_size: 2
+          prompt_length: 9216
+          response_length: 4096
+          max_model_len: 13824
           disable_log_stats: false
           checkpoint_engine:
+            backend: nccl
             engine_kwargs:
               nccl:
+                group_name: checkpoint_policy_2
                 rebuild_group: true
-
-# This recipe is intentionally sensitive: any positive sustained KV usage on
-# policy_1 is enough to trigger a borrow while the unused policy_2 remains a
-# safe lender. EMA alpha 1 makes the later zero/non-zero transitions immediate.
+  policy_3:
+    ppo_trainer_overrides:
+      trainer:
+        n_gpus_per_node: 4
+        default_local_dir: ${trainer.default_local_dir}/policy_3
+      actor_rollout_ref:
+        model:
+          path: ${policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.model.path}
+        actor:
+          fsdp_config:
+            fsdp_size: 4
+        rollout:
+          n_gpus_per_node: 4
+          tensor_model_parallel_size: 2
+          prompt_length: ${policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.prompt_length}
+          response_length: ${policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.response_length}
+          max_model_len: ${policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.max_model_len}
+          disable_log_stats: false
+          checkpoint_engine:
+            backend: nccl
+            engine_kwargs:
+              nccl:
+                group_name: checkpoint_policy_3
+                rebuild_group: true
 dynamic_inference_scheduling:
   enable: true
-  mode: resource
   resource_usage:
-    kv_enter: 0.0001
-    kv_exit: 0.0
-    kv_post_lend_max: 0.00005
-    ema_alpha: 1.0
-  bottleneck_confirm_polls: 1
-  rebalance_confirm_polls: 1
-  rebalance_settle_polls: 1
-  min_lend_polls: 1
-  borrow_cooldown_s: 0.0
-  # Keep the lend alive until policy_2 itself becomes busy; that exercises the
-  # safety early-return path instead of an immediate low-load normal return.
-  return_confirm_polls: 100
-  early_return_confirm_polls: 1
-  poll_interval_s: 0.1
-  metrics_scrape_interval_s: 0.1
+    # KV-only calibration run: queue depth/time remain observable but cannot
+    # enter, rank, retain or return a bottleneck.
+    queue_signal_enabled: false
+    # Calibrated against observed peaks: p1~1.9%, p2~0.4%, p3~4.5%.
+    kv_enter: 0.01
+    kv_exit: 0.003
+    kv_post_lend_max: 0.007
+    waiting_enter_per_replica: 8
+    waiting_exit_per_replica: 1
+    queue_time_enter_s: 2.0
+    queue_time_exit_s: 0.5
+    ema_alpha: 0.3
+  bottleneck_confirm_polls: 10
+  rebalance_confirm_polls: 5
+  rebalance_settle_polls: 10
+  min_lend_polls: 60
+  borrow_cooldown_s: 30.0
+  return_confirm_polls: 20
+  early_return_confirm_polls: 10
+  poll_interval_s: 0.5
+  metrics_scrape_interval_s: 0.5
+  trace_path: ${trainer.default_local_dir}/dynamic_inference.jsonl
+  trace_interval_s: 5.0
   weight_sync_timeout_s: 300.0
   borrowing:
-    # Deterministic node-local rendezvous ranges keep concurrently pre-created
-    # guest worker groups from selecting overlapping master ports.
-    guest_master_port_range: [32000, 32768]
+    # Verified on all four nodes; outside Ray workers and ephemeral ports.
+    guest_master_port_range:
+    - 20010
+    - 20522
     guest_master_port_stride: 4
+    # vLLM selects its internal TCPStore port with a check-then-bind sequence.
+    # Keep guest creation concurrent and rebuild only a replica that loses the
+    # race, with exponential backoff plus jitter between attempts.
+    guest_init_max_attempts: 4
+    guest_init_retry_backoff_s: 2.0
+    guest_init_retry_jitter_s: 2.0
+    # Complete directed graph. No max_units cap: the scheduler can add further
+    # units over later confirmed events, while each event still adds only one.
     pairs:
-      - home: policy_2
-        donor: policy_1
-        home_replicas_per_unit: 1
-        guest_replicas_per_unit: 1
+    - {home: policy_1, donor: policy_2}
+    - {home: policy_1, donor: policy_3}
+    - {home: policy_2, donor: policy_1}
+    - {home: policy_2, donor: policy_3}
+    - {home: policy_3, donor: policy_1}
+    - {home: policy_3, donor: policy_2}
+actor_rollout_ref:
+  rollout:
+    seed: 42
+    custom:
+      agent_framework:
+        max_concurrent_rollouts: 128
+        role_policy_mapping:
+          agent_1: policy_1
+          agent_2: policy_2
+          agent_3: policy_3
+        completion_timeout_seconds: 3600
+        multi_agent_runner_kwargs:
+          request_timeout_seconds: 1800
+trainer:
+  test_freq: -1

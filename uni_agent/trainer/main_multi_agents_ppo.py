@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import importlib
 import os
+import sys
 from pprint import pprint
 
 import hydra
@@ -113,13 +114,30 @@ class MultiAgentsTaskRunner:
             self.init_agent_loop_manager()
             self.trainer.fit(self.agent_loop_manager)
         finally:
+            # ``sys.exception`` is Python 3.11+, while this project supports
+            # Python 3.10.  Capture the active exception without replacing it
+            # if either cleanup path also fails.
+            primary_error = sys.exc_info()[1]
+            cleanup_error = None
             try:
                 # Release placement groups and gateway actors so a shared Ray
                 # cluster can be reused immediately by the next job.
                 if self.trainer is not None:
                     self.trainer.cleanup()
-            finally:
+            except Exception as exc:
+                cleanup_error = exc
+                if primary_error is not None:
+                    logger.exception("Trainer cleanup failed after the primary experiment error")
+
+            try:
                 tq.close()
+            except Exception:
+                if primary_error is None and cleanup_error is None:
+                    raise
+                logger.exception("Transfer queue cleanup failed")
+
+            if primary_error is None and cleanup_error is not None:
+                raise cleanup_error
 
 
 @hydra.main(config_path="config", config_name="multi_agent_blackbox", version_base=None)

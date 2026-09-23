@@ -74,10 +74,17 @@ def _row(question: str, answer: str, index: int) -> dict:
 
 
 def main() -> None:
-    out_dir = Path(__file__).resolve().parent / "mock_data"
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "mock_data")
+    args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat must be positive")
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = [_row(s["question"], s["answer"], i) for i, s in enumerate(_SAMPLES)]
+    rows = [_row(s["question"], s["answer"], i) for i, s in enumerate(_SAMPLES * args.repeat)]
     table = pa.Table.from_pylist(rows)
 
     train_path = out_dir / "mock_mas_train.parquet"

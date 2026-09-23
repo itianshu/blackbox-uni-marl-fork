@@ -2,6 +2,8 @@
 
 import time
 
+import pytest
+
 from uni_agent.trainer.dynamic_inference.metrics import (
     VLLMMetricsScraper,
     parse_vllm_metrics,
@@ -148,7 +150,7 @@ class TestServingSignalSource:
 
         return {name: _Handle(addrs) for name, addrs in addresses.items()}
 
-    def test_scrape_throttled_by_interval(self, monkeypatch):
+    def test_lb_and_metrics_are_sampled_together_on_every_call(self, monkeypatch):
         import sys
         monkeypatch.setitem(sys.modules, "ray", _FakeRay)
 
@@ -175,11 +177,11 @@ class TestServingSignalSource:
             "num_requests_waiting") == 2
         assert samples["a"].metrics_fresh is True
 
-        # next tick is inside the interval: no new scrapes
+        # The caller owns the cadence; every tick produces an aligned sample.
         scraped.clear()
         cached = source.sample_all()
-        assert scraped == []
-        assert cached["a"].metrics_fresh is False
+        assert sorted(scraped) == ["h1:1", "h2:2"]
+        assert cached["a"].metrics_fresh is True
         assert samples["a"].kv_cache_usage  # previous samples untouched
 
     def test_store_reports_only_fresh_scrape_attempts(self):
@@ -229,6 +231,37 @@ class TestServingSignalSource:
 
 
 class TestSignalStoreVLLMMetrics:
+    def test_queue_signals_use_per_replica_depth_and_current_window(self):
+        start = parse_vllm_metrics(
+            "vllm:num_requests_waiting 10\n"
+            'vllm:request_queue_time_seconds_bucket{le="0.5"} 2\n'
+            'vllm:request_queue_time_seconds_bucket{le="2"} 2\n'
+            'vllm:request_queue_time_seconds_bucket{le="+Inf"} 2\n'
+        )
+        end = parse_vllm_metrics(
+            "vllm:num_requests_waiting 14\n"
+            'vllm:request_queue_time_seconds_bucket{le="0.5"} 3\n'
+            'vllm:request_queue_time_seconds_bucket{le="2"} 6\n'
+            'vllm:request_queue_time_seconds_bucket{le="+Inf"} 6\n'
+        )
+        store = SignalStore(["a"], window_s=10)
+        store.record("a", PolicySample(
+            t=10.0,
+            vllm_metrics={"r0": start, "r1": start},
+            metrics_fresh=True,
+        ))
+        store.record("a", PolicySample(
+            t=13.0,
+            vllm_metrics={"r0": end, "r1": end},
+            metrics_fresh=True,
+        ))
+
+        assert store.waiting_per_replica("a") == pytest.approx(12.0)
+        assert store.waiting_streak_s("a", 8.0) == pytest.approx(3.0)
+        assert store.histogram_window_quantile(
+            "a", "request_queue_time_seconds", 0.9,
+        ) == pytest.approx(1.8)
+
     def test_curated_observability_includes_queue_latency_and_counters(self):
         previous = parse_vllm_metrics(
             "vllm:num_requests_running 1\n"

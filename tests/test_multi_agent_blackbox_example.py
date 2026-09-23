@@ -95,6 +95,86 @@ def test_multi_agent_runner_returns_rollout_result_for_reward_worker(monkeypatch
     }
 
 
+def test_random_routing_harness_uses_entry_agent_and_bounded_handoffs(monkeypatch):
+    from examples.multi_agent_blackbox import random_routing_harness as harness
+
+    calls = []
+
+    async def fake_chat_completion(*, role, messages, agent_cfg, **_):
+        calls.append({"role": role, "messages": messages, "agent_cfg": dict(agent_cfg)})
+        return f"output from {role}"
+
+    monkeypatch.setattr(harness, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        harness.random_routing_agent_runner(
+            raw_prompt=[{"role": "user", "content": "solve"}],
+            rollout=SimpleNamespace(
+                base_url="http://gateway/rollouts/random/v1",
+                sessions={"agent_1": object(), "agent_2": object(), "agent_3": object()},
+            ),
+            sample_index=7,
+            session_runtime=None,
+            role_policy_mapping={
+                "agent_1": "policy_1",
+                "agent_2": "policy_2",
+                "agent_3": "policy_3",
+            },
+            mas_config={
+                "harness": {
+                    "entry_agent": "agent_1",
+                    "min_rounds": 3,
+                    "max_rounds": 3,
+                    "random_seed": 42,
+                    "route_weights": {"agent_1": 0, "agent_2": 1, "agent_3": 0},
+                    "output_tokens_min": 4096,
+                    "output_tokens_max": 4096,
+                    "minimum_completion_ratio": 0.75,
+                },
+                "agents": {},
+            },
+            max_tokens=8192,
+        )
+    )
+
+    assert result["route"] == ["agent_1", "agent_2", "agent_2"]
+    assert [call["role"] for call in calls] == result["route"]
+    assert all(call["agent_cfg"]["max_tokens"] == 4096 for call in calls)
+    assert all(call["agent_cfg"]["min_tokens"] == 3072 for call in calls)
+    assert all("ignore_eos" not in call["agent_cfg"] for call in calls)
+    assert "entered through agent_1" in calls[0]["messages"][-1]["content"]
+    assert "Previous agent output:\noutput from agent_1" in calls[1]["messages"][-1]["content"]
+    assert result["reward_info"]["round_count"] == 3
+    assert result["reward_info"]["entry_agent"] == "agent_1"
+    assert result["reward_info"]["final_result"] == "output from agent_2"
+
+
+def test_random_routing_recipe_selects_new_harness_and_random_token_range():
+    mas_cfg = yaml.safe_load(
+        (EXAMPLE_DIR / "config" / "mas_config_random_routing.yaml").read_text(encoding="utf-8")
+    )
+    cfg = yaml.safe_load(
+        (EXAMPLE_DIR / "config" / "multi_agent_blackbox_borrow_random_routing.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    harness_cfg = mas_cfg["harness"]
+    assert harness_cfg["entry_agent"] == "agent_1"
+    assert (harness_cfg["min_rounds"], harness_cfg["max_rounds"]) == (7, 10)
+    assert harness_cfg["output_tokens_min"] >= 8192
+    assert harness_cfg["output_tokens_max"] > harness_cfg["output_tokens_min"]
+    assert all("ignore_eos" not in agent for agent in mas_cfg["agents"].values())
+    framework_cfg = cfg["actor_rollout_ref"]["rollout"]["custom"]["agent_framework"]
+    assert framework_cfg["multi_agent_runner_fqn"].endswith(
+        "random_routing_harness.random_routing_agent_runner"
+    )
+    assert framework_cfg["multi_agent_runner_kwargs"]["max_tokens"] == 10240
+    script = (EXAMPLE_DIR / "scripts" / "run_e2e_borrow_verify.sh").read_text(encoding="utf-8")
+    assert 'BORROW_LOAD_PROFILE:-standard}" == "random_routing"' in script
+    assert "multi_agent_blackbox_borrow_random_routing" in script
+    assert "mas_config_random_routing.yaml" in script
+
+
 def test_chat_completion_forwards_deterministic_length_options(monkeypatch):
     from examples.multi_agent_blackbox import multi_agent_runner as runner_module
 
@@ -141,7 +221,7 @@ def test_chat_completion_forwards_deterministic_length_options(monkeypatch):
     assert captured["payload"]["ignore_eos"] is True
 
 
-def test_borrow_verify_recipe_forces_asymmetric_load_and_one_way_pair():
+def test_borrow_verify_recipe_forces_asymmetric_load_and_lends_to_both_busy_policies():
     mas_cfg = yaml.safe_load(
         (EXAMPLE_DIR / "config" / "mas_config_borrow_verify.yaml").read_text(encoding="utf-8")
     )
@@ -151,27 +231,34 @@ def test_borrow_verify_recipe_forces_asymmetric_load_and_one_way_pair():
         )
     )
 
-    assert mas_cfg["agents"]["agent_1"]["min_tokens"] == 512
-    assert mas_cfg["agents"]["agent_2"]["ignore_eos"] is True
-    assert mas_cfg["agents"]["agent_3"]["min_tokens"] == 128
+    for agent in mas_cfg["agents"].values():
+        assert "min_tokens" not in agent  # async resume can reduce the remaining budget
+        assert agent["ignore_eos"] is True
+    assert mas_cfg["agents"]["agent_2"]["max_tokens"] < mas_cfg["agents"]["agent_1"]["max_tokens"]
+    assert mas_cfg["agents"]["agent_2"]["max_tokens"] < mas_cfg["agents"]["agent_3"]["max_tokens"]
     dynamic = cfg["dynamic_inference_scheduling"]
     assert dynamic["resource_usage"]["kv_enter"] > dynamic["resource_usage"]["kv_post_lend_max"]
-    assert dynamic["borrowing"]["guest_master_port_range"] == [32000, 32768]
+    assert dynamic["borrowing"]["guest_master_port_range"] == [20010, 20522]
     assert dynamic["borrowing"]["guest_master_port_stride"] == 4
+    assert dynamic["resource_usage"]["queue_signal_enabled"] is False
     assert dynamic["borrowing"]["pairs"] == [
-        {
-            "home": "policy_2",
-            "donor": "policy_1",
-            "home_replicas_per_unit": 1,
-            "guest_replicas_per_unit": 1,
-        }
+        {"home": "policy_1", "donor": "policy_2"},
+        {"home": "policy_1", "donor": "policy_3"},
+        {"home": "policy_2", "donor": "policy_1"},
+        {"home": "policy_2", "donor": "policy_3"},
+        {"home": "policy_3", "donor": "policy_1"},
+        {"home": "policy_3", "donor": "policy_2"},
     ]
+    assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["trainer"]["n_gpus_per_node"] == 4
+    assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["n_gpus_per_node"] == 12
     assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
     assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
 
     script = (EXAMPLE_DIR / "scripts" / "run_e2e_borrow_verify.sh").read_text(encoding="utf-8")
-    assert "TRAIN_CONFIG_NAME=multi_agent_blackbox_borrow_verify" in script
-    assert "DYNAMIC_INFERENCE_SCHEDULING=true" in script
+    assert 'TRAIN_CONFIG_NAME="${TRAIN_CONFIG_NAME:-multi_agent_blackbox_borrow_verify}"' in script
+    assert 'POLICY_2_N_GPUS_PER_NODE="${POLICY_2_N_GPUS_PER_NODE:-4}"' in script
+    assert 'POLICY_2_ROLLOUT_N_GPUS_PER_NODE="${POLICY_2_ROLLOUT_N_GPUS_PER_NODE:-12}"' in script
+    assert 'DYNAMIC_INFERENCE_SCHEDULING="${DYNAMIC_INFERENCE_SCHEDULING:-true}"' in script
 
 
 def test_multi_agent_reward_function_scores_injected_final_result():
@@ -203,8 +290,8 @@ def test_multi_agent_blackbox_yaml_exposes_framework_and_policy_mapping():
     assert af_cfg["multi_agent_runner_fqn"] == "examples.multi_agent_blackbox.multi_agent_runner.multi_agent_runner"
     assert af_cfg["role_policy_mapping"] == {
         "agent_1": "policy_1",
-        "agent_2": "policy_1",
-        "agent_3": "policy_2",
+        "agent_2": "policy_2",
+        "agent_3": "policy_3",
     }
     assert cfg["actor_rollout_ref"]["rollout"]["n"] == 4
     assert "reward_function_fqn" not in af_cfg["multi_agent_runner_kwargs"]
@@ -213,12 +300,14 @@ def test_multi_agent_blackbox_yaml_exposes_framework_and_policy_mapping():
         "name": "compute_score",
     }
     assert "models" not in cfg
-    assert set(cfg["policies"]) == {"policy_1", "policy_2"}
+    assert set(cfg["policies"]) == {"policy_1", "policy_2", "policy_3"}
     assert "name" not in cfg["policies"]["policy_1"]
     assert "name" not in cfg["policies"]["policy_2"]
+    assert "name" not in cfg["policies"]["policy_3"]
     assert cfg["ppo_trainer_config_name"] == "ppo_trainer"
     assert "ppo_trainer_config_name" not in cfg["policies"]["policy_1"]
     assert "ppo_trainer_config_name" not in cfg["policies"]["policy_2"]
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_3"]
 
 
 def test_external_multi_agent_recipe_exposes_command_runner_contract():
@@ -252,7 +341,7 @@ def test_external_mas_training_script_selects_external_recipe_without_callable_c
     assert "POLICY_2_MODEL_PATH" in content
     assert "data.train_files" in content
     assert "data.val_files" in content
-    assert "for var in POLICY_1_MODEL_PATH POLICY_2_MODEL_PATH; do" in content
+    assert "for var in POLICY_1_MODEL_PATH POLICY_2_MODEL_PATH POLICY_3_MODEL_PATH; do" in content
     assert "--config-name=multi_agent_blackbox_external" in content
     assert "--config-path=\"${REPO_ROOT}/examples/multi_agent_blackbox/config\"" in content
     assert 'data.train_files="[\'${TRAIN_DATA}\']"' in content
@@ -283,7 +372,8 @@ def test_multi_agent_blackbox_yaml_uses_public_ppo_trainer_base_per_policy():
     assert cfg["ppo_trainer_config_name"] == "ppo_trainer"
     assert "ppo_trainer_config_name" not in cfg["policies"]["policy_1"]
     assert "ppo_trainer_config_name" not in cfg["policies"]["policy_2"]
-    for policy_name in ("policy_1", "policy_2"):
+    assert "ppo_trainer_config_name" not in cfg["policies"]["policy_3"]
+    for policy_name in ("policy_1", "policy_2", "policy_3"):
         assert "use_v1" not in cfg["policies"][policy_name]["ppo_trainer_overrides"].get("trainer", {})
     assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["data"]["train_batch_size"] == "${data.train_batch_size}"
     assert (
@@ -294,13 +384,14 @@ def test_multi_agent_blackbox_yaml_uses_public_ppo_trainer_base_per_policy():
     assert cfg["policies"]["policy_1"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.6
 
     assert cfg["policies"]["policy_2"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.6
+    assert cfg["policies"]["policy_3"]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.6
 
 
 def test_multi_agent_blackbox_yaml_projects_shared_ppo_mini_batch_size_to_policies():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 
-    assert cfg["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 4
-    for policy_name in ("policy_1", "policy_2"):
+    assert cfg["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 32
+    for policy_name in ("policy_1", "policy_2", "policy_3"):
         assert (
             cfg["policies"][policy_name]["ppo_trainer_overrides"]["actor_rollout_ref"]["actor"]
             ["ppo_mini_batch_size"]
@@ -313,7 +404,7 @@ def test_multi_agent_blackbox_yaml_keeps_shared_runtime_topology_at_outer_level(
 
     assert cfg["trainer"]["v1"]["trainer_mode"] == "separate_async"
     assert cfg["trainer"]["v1"]["separate_async"]["parameter_sync_step"] == 1
-    for policy_name in ("policy_1", "policy_2"):
+    for policy_name in ("policy_1", "policy_2", "policy_3"):
         policy_trainer = cfg["policies"][policy_name]["ppo_trainer_overrides"].get("trainer", {})
         assert "v1" not in policy_trainer
 
@@ -322,7 +413,7 @@ def test_multi_agent_blackbox_yaml_keeps_top_p_per_policy():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 
     assert "top_p" not in cfg["actor_rollout_ref"]["rollout"]
-    for policy_name in ("policy_1", "policy_2"):
+    for policy_name in ("policy_1", "policy_2", "policy_3"):
         assert (
             cfg["policies"][policy_name]["ppo_trainer_overrides"]["actor_rollout_ref"]["rollout"]["top_p"]
             == 1.0
@@ -332,7 +423,7 @@ def test_multi_agent_blackbox_yaml_keeps_top_p_per_policy():
 def test_multi_agent_blackbox_yaml_keeps_shared_data_and_algorithm_at_root_level():
     cfg = yaml.safe_load((EXAMPLE_DIR / "config" / "multi_agent_blackbox.yaml").read_text(encoding="utf-8"))
 
-    for policy_name in ("policy_1", "policy_2"):
+    for policy_name in ("policy_1", "policy_2", "policy_3"):
         ppo_config = cfg["policies"][policy_name]["ppo_trainer_overrides"]
 
         assert cfg["data"]["train_files"] == "???"
@@ -395,29 +486,41 @@ def test_multi_agent_blackbox_yaml_documents_per_policy_resource_isolation():
 
     policy_1 = cfg["policies"]["policy_1"]["ppo_trainer_overrides"]
     policy_2 = cfg["policies"]["policy_2"]["ppo_trainer_overrides"]
+    policy_3 = cfg["policies"]["policy_3"]["ppo_trainer_overrides"]
 
-    assert policy_1["trainer"]["nnodes"] == 2
-    assert policy_2["trainer"]["nnodes"] == 2
+    assert policy_1["trainer"]["nnodes"] == 1
+    assert policy_2["trainer"]["nnodes"] == 1
+    assert policy_3["trainer"]["nnodes"] == 1
     assert policy_1["trainer"]["n_gpus_per_node"] == 8
     assert policy_2["trainer"]["n_gpus_per_node"] == 8
+    assert policy_3["trainer"]["n_gpus_per_node"] == 8
     assert "n_training_gpus_per_node" not in policy_1["trainer"]
     assert "n_training_gpus_per_node" not in policy_2["trainer"]
+    assert "n_training_gpus_per_node" not in policy_3["trainer"]
     assert policy_1["trainer"]["default_local_dir"].endswith("/policy_1")
     assert policy_2["trainer"]["default_local_dir"].endswith("/policy_2")
+    assert policy_3["trainer"]["default_local_dir"].endswith("/policy_3")
     assert policy_1["actor_rollout_ref"]["model"]["path"] == "???"
     assert policy_2["actor_rollout_ref"]["model"]["path"] == "???"
+    assert policy_3["actor_rollout_ref"]["model"]["path"] == "???"
     assert policy_1["actor_rollout_ref"]["actor"]["fsdp_config"]["fsdp_size"] == 8
     assert policy_2["actor_rollout_ref"]["actor"]["fsdp_config"]["fsdp_size"] == 8
-    assert policy_1["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 4
-    assert policy_2["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 8
+    assert policy_3["actor_rollout_ref"]["actor"]["fsdp_config"]["fsdp_size"] == 8
+    assert policy_1["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 2
+    assert policy_2["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 2
+    assert policy_3["actor_rollout_ref"]["rollout"]["tensor_model_parallel_size"] == 2
     assert policy_1["actor_rollout_ref"]["rollout"]["multi_turn"]["format"] == "qwen3_coder"
     assert policy_2["actor_rollout_ref"]["rollout"]["multi_turn"]["format"] == "hermes"
+    assert policy_3["actor_rollout_ref"]["rollout"]["multi_turn"]["format"] == "hermes"
     assert "enable" not in policy_1["actor_rollout_ref"]["rollout"]["multi_turn"]
     assert "enable" not in policy_2["actor_rollout_ref"]["rollout"]["multi_turn"]
+    assert "enable" not in policy_3["actor_rollout_ref"]["rollout"]["multi_turn"]
     assert "served_model_name" not in policy_1["actor_rollout_ref"]["rollout"]
     assert "served_model_name" not in policy_2["actor_rollout_ref"]["rollout"]
+    assert "served_model_name" not in policy_3["actor_rollout_ref"]["rollout"]
     assert "prometheus" not in policy_1["actor_rollout_ref"]["rollout"]
     assert "prometheus" not in policy_2["actor_rollout_ref"]["rollout"]
+    assert "prometheus" not in policy_3["actor_rollout_ref"]["rollout"]
 
 
 def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monkeypatch):
@@ -448,6 +551,7 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
                 "actor_rollout_ref.rollout.n=8",
                 "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.model.path=/models/policy_1",
                 "policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.model.path=/models/policy_2",
+                "policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.model.path=/models/policy_3",
                 "policies.policy_1.ppo_trainer_overrides.actor_rollout_ref.rollout.top_p=0.95",
                 "policies.policy_1.ppo_trainer_overrides.trainer.nnodes=2",
                 "policies.policy_2.ppo_trainer_overrides.trainer.nnodes=3",
@@ -458,13 +562,15 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
 
     trainer = MultiAgentsPPOTrainer(config=cfg)
 
-    assert list(trainer.policy_trainers) == ["policy_1", "policy_2"]
-    assert len(ConfigSmokePolicyTrainer.instances) == 2
+    assert list(trainer.policy_trainers) == ["policy_1", "policy_2", "policy_3"]
+    assert len(ConfigSmokePolicyTrainer.instances) == 3
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.actor.optim.lr == 1e-6
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.model.path == "/models/policy_1"
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.model.path == "/models/policy_2"
+    assert trainer.policy_configs["policy_3"].actor_rollout_ref.model.path == "/models/policy_3"
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.rollout.n == 8
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.n == 8
+    assert trainer.policy_configs["policy_3"].actor_rollout_ref.rollout.n == 8
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.rollout.temperature == 0.5
     assert trainer.policy_configs["policy_2"].actor_rollout_ref.rollout.temperature == 0.8
     assert trainer.policy_configs["policy_1"].actor_rollout_ref.rollout.top_p == 0.95
@@ -473,8 +579,8 @@ def test_multi_agent_blackbox_hydra_config_initializes_multi_policy_trainer(monk
     assert trainer.policy_configs["policy_2"].trainer.nnodes == 3
     assert cfg.actor_rollout_ref.rollout.custom.agent_framework.role_policy_mapping == {
         "agent_1": "policy_1",
-        "agent_2": "policy_1",
-        "agent_3": "policy_2",
+        "agent_2": "policy_2",
+        "agent_3": "policy_3",
     }
 
 
@@ -483,16 +589,19 @@ def test_e2e_training_script_uses_multi_agents_entrypoint_and_config():
     content = script.read_text(encoding="utf-8")
 
     assert "-m uni_agent.trainer.main_multi_agents_ppo" in content
-    assert "--config-name=multi_agent_blackbox" in content
+    assert '--config-name="${TRAIN_CONFIG_NAME}"' in content
     assert "--config-path=\"${REPO_ROOT}/examples/multi_agent_blackbox/config\"" in content
     assert "actor_rollout_ref.rollout.custom.agent_framework.multi_agent_runner_kwargs.mas_config_path" in content
     assert "actor_rollout_ref.rollout.n=${ROLLOUT_N}" in content
     assert "POLICY_1_NNODES" in content
     assert "POLICY_2_NNODES" in content
+    assert "POLICY_3_NNODES" in content
     assert "POLICY_1_N_GPUS_PER_NODE" in content
     assert "POLICY_2_N_GPUS_PER_NODE" in content
+    assert "POLICY_3_N_GPUS_PER_NODE" in content
     assert "POLICY_1_TENSOR_PARALLEL_SIZE" in content
     assert "POLICY_2_TENSOR_PARALLEL_SIZE" in content
+    assert "POLICY_3_TENSOR_PARALLEL_SIZE" in content
     assert "policies.policy_1.ppo_trainer_overrides.trainer.nnodes=${POLICY_1_NNODES}" in content
     assert "policies.policy_2.ppo_trainer_overrides.trainer.nnodes=${POLICY_2_NNODES}" in content
     assert "policies.policy_1.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_1_N_GPUS_PER_NODE}" in content

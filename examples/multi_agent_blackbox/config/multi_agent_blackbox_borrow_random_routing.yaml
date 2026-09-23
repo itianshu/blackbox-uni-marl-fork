@@ -1,0 +1,13 @@
+# @package _global_
+# High-KV borrow experiment using the bounded random-routing business harness.
+defaults:
+- multi_agent_blackbox_borrow_high_kv
+- _self_
+actor_rollout_ref:
+  rollout:
+    custom:
+      agent_framework:
+        multi_agent_runner_fqn: examples.multi_agent_blackbox.random_routing_harness.random_routing_agent_runner
+        multi_agent_runner_kwargs:
+          mas_config_path: examples/multi_agent_blackbox/config/mas_config_random_routing.yaml
+          max_tokens: 10240

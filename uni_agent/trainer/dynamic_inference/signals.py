@@ -13,6 +13,7 @@ from .metrics import (
     MetricNames,
     VLLMMetricsScraper,
     VLLMMetricsSnapshot,
+    PrometheusSample,
     summarize_vllm_metrics,
 )
 
@@ -50,7 +51,7 @@ class SignalSource(Protocol):
 
 
 class ServingSignalSource:
-    """Sample LB in-flight state and periodically scrape each vLLM server."""
+    """Take one aligned LB and vLLM sample for every call."""
 
     def __init__(
         self,
@@ -60,20 +61,18 @@ class ServingSignalSource:
     ):
         self._handles = handles
         self._scraper = scraper
+        # Kept in the signature for callers written before LB and vLLM polling
+        # were unified. The PollLoop owns the sole sampling interval now.
         self._scrape_interval_s = max(0.0, float(scrape_interval_s))
-        self._last_scrape_t = float("-inf")
 
     def sample_all(self) -> dict[str, PolicySample]:
         now = time.monotonic()
-        scrape = self._scraper is not None and now - self._last_scrape_t >= self._scrape_interval_s
-        if scrape:
-            self._last_scrape_t = now
-
         statuses = self._load_statuses()
         inflight = {
             policy: {str(server): int(count) for server, count in (status.get("servers") or {}).items()}
             for policy, status in statuses.items()
         }
+        scrape = self._scraper is not None
         metrics = self._scrape_metrics(self._scrape_targets(inflight)) if scrape else {}
 
         samples = {}
@@ -242,12 +241,86 @@ class SignalStore:
         }
 
     def kv_util(self, policy: str, how: str = "p90") -> float:
+        """Policy KV load: replica mean at each sample, then a window statistic."""
         values = [
-            max(sample.kv_cache_usage.values())
+            sum(sample.kv_cache_usage.values()) / len(sample.kv_cache_usage)
             for sample in self.samples[policy]
             if sample.kv_cache_usage
         ]
         return _stat(values, how) or 0.0
+
+    @staticmethod
+    def _sample_waiting_per_replica(sample: PolicySample) -> float | None:
+        values = []
+        for snapshot in sample.vllm_metrics.values():
+            value = snapshot.aggregate("num_requests_waiting")
+            if value is not None:
+                values.append(value)
+        return sum(values) / len(values) if values else None
+
+    def waiting_per_replica(self, policy: str, how: str = "mean") -> float:
+        values = [
+            value
+            for sample in self._metric_samples(policy)
+            if (value := self._sample_waiting_per_replica(sample)) is not None
+        ]
+        return _stat(values, how) or 0.0
+
+    def waiting_streak_s(self, policy: str, threshold_per_replica: float) -> float:
+        """Duration of the current continuously-high waiting backlog."""
+        samples = self._metric_samples(policy)
+        if not samples:
+            return 0.0
+        latest_t = samples[-1].t
+        earliest_t = latest_t
+        seen = False
+        for sample in reversed(samples):
+            waiting = self._sample_waiting_per_replica(sample)
+            if waiting is None or waiting < threshold_per_replica:
+                break
+            earliest_t = sample.t
+            seen = True
+        return max(0.0, latest_t - earliest_t) if seen else 0.0
+
+    def histogram_window_quantile(
+        self,
+        policy: str,
+        metric_names: MetricNames,
+        q: float,
+    ) -> float | None:
+        """Quantile from histogram observations added during this window.
+
+        Prometheus histograms are process-lifetime counters. Subtracting the
+        first aligned scrape from the last keeps old queue spikes from holding
+        the scheduling signal high indefinitely.
+        """
+        samples = self._metric_samples(policy)
+        if not samples:
+            return None
+        if len(samples) == 1:
+            merged = VLLMMetricsSnapshot.merge(list(samples[-1].vllm_metrics.values()))
+            return merged.histogram_quantile(metric_names, q)
+
+        first, last = samples[0], samples[-1]
+        deltas: list[PrometheusSample] = []
+        for server, end_snapshot in last.vllm_metrics.items():
+            start_snapshot = first.vllm_metrics.get(server, VLLMMetricsSnapshot())
+            starts = {
+                (sample.name, tuple(sorted(sample.labels.items()))): sample.value
+                for sample in start_snapshot.samples
+            }
+            for sample in end_snapshot.samples:
+                key = (sample.name, tuple(sorted(sample.labels.items())))
+                if not (
+                    sample.name.endswith("_bucket")
+                    or sample.name.endswith("_count")
+                    or sample.name.endswith("_sum")
+                ):
+                    continue
+                start = starts.get(key, 0.0)
+                delta = sample.value - start if sample.value >= start else sample.value
+                deltas.append(PrometheusSample(sample.name, sample.labels, delta))
+        return VLLMMetricsSnapshot(deltas).histogram_quantile(metric_names, q)
 
     def _metric_samples(self, policy: str) -> list[PolicySample]:
         return [sample for sample in self.samples[policy] if sample.vllm_metrics]

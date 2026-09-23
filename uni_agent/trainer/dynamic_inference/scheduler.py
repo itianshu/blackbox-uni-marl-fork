@@ -1,18 +1,13 @@
-"""Decision layer: KV-cache-utilisation bottleneck detection and stable allocation.
+"""Decision layer: composite serving-load detection and stable allocation.
 
 Quantity output is treated as a desired allocation. Target confirmation,
 post-change settling, minimum lend duration and in-place renewal prevent
 discrete replica rounding from causing repeated swaps:
 
-- **Signal**: windowed p90 of the per-replica-max KV cache gauge
-  (``SignalStore.kv_util``, fed by the vLLM ``/metrics`` scraper), EMA-smoothed.
-- **Bottleneck**: candidates are policies at ``kv_enter`` or above (highest
-  wins); the simple FSM requires ``bottleneck_confirm_polls`` consecutive
-  confirmations and exits at or below ``kv_exit``.
-- **Quantity (pluggable, ``quantity.py``)**: the default ``equalisation``
-  strategy uses demand-conserving dilution to rank topology-valid units, then
-  selects every unit allowed by the lender safety guards. Existing units that
-  remain in the target are renewed in place.
+- **Signal**: p90 over a window of per-policy replica-mean KV gauges, followed
+  by an EMA. Sustained queue depth plus queue duration is an alternative entry
+  signal when KV is low.
+- **Quantity**: each event adds at most one topology-valid atomic replica unit.
 
 The scheduler is a plain in-process class (no Ray actor): fresh metrics drive
 decisions on the poll thread, while the controller's gate serializes physical
@@ -88,12 +83,14 @@ class MultiPolicyInferenceScheduler:
         self._normal_return_ready_ids: set[int] = set()
 
         # ---- borrow quantity ----
-        from .quantity import EqualisationStrategy
+        from .quantity import SingleUnitStrategy
 
-        self.quantity = EqualisationStrategy()
+        self.quantity = SingleUnitStrategy()
 
         # ---- signal smoothing ----
         self.ema_kv: dict[str, float] = {p: 0.0 for p in self.policies}
+        self.waiting_per_replica: dict[str, float] = {p: 0.0 for p in self.policies}
+        self.queue_time_s: dict[str, float] = {p: 0.0 for p in self.policies}
         self._ema_initialized: set[str] = set()
 
         # ---- lend registry (single writer: this class, under the boundary gate) ----
@@ -110,6 +107,8 @@ class MultiPolicyInferenceScheduler:
             "returns": 0, "disabled_by_failures": 0,
         }
         self.disabled = False   # repeated execution failures -> behave like static
+        from .observability import SchedulingTrace
+        self.trace = SchedulingTrace(config)
 
     # ================================================================ helpers
     def initial_cards(self, policy: str) -> int:
@@ -172,9 +171,29 @@ class MultiPolicyInferenceScheduler:
                     self._ema_initialized.add(p)
                 else:
                     self.ema_kv[p] = a * kv + (1 - a) * self.ema_kv[p]
+                waiting_fn = getattr(self.signals, "waiting_per_replica", None)
+                self.waiting_per_replica[p] = (
+                    float(waiting_fn(p, "mean")) if callable(waiting_fn) else 0.0
+                )
+                histogram_fn = getattr(self.signals, "histogram_window_quantile", None)
+                histogram_wait = (
+                    histogram_fn(
+                        p,
+                        ("request_queue_time_seconds", "request_waiting_time_seconds"),
+                        0.9,
+                    )
+                    if callable(histogram_fn) else None
+                )
+                streak_fn = getattr(self.signals, "waiting_streak_s", None)
+                streak_wait = (
+                    float(streak_fn(p, self.ru.waiting_enter_per_replica))
+                    if callable(streak_fn) else 0.0
+                )
+                self.queue_time_s[p] = max(float(histogram_wait or 0.0), streak_wait)
             if complete_scrape and self._settle_polls_remaining > 0:
                 self._settle_polls_remaining -= 1
         if complete_scrape:
+            self.trace.emit(self, "sample", getattr(self, "_trace_step", 0))
             self._check_early_return()
             self._update_normal_return_confirmations()
         return complete_scrape
@@ -185,7 +204,7 @@ class MultiPolicyInferenceScheduler:
         for lend in list(self.active_lends):
             if lend.home_policy in returned_homes:
                 continue
-            if self.ema_kv[lend.home_policy] >= self.ru.kv_enter:
+            if self._is_overloaded(lend.home_policy):
                 lend.home_kv_hot_polls += 1
                 if lend.home_kv_hot_polls >= self.config.early_return_confirm_polls:
                     self._do_early_return(lend)
@@ -194,6 +213,9 @@ class MultiPolicyInferenceScheduler:
                 lend.home_kv_hot_polls = 0
 
     def _do_early_return(self, lend: LendRecord) -> None:
+        self.trace.emit(self, "early_return_requested", getattr(self, "_trace_step", 0),
+                        lend_id=lend.lend_id, lender=lend.home_policy, borrower=lend.donor,
+                        reason="lender_composite_load_above_enter")
         logger.info(
             "dynamic_inference: early return %s->%s (home exhausted while lent out)",
             lend.home_policy, lend.donor,
@@ -203,10 +225,10 @@ class MultiPolicyInferenceScheduler:
             self._on_early_return(lend)
 
     def _update_normal_return_confirmations(self) -> None:
-        """Count consecutive low-KV scrapes only for policies using guests."""
+        """Count consecutive fully-relieved samples for policies using guests."""
         active_donors = {lend.donor for lend in self.active_lends}
         for policy in self.policies:
-            if policy in active_donors and self.ema_kv[policy] <= self.ru.kv_exit:
+            if policy in active_donors and self._is_relieved(policy):
                 self._return_low_polls[policy] += 1
             else:
                 self._return_low_polls[policy] = 0
@@ -215,6 +237,7 @@ class MultiPolicyInferenceScheduler:
     def decide(self, stats: StepStats) -> BoundaryPlan:
         plan = BoundaryPlan()
         step = stats.step
+        self._trace_step = step
         self._decision_count += 1
 
         if self.disabled:
@@ -223,7 +246,7 @@ class MultiPolicyInferenceScheduler:
 
         # A failed return may have already removed routing or put engines to
         # sleep. Resume it before making any allocation decision; unaffected
-        # lends stay active and receive their normal renewal push.
+        # lends stay active in their owning policy's regular weight update.
         recovering = [lend for lend in self.active_lends if lend.return_stage > 0]
         if recovering:
             plan.returns = recovering
@@ -369,7 +392,7 @@ class MultiPolicyInferenceScheduler:
         )
 
     def _limit_new_borrows(self, desired: list[BorrowPlan]) -> list[BorrowPlan]:
-        """Retain incumbents but admit additions from at most one pair.
+        """Retain incumbents but admit at most one new atomic unit.
 
         A successful physical borrow starts a global wall-clock cooldown. While
         it is active, no new units are admitted; desired removals still flow
@@ -377,16 +400,12 @@ class MultiPolicyInferenceScheduler:
         """
         active_keys = {self._lend_key(lend) for lend in self.active_lends}
         additions = [plan for plan in desired if self._plan_key(plan) not in active_keys]
-        allowed_pair = None
-        if additions and time.monotonic() >= self._borrow_cooldown_until:
-            first = additions[0]
-            allowed_pair = (first.home_policy, first.donor)
-        return [
-            plan
-            for plan in desired
-            if self._plan_key(plan) in active_keys
-            or (plan.home_policy, plan.donor) == allowed_pair
+        incumbents = [
+            plan for plan in desired if self._plan_key(plan) in active_keys
         ]
+        if additions and time.monotonic() >= self._borrow_cooldown_until:
+            incumbents.append(additions[0])
+        return incumbents
 
     @staticmethod
     def _unit_key(home: str, donor: str, replicas: list[Any]) -> tuple:
@@ -406,11 +425,39 @@ class MultiPolicyInferenceScheduler:
 
     # ------------------------------------------------- layer 1: candidates
     def _pick_candidate(self) -> str | None:
-        """Highest-KV policy at or above the enter threshold, if any."""
-        cands = [p for p in self.policies if self.ema_kv[p] >= self.ru.kv_enter]
+        """Highest composite-load policy satisfying an entry condition."""
+        cands = [p for p in self.policies if self._is_overloaded(p)]
         if not cands:
             return None
-        return max(cands, key=lambda p: self.ema_kv[p])
+        return max(cands, key=self._load_score)
+
+    def _queue_overloaded(self, policy: str) -> bool:
+        return self.ru.queue_signal_enabled and (
+            self.waiting_per_replica[policy] >= self.ru.waiting_enter_per_replica
+            and self.queue_time_s[policy] >= self.ru.queue_time_enter_s
+        )
+
+    def _is_overloaded(self, policy: str) -> bool:
+        return self.ema_kv[policy] >= self.ru.kv_enter or self._queue_overloaded(policy)
+
+    def _is_relieved(self, policy: str) -> bool:
+        if self.ema_kv[policy] > self.ru.kv_exit:
+            return False
+        return not self.ru.queue_signal_enabled or (
+            self.waiting_per_replica[policy] <= self.ru.waiting_exit_per_replica
+            and self.queue_time_s[policy] <= self.ru.queue_time_exit_s
+        )
+
+    def _load_score(self, policy: str) -> float:
+        """Comparable pressure score used only to rank eligible policies."""
+        kv = self.ema_kv[policy] / self.ru.kv_enter
+        queue = 0.0
+        if self.ru.queue_signal_enabled:
+            queue = min(
+                self.waiting_per_replica[policy] / self.ru.waiting_enter_per_replica,
+                self.queue_time_s[policy] / self.ru.queue_time_enter_s,
+            )
+        return max(kv, queue)
 
     def _bottleneck_fsm(self, target: str | None, step: int) -> str | None:
         """Enter on ``bottleneck_confirm_polls`` consecutive confirmations;
@@ -420,7 +467,7 @@ class MultiPolicyInferenceScheduler:
             self.confirm.clear()
             return cur
         if target is None:
-            if cur is not None and self.ema_kv.get(cur, 0.0) <= self.ru.kv_exit:
+            if cur is not None and self._is_relieved(cur):
                 self._log_bn_change(None, step)
                 self.bottleneck = None
             self.confirm.clear()
@@ -509,6 +556,7 @@ class MultiPolicyInferenceScheduler:
     # (called by the executor/controller after physical success — the
     # scheduler stays the single writer of active_lends under the gate)
     def note_borrow_started(self, lend: LendRecord) -> None:
+        self.trace.started[lend.lend_id] = time.monotonic()
         self.active_lends.append(lend)
         self._lend_start_poll[id(lend)] = self._decision_count
         self._borrow_cooldown_until = max(
@@ -518,7 +566,8 @@ class MultiPolicyInferenceScheduler:
         self._return_low_polls[lend.donor] = 0
         self._settle_polls_remaining = self.config.rebalance_settle_polls
         self._counters["swap_episodes"] += 1
-        self._log_event("borrow", lend.since_step, lend.home_policy, lend.donor, {})
+        self._log_event("borrow", lend.since_step, lend.home_policy, lend.donor,
+                        {"lend_id": lend.lend_id})
 
     def note_lend_returned(
         self, lend: LendRecord, step: int, early: bool = False,
@@ -531,7 +580,10 @@ class MultiPolicyInferenceScheduler:
         if not early:
             self._counters["returns"] += 1
         self._log_event("early_return" if early else "return", step,
-                        lend.home_policy, lend.donor, {})
+                        lend.home_policy, lend.donor,
+                        {"lend_id": lend.lend_id,
+                         "held_s": time.monotonic() - self.trace.started.pop(lend.lend_id)
+                         if lend.lend_id in self.trace.started else None})
 
     def note_lend_renewed(self, lend: LendRecord, step: int) -> None:
         self._counters["renewals"] += 1
@@ -549,6 +601,7 @@ class MultiPolicyInferenceScheduler:
 
     # ------------------------------------------------- observation
     def _log_event(self, kind, step, home, donor, detail):
+        self.trace.emit(self, kind, step, lender=home, borrower=donor, **detail)
         self.events.append(LendEvent(kind=kind, step=step, t=round(time.time(), 3),
                                      home=home, donor=donor, detail=detail))
         if len(self.events) > 5000:
@@ -560,10 +613,20 @@ class MultiPolicyInferenceScheduler:
         snap["bottleneck"] = self.bottleneck or ""
         snap["disabled"] = self.disabled
         snap["kv_util"] = {p: round(self.ema_kv[p], 3) for p in self.policies}
+        snap["waiting_per_replica"] = {
+            p: round(self.waiting_per_replica[p], 3) for p in self.policies
+        }
+        snap["queue_time_s"] = {
+            p: round(self.queue_time_s[p], 3) for p in self.policies
+        }
         # Keep the aggregate mapping for programmatic inspection and expose
         # scalar values too: console/W&B loggers commonly discard nested maps.
         for policy in self.policies:
             snap[f"kv_util/{policy}"] = round(self.ema_kv[policy], 6)
+            snap[f"waiting_per_replica/{policy}"] = round(
+                self.waiting_per_replica[policy], 6,
+            )
+            snap[f"queue_time_s/{policy}"] = round(self.queue_time_s[policy], 6)
         snap["borrow_cooldown_remaining_s"] = round(
             max(0.0, self._borrow_cooldown_until - time.monotonic()), 3,
         )

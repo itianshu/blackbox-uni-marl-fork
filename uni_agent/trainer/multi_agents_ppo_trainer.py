@@ -250,6 +250,8 @@ class MultiAgentsPPOTrainer:
            initialization phase to synchronize current actor weights to that
            policy's rollout replicas.
         """
+        # Keep this optional subsystem lazy: importing it pulls in runtime
+        # components that are unnecessary when scheduling is disabled.
         from uni_agent.trainer.dynamic_inference.controller import DynamicInferenceController
 
         dynamic_inference = DynamicInferenceController.maybe_create(self)
@@ -628,10 +630,13 @@ class MultiAgentsPPOTrainer:
             self._sync_policy_runtime_context()
             self.on_step_begin()
             batch = self.step(metrics=metrics, timing_raw=self.timing_raw)
-            if self._should_save_checkpoint():
-                with marked_timer("save_checkpoint", self.timing_raw, color="green"):
-                    self._save_checkpoint()
-            self.on_step_end()
+            # Saving uses the same actor group as dynamic weight transfer.
+            boundary = self._dynamic_inference.gate.boundary() if self._dynamic_inference else nullcontext()
+            with boundary:
+                if self._should_save_checkpoint():
+                    with marked_timer("save_checkpoint", self.timing_raw, color="green"):
+                        self._save_checkpoint()
+                self.on_step_end()
             # Collect separate_async weight-sync metrics from the policy trainers.
             metrics.update(self._consume_sync_metrics())
             if self._dynamic_inference is not None:
@@ -765,33 +770,22 @@ class MultiAgentsPPOTrainer:
                 sample_batch_size=sample_batch_size,
                 metrics=metrics,
             )
-        # A metrics-driven borrow performs a one-shot weight push through the
-        # donor's actor worker group.  Batch balancing, old-log-prob/advantage
-        # computation and the PPO update use those same actors.  Keep that
-        # whole actor phase under the boundary gate so a poll-thread borrow
-        # that started near the end of rollout must finish before actor CUDA
-        # work begins.  Otherwise NCCL checkpoint broadcasts and FSDP actor
-        # collectives can overlap on rank 0 and form a CUDA-stream cycle.
-        actor_phase = (
-            self._dynamic_inference.gate.boundary()
-            if self._dynamic_inference is not None
-            else nullcontext()
-        )
-        with actor_phase:
-            per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
-            per_policy_batches = self.prepare_policy_batches_for_ppo_update(per_policy_batches, metrics)
-            with marked_timer("adv", timing_raw, color="brown"):
-                multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
-                    per_policy_batches,
-                    metrics,
-                )
-            # Chain the advantage-computed batch into the update, mirroring verl's
-            # standard flow (`batch = _compute_advantage(batch); _update_actor(batch)`).
-            # Without this, per-policy batches never carry the advantages that
-            # _compute_advantage wrote back, and worker-side ppo_loss fails with
-            # KeyError('advantages').
-            per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
-            self.update_policy_trainers(per_policy_batches, metrics=metrics)
+        # Borrow/return clones published vLLM weights and never touches the
+        # actor. Only step-end publication and topology changes share the gate.
+        per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
+        per_policy_batches = self.prepare_policy_batches_for_ppo_update(per_policy_batches, metrics)
+        with marked_timer("adv", timing_raw, color="brown"):
+            multi_agent_batch = self.compute_multi_agent_advantage_from_policy_batches(
+                per_policy_batches,
+                metrics,
+            )
+        # Chain the advantage-computed batch into the update, mirroring verl's
+        # standard flow (`batch = _compute_advantage(batch); _update_actor(batch)`).
+        # Without this, per-policy batches never carry the advantages that
+        # _compute_advantage wrote back, and worker-side ppo_loss fails with
+        # KeyError('advantages').
+        per_policy_batches = self.build_per_policy_batches(multi_agent_batch)
+        self.update_policy_trainers(per_policy_batches, metrics=metrics)
         return multi_agent_batch
 
     def sample_multi_agent_batch(

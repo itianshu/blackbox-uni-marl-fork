@@ -319,6 +319,61 @@ class TestPrecreate:
             for rank in (0, 1):
                 assert f"home_wake:{policy}:{rank}" in env.ops()
 
+    @pytest.mark.parametrize("message", [
+        "DistNetworkError: server socket has failed to listen; EADDRINUSE: address already in use",
+        "Engine core initialization failed. See root cause above. Failed core proc(s): {}",
+    ])
+    def test_port_collision_rebuilds_guest_and_retries(self, env, monkeypatch, message):
+        failed_guest = None
+        original_init = FakeGuestReplica.init_standalone
+
+        async def collide_once(guest):
+            nonlocal failed_guest
+            if failed_guest is None:
+                failed_guest = guest
+                guest.workers = ["partial-worker"]
+                guest.servers = ["partial-server"]
+                raise RuntimeError(message)
+            await original_init(guest)
+
+        killed = []
+        monkeypatch.setattr(FakeGuestReplica, "init_standalone", collide_once)
+        monkeypatch.setattr(
+            env.manager,
+            "_kill_guest_actors",
+            lambda guests: killed.extend(guests) or 2,
+        )
+        async def stopped(guest):
+            assert guest in killed
+        monkeypatch.setattr(env.manager, "_wait_guest_actors_stopped", stopped)
+        env.config.borrowing.guest_init_retry_backoff_s = 0
+        env.config.borrowing.guest_init_retry_jitter_s = 0
+
+        assert asyncio.run(env.manager.precreate_all()) == 4
+        assert failed_guest in killed
+        assert failed_guest not in [
+            guest for unit in env.manager.units for guest in unit.guests
+        ]
+        assert len(FakeGuestReplica.created) == 5
+        assert any(op.startswith("guest_init:10004") for op in env.ops())
+
+    def test_non_port_init_failure_is_not_retried(self, env, monkeypatch):
+        calls = 0
+
+        async def fail_init(guest):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("model load failed")
+
+        monkeypatch.setattr(FakeGuestReplica, "init_standalone", fail_init)
+        env.config.borrowing.guest_init_retry_backoff_s = 0
+        env.config.borrowing.guest_init_retry_jitter_s = 0
+
+        with pytest.raises(RuntimeError, match="model load failed"):
+            asyncio.run(env.manager.precreate_all())
+        # All units start concurrently, but none gets a second attempt.
+        assert calls == 4
+
     def test_wake_failure_is_reported_after_all_homes_attempt_restore(
         self, env, monkeypatch,
     ):
@@ -507,3 +562,32 @@ class TestKillAll:
         monkeypatch.setitem(sys.modules, "ray", types.SimpleNamespace(kill=bad_kill))
         env.manager.kill_all()  # must not raise
         assert env.manager.units == []
+
+
+def test_retry_cleanup_waits_for_actor_death(monkeypatch):
+    class ActorDiedError(Exception):
+        pass
+    calls = []
+    async def ready():
+        calls.append('ready')
+        if len(calls) > 1:
+            raise ActorDiedError()
+    monkeypatch.setitem(sys.modules, 'ray', SimpleNamespace(
+        exceptions=SimpleNamespace(ActorDiedError=ActorDiedError)))
+    guest = SimpleNamespace(servers=[SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready))], workers=[])
+    manager = object.__new__(GuestEngineManager)
+    asyncio.run(manager._wait_guest_actors_stopped(guest, timeout=1))
+    assert calls == ['ready', 'ready']
+
+
+def test_retry_cleanup_timeout_is_not_success(monkeypatch):
+    class ActorDiedError(Exception):
+        pass
+    async def ready():
+        await asyncio.Event().wait()
+    monkeypatch.setitem(sys.modules, 'ray', SimpleNamespace(
+        exceptions=SimpleNamespace(ActorDiedError=ActorDiedError)))
+    guest = SimpleNamespace(servers=[SimpleNamespace(__ray_ready__=SimpleNamespace(remote=ready))], workers=[])
+    manager = object.__new__(GuestEngineManager)
+    with pytest.raises(TimeoutError):
+        asyncio.run(manager._wait_guest_actors_stopped(guest, timeout=0.01))

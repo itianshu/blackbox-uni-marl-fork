@@ -29,6 +29,15 @@ POLICY_2_ROLLOUT_N_GPUS_PER_NODE="${POLICY_2_ROLLOUT_N_GPUS_PER_NODE:-2}"  # sta
 POLICY_2_TENSOR_PARALLEL_SIZE="${POLICY_2_TENSOR_PARALLEL_SIZE:-1}"    # rollout TP；2 rollout 卡 / TP=1 => 2 replicas，满足动态调度借用要求
 POLICY_2_MODEL_PATH="${POLICY_2_MODEL_PATH:-/mnt/bn/chenghao1026/models/Qwen2.5-0.5B-Instruct}"
 
+# ── policy_3（资源 + 模型）───────────────────────────────────────────────
+POLICY_3_NNODES="${POLICY_3_NNODES:-1}"
+POLICY_3_N_GPUS_PER_NODE="${POLICY_3_N_GPUS_PER_NODE:-2}"
+POLICY_3_FSDP_SIZE="${POLICY_3_FSDP_SIZE:-${POLICY_3_N_GPUS_PER_NODE}}"
+POLICY_3_ROLLOUT_NNODES="${POLICY_3_ROLLOUT_NNODES:-1}"
+POLICY_3_ROLLOUT_N_GPUS_PER_NODE="${POLICY_3_ROLLOUT_N_GPUS_PER_NODE:-2}"
+POLICY_3_TENSOR_PARALLEL_SIZE="${POLICY_3_TENSOR_PARALLEL_SIZE:-1}"
+POLICY_3_MODEL_PATH="${POLICY_3_MODEL_PATH:-/mnt/bn/chenghao1026/models/Qwen2.5-0.5B-Instruct}"
+
 # ── Data ──────────────────────────
 MOCK_DATA_DIR="${MOCK_DATA_DIR:-${REPO_ROOT}/examples/multi_agent_blackbox/scripts/mock_data}"
 TRAIN_DATA="${TRAIN_DATA:-${MOCK_DATA_DIR}/mock_mas_train.parquet}"
@@ -82,13 +91,14 @@ mkdir -p "$LOG_DIR"
 
 echo "=== Multi-Agent Blackbox Example (v1 separate_async) ==="
 echo "Ray address:      ${RAY_ADDRESS}"
-echo "Nodes:            p1 train=${POLICY_1_NNODES}/rollout=${POLICY_1_ROLLOUT_NNODES}, p2 train=${POLICY_2_NNODES}/rollout=${POLICY_2_ROLLOUT_NNODES}"
-echo "Train GPUs/node:  p1=${POLICY_1_N_GPUS_PER_NODE}, p2=${POLICY_2_N_GPUS_PER_NODE} (FSDP: p1=${POLICY_1_FSDP_SIZE}, p2=${POLICY_2_FSDP_SIZE}, TP: p1=${POLICY_1_TENSOR_PARALLEL_SIZE}, p2=${POLICY_2_TENSOR_PARALLEL_SIZE})"
-echo "Rollout GPUs/node: p1=${POLICY_1_ROLLOUT_N_GPUS_PER_NODE}, p2=${POLICY_2_ROLLOUT_N_GPUS_PER_NODE} (standalone)"
+echo "Nodes:            p1 train=${POLICY_1_NNODES}/rollout=${POLICY_1_ROLLOUT_NNODES}, p2 train=${POLICY_2_NNODES}/rollout=${POLICY_2_ROLLOUT_NNODES}, p3 train=${POLICY_3_NNODES}/rollout=${POLICY_3_ROLLOUT_NNODES}"
+echo "Train GPUs/node:  p1=${POLICY_1_N_GPUS_PER_NODE}, p2=${POLICY_2_N_GPUS_PER_NODE}, p3=${POLICY_3_N_GPUS_PER_NODE} (FSDP: p1=${POLICY_1_FSDP_SIZE}, p2=${POLICY_2_FSDP_SIZE}, p3=${POLICY_3_FSDP_SIZE}; TP: p1=${POLICY_1_TENSOR_PARALLEL_SIZE}, p2=${POLICY_2_TENSOR_PARALLEL_SIZE}, p3=${POLICY_3_TENSOR_PARALLEL_SIZE})"
+echo "Rollout GPUs/node: p1=${POLICY_1_ROLLOUT_N_GPUS_PER_NODE}, p2=${POLICY_2_ROLLOUT_N_GPUS_PER_NODE}, p3=${POLICY_3_ROLLOUT_N_GPUS_PER_NODE} (standalone)"
 echo "Steps:            ${TOTAL_TRAINING_STEPS}, batch=${TRAIN_BATCH_SIZE}, rollout_n=${ROLLOUT_N}, warmup=${NUM_WARMUP_BATCHES}"
 echo "Sequence:         prompt=${PROMPT_LENGTH}, response=${RESPONSE_LENGTH}, max_model_len=${MAX_MODEL_LEN}"
 echo "Policy 1 model:   ${POLICY_1_MODEL_PATH}"
 echo "Policy 2 model:   ${POLICY_2_MODEL_PATH}"
+echo "Policy 3 model:   ${POLICY_3_MODEL_PATH}"
 echo "Train data:       ${TRAIN_DATA}"
 echo "Val data:         ${VAL_DATA}"
 echo "MAS config:       ${MAS_CONFIG_PATH}"
@@ -106,7 +116,7 @@ export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"   # 定位 hang 需要 INFO；正式跑�
 export HYDRA_FULL_ERROR="${HYDRA_FULL_ERROR:-1}"   # hydra 打印完整异常栈
 
 # ── 模型路径校验 ─────────────────────────────────────────────
-for var in POLICY_1_MODEL_PATH POLICY_2_MODEL_PATH; do
+for var in POLICY_1_MODEL_PATH POLICY_2_MODEL_PATH POLICY_3_MODEL_PATH; do
     val="${!var}"
     if [[ -z "${val}" ]]; then
         echo "ERROR: ${var} 为空，无法解析模型路径" >&2
@@ -163,4 +173,16 @@ done
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.nnodes=${POLICY_2_ROLLOUT_NNODES} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.n_gpus_per_node=${POLICY_2_ROLLOUT_N_GPUS_PER_NODE} \
     policies.policy_2.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_2_TENSOR_PARALLEL_SIZE} \
+    \
+    policies.policy_3.ppo_trainer_overrides.trainer.nnodes=${POLICY_3_NNODES} \
+    policies.policy_3.ppo_trainer_overrides.trainer.n_gpus_per_node=${POLICY_3_N_GPUS_PER_NODE} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.model.path=${POLICY_3_MODEL_PATH} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.actor.fsdp_config.fsdp_size=${POLICY_3_FSDP_SIZE} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.nnodes=${POLICY_3_ROLLOUT_NNODES} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.n_gpus_per_node=${POLICY_3_ROLLOUT_N_GPUS_PER_NODE} \
+    policies.policy_3.ppo_trainer_overrides.actor_rollout_ref.rollout.tensor_model_parallel_size=${POLICY_3_TENSOR_PARALLEL_SIZE} \
+    "$@" \
     2>&1 | tee "${LOG_PATH}"

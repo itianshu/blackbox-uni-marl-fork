@@ -110,14 +110,14 @@ class FakeOuterTrainer:
 
     def __init__(self, log, policies=("a", "b")):
         self.log = log
-        self.policy_trainers = {name: SimpleNamespace() for name in policies}
+        self.policy_trainers = {
+            name: SimpleNamespace(on_step_end=lambda name=name: self.log.append(("hook", name)))
+            for name in policies
+        }
+        self.timing_raw = {}
         self._policy_pool = ThreadPoolExecutor(max_workers=len(policies))
         self.global_steps = 11
         self.replay_buffer = SimpleNamespace(get_sampleable_count=lambda: 7)
-
-    def _run_trainer_hook(self, policy_name, hook_name):
-        assert hook_name == "on_step_end"
-        self.log.append(("hook", policy_name))
 
     def close(self):
         self._policy_pool.shutdown(wait=True)
@@ -142,6 +142,12 @@ class FakeScheduler:
 class FakeExecutor:
     def __init__(self, log):
         self.log = log
+
+    def assert_stable(self):
+        pass
+
+    def validate_membership(self):
+        pass
 
     def return_(self, lend, step, early=False, **kwargs):
         self.log.append(("return", lend.lend_id, step, early))
@@ -208,8 +214,8 @@ class TestRunBoundary:
         controller.run_boundary(trainer)
         trainer.close()
 
-        renew_idx = log.index(("renew_batch", (lend.lend_id,), 11))
-        assert renew_idx > max(i for i, event in enumerate(log) if event[0] == "hook")
+        assert not any(event[0].startswith("renew") for event in log)
+        assert sum(event[0] == "hook" for event in log) == 2
         assert not any(event[0] == "return" for event in log)
 
     def test_metrics_prefixed_and_stored(self):
@@ -224,16 +230,31 @@ class TestRunBoundary:
             "dynamic_inference/disabled": False,
         }
 
+    def test_boundary_collects_policy_hook_timings(self):
+        trainer = FakeOuterTrainer([])
+        trainer.timing_raw["sample"] = 9.0
+        for name, policy in trainer.policy_trainers.items():
+            policy.on_step_end = lambda policy=policy: policy.timing_raw.update(update_weights=1.5)
+        controller = _controller(trainer, BoundaryPlan())
+        try:
+            controller.run_boundary(trainer)
+        finally:
+            trainer.close()
+        assert trainer.timing_raw == {
+            "sample": 9.0, "a/update_weights": 1.5, "b/update_weights": 1.5,
+        }
+
     def test_boundary_waits_for_all_policy_hooks_when_one_fails(self):
         log = []
         trainer = FakeOuterTrainer(log)
 
-        def hook(policy_name, hook_name):
+        def hook(policy_name):
             log.append(("hook", policy_name))
             if policy_name == "a":
                 raise RuntimeError("update failed")
 
-        trainer._run_trainer_hook = hook
+        for name, policy in trainer.policy_trainers.items():
+            policy.on_step_end = lambda name=name: hook(name)
         controller = _controller(trainer, BoundaryPlan())
         with pytest.raises(RuntimeError, match="update failed"):
             controller.run_boundary(trainer)
@@ -242,46 +263,19 @@ class TestRunBoundary:
             ("hook", "a"), ("hook", "b"),
         }
 
-    def test_failed_recovery_return_does_not_block_policy_hooks(self):
-        log = []
-        trainer = FakeOuterTrainer(log)
+    def test_failed_recovery_return_blocks_hooks_and_poisons_gate(self):
+        trainer = FakeOuterTrainer([])
+        controller = _controller(trainer, BoundaryPlan())
         lend = _lend()
         lend.return_stage = 1
-        controller = _controller(trainer, BoundaryPlan())
         controller.scheduler.active_lends.append(lend)
-
-        def fail_return(lend, step, early=False):
-            log.append(("return_failed", lend.lend_id, step, early))
-            return False
-
-        controller.executor.return_ = fail_return
-        controller.run_boundary(trainer)
+        controller.executor.return_ = lambda *a, **k: False
+        with pytest.raises(RuntimeError, match="reported failure"):
+            controller.run_boundary(trainer)
+        assert not any(e[0] == "hook" for e in trainer.log)
+        with pytest.raises(RuntimeError, match="gate failed"):
+            controller.run_boundary(trainer)
         trainer.close()
-
-        assert ("return_failed", 1, 11, False) in log
-        assert not any(event[0] == "borrow" for event in log)
-        assert {event for event in log if event[0] == "hook"} == {
-            ("hook", "a"), ("hook", "b"),
-        }
-
-    def test_failed_renewal_is_safely_returned(self):
-        log = []
-        trainer = FakeOuterTrainer(log)
-        lend = _lend()
-        controller = _controller(trainer, BoundaryPlan())
-        controller.scheduler.active_lends.append(lend)
-
-        def fail_renew(active_lends, step):
-            log.append(("renew_failed", tuple(lend.lend_id for lend in active_lends), step))
-            return False
-
-        controller.executor.renew_many = fail_renew
-        controller.run_boundary(trainer)
-        trainer.close()
-
-        assert ("renew_failed", (lend.lend_id,), 11) in log
-        assert ("return", lend.lend_id, 11, True) in log
-        assert not any(event[0] == "borrow" for event in log)
 
 
 class TestImmediateRebalance:
@@ -307,7 +301,8 @@ class TestImmediateRebalance:
             trainer, BoundaryPlan(returns=[lend], borrows=[borrow]))
 
         controller.executor.return_ = lambda *args, **kwargs: False
-        controller._rebalance_now()
+        with pytest.raises(RuntimeError, match="reported failure"):
+            controller._rebalance_now()
         trainer.close()
 
         assert not any(event[0] == "borrow" for event in log)
@@ -595,6 +590,7 @@ class TestTrainerWiring:
             ),
         }
         trainer._validate_stage_resources = lambda stage: events.append(("validate_resources", stage))
+        trainer._get_stage_resource_requests = lambda stage: [("a", "standalone_rollout", 2)]
         trainer._build_dataloader = lambda: events.append(("build_dataloader",))
         trainer._build_replay_buffer = lambda: events.append(("build_replay_buffer",))
         trainer._load_checkpoint = lambda: events.append(("load_checkpoint",))
@@ -656,3 +652,35 @@ class TestTrainerWiring:
         trainer.policy_trainers = {}
         trainer.cleanup()  # must not raise
         assert trainer._dynamic_inference is None
+
+
+def test_boundary_waits_for_entire_physical_operation():
+    gate = BoundaryGate()
+    started, release, reached = threading.Event(), threading.Event(), threading.Event()
+    def operation():
+        started.set()
+        assert release.wait(2)
+    poll = threading.Thread(target=lambda: gate.run_exclusive(operation))
+    def boundary():
+        with gate.boundary():
+            reached.set()
+    main = threading.Thread(target=boundary)
+    poll.start()
+    assert started.wait(2)
+    main.start()
+    assert not reached.wait(0.05)
+    release.set()
+    poll.join(2)
+    main.join(2)
+    assert reached.is_set()
+
+
+def test_remote_timeout_poison_survives_local_return():
+    gate = BoundaryGate()
+    def operation():
+        raise TimeoutError('remote completion unknown')
+    with pytest.raises(TimeoutError):
+        gate.run_exclusive(operation)
+    with pytest.raises(RuntimeError, match='gate failed'):
+        with gate.boundary():
+            pytest.fail('must not enter weight sync')

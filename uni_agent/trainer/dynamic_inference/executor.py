@@ -1,28 +1,8 @@
-"""Physical borrow/return sequences (the executor of the RFC).
+"""Gated ownership transactions with fail-stop handling.
 
-Sequences mirror verl's own deactivation/activation order
-(``dynamic_resource_controller.py``: remove-from-LB -> abort -> sleep;
-add-to-LB last), so every swap satisfies the safety invariants:
-
-- I1 unique ownership — guests only ever appear in a throwaway
-  ``CheckpointEngineManager`` built for one directed push; they are never
-  stored in any persistent manager;
-- I2 serialization — the controller only calls these under its boundary gate,
-  which serialises them with every policy's ``update_weights``;
-- I3 one awake engine per card — borrow sleeps every home replica before
-  waking any guest; return is the exact reverse pairing;
-- I5 weights match LB membership — the directed push precedes ``add_servers``
-  (borrow), follows ``wake_up`` (early return), and refreshes in-place renewals
-  after every donor ``update_weights``;
-- I6 remove-from-LB first — both sequences' literal step order.
-
-Every stage is individually time-boxed and failure-handled: a borrow rolls
-back to the pre-borrow state, a return records its progress on the
-``LendRecord`` (``return_stage``) and resumes from there at the next complete
-metrics decision or step boundary. A same-unit donor change keeps home asleep
-and skips the otherwise redundant home wake and weight refresh. Repeated
-failures on a pair block that pair; repeated failures overall disable the
-scheduler (degrade to static).
+Successful guests belong to the donor checkpoint manager. A failed transaction
+is never silently rolled back: remote work may still be running after timeout.
+The executor retains its error and refuses all further mutations/synchronization.
 """
 
 from __future__ import annotations
@@ -31,20 +11,17 @@ import asyncio
 import logging
 import time
 
+from .replica_clone import abort_replica
 from .types import BorrowPlan, LendRecord, PolicyInferenceHandles, SchedulingConfig
 
 logger = logging.getLogger(__name__)
 
-# how many consecutive pair failures before the whole feature degrades to static
-_PAIR_FAILURE_LIMIT = 2
-
-
 class BorrowFailedError(RuntimeError):
-    """A borrow rolled back (home state restored); the pair gets blocked."""
+    """A borrow failed; remote state is uncertain and further work is forbidden."""
 
 
 class ReturnFailedError(RuntimeError):
-    """A return is half-done; it stays active for the next gated retry."""
+    """A return failed; its last completed stage is retained for diagnosis."""
 
 
 class BoundaryExecutor:
@@ -59,7 +36,8 @@ class BoundaryExecutor:
         self.handles = handles
         self.guest_engine = guest_engine
         self.scheduler = scheduler
-        self._pair_failures: dict[tuple[str, str], int] = {}
+        self.failure: BaseException | None = None
+        self.transaction: str | None = None
 
     # ================================================================ public
     def borrow(
@@ -68,13 +46,22 @@ class BoundaryExecutor:
         step: int,
         *,
         home_already_sleeping: bool = False,
-    ) -> LendRecord | None:
-        """Execute one borrow unit; returns the LendRecord (or None on rollback)."""
+    ) -> LendRecord:
+        """Commit one borrow or raise and poison the executor."""
+        self.assert_stable()
+        self.transaction = "BORROWING"
+        started = time.monotonic()
+        self._trace("borrow_start", step, lender=plan.home_policy, borrower=plan.donor)
         try:
-            return asyncio.run(self._borrow(plan, step, home_already_sleeping))
-        except BorrowFailedError as exc:
-            self._note_pair_failure(plan.home_policy, plan.donor, step, exc)
-            return None
+            result = asyncio.run(self._borrow(plan, step, home_already_sleeping))
+            self._trace("borrow_complete", step, lender=plan.home_policy, borrower=plan.donor,
+                        lend_id=result.lend_id, execution_s=time.monotonic() - started)
+            self.transaction = None
+            return result
+        except BaseException as exc:
+            self._trace("borrow_failed", step, error=str(exc), execution_s=time.monotonic() - started)
+            self.failure = exc
+            raise
 
     def return_(
         self,
@@ -84,58 +71,58 @@ class BoundaryExecutor:
         *,
         reactivate_home: bool = True,
     ) -> bool:
-        """Execute one return; True when complete, False for a later gated retry."""
+        """Commit one return or raise and poison the executor."""
+        self.assert_stable()
+        self.transaction = "RETURNING"
+        started = time.monotonic()
+        self._trace("return_start", step, lend_id=lend.lend_id, lender=lend.home_policy,
+                    borrower=lend.donor, early=early)
         try:
             asyncio.run(self._return(lend, step, early, reactivate_home))
-        except ReturnFailedError as exc:
-            self._note_pair_failure(lend.home_policy, lend.donor, step, exc)
-            return False
-        self._pair_failures.pop((lend.home_policy, lend.donor), None)
+        except BaseException as exc:
+            self._trace("return_failed", step, lend_id=lend.lend_id, error=str(exc))
+            self.failure = exc
+            raise
+        self.transaction = None
         if self.scheduler is not None:
             self.scheduler.note_lend_returned(lend, step=step, early=early)
+        self._trace("return_complete", step, lend_id=lend.lend_id, early=early,
+                    execution_s=time.monotonic() - started)
         return True
 
-    def renew(self, lend: LendRecord, step: int) -> bool:
-        """Refresh a still-routed guest with the donor's latest weights."""
-        return self.renew_many([lend], step)
+    def _trace(self, kind, step, **detail):
+        trace = getattr(self.scheduler, "trace", None)
+        if trace is not None:
+            trace.emit(self.scheduler, kind, step, **detail)
 
-    def renew_many(self, lends: list[LendRecord], step: int) -> bool:
-        """Refresh all retained lends for one donor in one process group."""
-        if not lends:
-            return True
-        donors = {lend.donor for lend in lends}
-        if len(donors) != 1:
-            raise ValueError("renew_many requires all lends to have the same donor")
-        donor = next(iter(donors))
-        guests = [guest for lend in lends for guest in lend.guests]
-        try:
-            asyncio.run(self._directed_push(
-                donor,
-                guests,
-                step,
-                timeout=self.config.weight_sync_timeout_s,
-            ))
-        except Exception as exc:
-            # A batch is one physical push attempt. Count it once per affected
-            # direction, even when that direction currently owns several lend
-            # units; otherwise one outage can immediately trip the consecutive
-            # failure limit merely because the allocation is larger.
-            failed_pairs = {
-                (lend.home_policy, lend.donor)
-                for lend in lends
-            }
-            for home, failed_donor in failed_pairs:
-                self._note_pair_failure(home, failed_donor, step, exc)
-            logger.warning(
-                "dynamic_inference: renewal batch for donor %s failed at step %d: %s",
-                donor, step, exc,
-            )
-            return False
-        for lend in lends:
-            self._pair_failures.pop((lend.home_policy, lend.donor), None)
-            if self.scheduler is not None:
-                self.scheduler.note_lend_renewed(lend, step)
-        return True
+    def assert_stable(self) -> None:
+        if self.failure is not None:
+            raise RuntimeError("Topology transaction failed; restart required") from self.failure
+        if self.transaction is not None:
+            raise RuntimeError(f"Unfinished topology transaction: {self.transaction}")
+
+    def validate_membership(self) -> None:
+        self.assert_stable()
+        expected = {p: list(h.replicas) for p, h in self.handles.items()}
+        for lend in self.scheduler.active_lends:
+            if lend.return_stage:
+                raise RuntimeError(f"Unfinished return {lend.lend_id}: stage {lend.return_stage}")
+            expected[lend.home_policy] = [r for r in expected[lend.home_policy]
+                                           if r not in lend.home_replicas]
+            expected[lend.donor].extend(lend.guests)
+        seen = set()
+        for policy, handle in self.handles.items():
+            actual = handle.standalone_checkpoint_manager.replicas
+            ids = [id(r) for r in actual]
+            if len(ids) != len(set(ids)) or seen.intersection(ids):
+                raise RuntimeError(f"Duplicate checkpoint ownership: {policy}")
+            if set(ids) != {id(r) for r in expected[policy]}:
+                raise RuntimeError(f"Checkpoint ownership mismatch: {policy}")
+            seen.update(ids)
+
+    @staticmethod
+    def _add_replicas(manager, replicas):
+        manager.add_replicas([r for r in replicas if r not in manager.replicas])
 
     # ================================================================ borrow
     async def _borrow(
@@ -152,16 +139,19 @@ class BoundaryExecutor:
         stage = 4 if home_already_sleeping else 0
         try:
             if not home_already_sleeping:
+                if not any(r not in unit and r in home_h.replicas
+                           for r in home_h.standalone_checkpoint_manager.replicas):
+                    raise RuntimeError("Cannot lend the last published seed replica")
                 # 1. home LB: remove routing FIRST so retries land on remaining
                 #    home replicas (I6)
                 home_servers = {r.server_address: r.server_handle for r in unit}
                 # Mark before the remote call: it may mutate the LB and then raise.
-                # Re-adding the same address mapping during rollback is idempotent.
+                # A failure here is terminal because remote completion is uncertain.
                 stage = 1
                 await self._ray(home_h.lb_handle.remove_servers.remote(list(home_servers)))
                 # 2. abort in-flight (clients transparently retry elsewhere)
                 await asyncio.wait_for(
-                    asyncio.gather(*[r.abort_all_requests() for r in unit]), timeout)
+                    asyncio.gather(*[abort_replica(r) for r in unit]), timeout)
                 stage = 2
                 # 3. home scm: stop covering these replicas in the policy's own
                 #    update_weights (I1)
@@ -169,42 +159,37 @@ class BoundaryExecutor:
                 stage = 3
                 # 4. home engines sleep (level-2 after the worker patch)
                 t0 = time.perf_counter()
-                # A gather can fail after only part of the unit slept. Rollback must
-                # wake every home replica in that case.
+                # A partial sleep failure leaves uncertain remote state and
+                # therefore stops the transaction without waking another engine.
                 stage = 4
                 await asyncio.wait_for(asyncio.gather(*[r.sleep() for r in unit]), timeout)
                 logger.info("dynamic_inference: %s sleep in %.2fs", plan.home_policy, time.perf_counter() - t0)
             # 5. wake the pre-created guests (I3: home is fully asleep first)
             guests = await self.guest_engine.guests_for(plan.home_policy, plan.donor, unit)
             t0 = time.perf_counter()
-            # guests_for marks the unit in-use. Even a partial wake failure must
-            # sleep all guests and release that reservation.
+            # guests_for reserves the unit. Retain that reservation on failure;
+            # a timed-out wake can still be running remotely.
             stage = 5
             await asyncio.wait_for(asyncio.gather(*[g.wake_up() for g in guests]), timeout)
             logger.info("dynamic_inference: %s guest wake in %.2fs", plan.donor, time.perf_counter() - t0)
-            # 6. one directed weight push: donor weights -> guests (guests never
-            #    enter the donor's persistent scm)
+            # 6. Clone the target policy published vLLM version, without actor access.
             t0 = time.perf_counter()
-            await self._directed_push(
+            await self._clone_weights(
                 plan.donor, guests, step,
                 timeout=self.config.weight_sync_timeout_s,
             )
-            logger.info("dynamic_inference: %s directed push in %.2fs", plan.donor, time.perf_counter() - t0)
+            logger.info("dynamic_inference: %s vLLM clone in %.2fs", plan.donor, time.perf_counter() - t0)
             stage = 6
+            self._add_replicas(donor_h.standalone_checkpoint_manager, guests)
             # 7. donor LB: route to the guests (least-loaded sends them traffic
             #    naturally; I5 — weights are already correct)
             await self._ray(donor_h.lb_handle.add_servers.remote(
                 {g.server_address: g.server_handle for g in guests}))
         except Exception as exc:
-            await self._rollback_borrow(
-                plan, unit, guests, stage, timeout, step,
-                refresh_home=home_already_sleeping,
-            )
             raise BorrowFailedError(
-                f"borrow {plan.home_policy}->{plan.donor} failed at stage {stage}: {exc}") from exc
+                f"borrow {plan.home_policy}->{plan.donor} failed at stage {stage}: {type(exc).__name__}: {exc!r}") from exc
 
         # ---- success bookkeeping ----
-        self._pair_failures.pop((plan.home_policy, plan.donor), None)
         lend = LendRecord(
             lend_id=self.scheduler.next_lend_id() if self.scheduler else 0,
             home_policy=plan.home_policy, donor=plan.donor,
@@ -215,73 +200,6 @@ class BoundaryExecutor:
         logger.info("dynamic_inference: borrow %s -> %s at step %d",
                     plan.home_policy, plan.donor, step)
         return lend
-
-    async def _rollback_borrow(
-        self,
-        plan,
-        unit,
-        guests,
-        stage,
-        timeout,
-        step,
-        *,
-        refresh_home: bool = False,
-    ) -> None:
-        """Best-effort restore of the pre-borrow state; never raises."""
-        home_h = self.handles[plan.home_policy]
-        donor_h = self.handles[plan.donor]
-        home_servers = {r.server_address: r.server_handle for r in unit}
-        errors = []
-
-        if stage >= 5:
-            # add_servers may have failed after a partial LB mutation. Removing
-            # all guest addresses is idempotent and prevents stale routes.
-            try:
-                await self._ray(donor_h.lb_handle.remove_servers.remote(
-                    [g.server_address for g in guests]))
-            except Exception as exc:
-                errors.append(("donor LB remove", exc))
-            try:
-                await asyncio.wait_for(asyncio.gather(*[g.sleep() for g in guests]), timeout)
-            except Exception as exc:
-                errors.append(("guest sleep", exc))
-            finally:
-                self.guest_engine.release(plan.home_policy, plan.donor, unit)
-        if stage >= 4:
-            try:
-                await asyncio.wait_for(asyncio.gather(*[r.wake_up() for r in unit]), timeout)
-            except Exception as exc:
-                errors.append(("home wake", exc))
-            if refresh_home:
-                try:
-                    await self._directed_push(
-                        plan.home_policy, unit, step,
-                        timeout=self.config.weight_sync_timeout_s,
-                    )
-                except Exception as exc:
-                    errors.append(("home weight refresh", exc))
-        if stage >= 3:
-            try:
-                home_h.standalone_checkpoint_manager.add_replicas(unit)
-            except Exception as exc:
-                errors.append(("home SCM add", exc))
-        if stage >= 1:
-            try:
-                await self._ray(home_h.lb_handle.add_servers.remote(home_servers))
-            except Exception as exc:
-                errors.append(("home LB add", exc))
-
-        if errors:
-            # rollback itself failed — the cluster state is inconsistent; block
-            # the pair permanently and let the controller degrade to static
-            logger.error(
-                "dynamic_inference: ROLLBACK FAILED for %s->%s (stage %d): %s — "
-                "disabling dynamic inference",
-                plan.home_policy, plan.donor, stage,
-                "; ".join(f"{label}: {exc}" for label, exc in errors),
-            )
-            if self.scheduler is not None:
-                self.scheduler.note_disabled_by_failures()
 
     # ================================================================ return
     async def _return(
@@ -305,9 +223,10 @@ class BoundaryExecutor:
                 lend.return_stage = 1
             if lend.return_stage < 2:
                 await asyncio.wait_for(
-                    asyncio.gather(*[g.abort_all_requests() for g in guests]), timeout)
+                    asyncio.gather(*[abort_replica(g) for g in guests]), timeout)
                 lend.return_stage = 2
             if lend.return_stage < 3:
+                donor_h.standalone_checkpoint_manager.remove_replicas(guests)
                 # 3. guests sleep — NO weight write-back (the home replicas'
                 #    weights are authoritative; the donor's trainer state moves on)
                 t0 = time.perf_counter()
@@ -331,27 +250,27 @@ class BoundaryExecutor:
                 #    happen before the regular update_weights, so omitting this
                 #    push would expose stale home weights until that hook ends.
                 t0 = time.perf_counter()
-                await self._directed_push(
+                await self._clone_weights(
                     lend.home_policy, unit, step,
                     timeout=self.config.weight_sync_timeout_s,
                 )
-                logger.info("dynamic_inference: %s return push in %.2fs",
+                logger.info("dynamic_inference: %s return vLLM clone in %.2fs",
                             lend.home_policy, time.perf_counter() - t0)
                 lend.return_stage = 5
             if lend.return_stage < 6:
                 # 6. Re-attach to the persistent home weight manager.
-                home_h.standalone_checkpoint_manager.add_replicas(unit)
+                self._add_replicas(home_h.standalone_checkpoint_manager, unit)
                 lend.return_stage = 6
             if lend.return_stage < 7:
                 # 7. Route only after current home weights are present. Keeping
-                #    SCM and LB as separate resumable stages avoids duplicate
-                #    SCM entries when add_servers fails and is retried.
+                #    SCM and LB stages separate identifies which side completed
+                #    if the remote routing change fails.
                 await self._ray(home_h.lb_handle.add_servers.remote(home_servers))
                 lend.return_stage = 7
         except Exception as exc:
             raise ReturnFailedError(
                 f"return {lend.home_policy}->{lend.donor} failed at stage "
-                f"{lend.return_stage}: {exc}") from exc
+                f"{lend.return_stage}: {type(exc).__name__}: {exc!r}") from exc
         self.guest_engine.release(lend.home_policy, lend.donor, unit)
         logger.info(
             "dynamic_inference: return %s -> %s at step %d%s",
@@ -359,23 +278,23 @@ class BoundaryExecutor:
         )
 
     # ================================================================ push
-    async def _directed_push(self, policy: str, replicas, step: int, timeout: float) -> None:
-        """One-shot weight push from ``policy``'s actor group to ``replicas``.
-
-        Builds a throwaway ``CheckpointEngineManager`` around the policy's
-        actor_wg and just the target replicas — the manager rebuilds its
-        temporary worker group/process group on every ``update_weights``
-        call, so nothing needs cleaning up afterwards (I1).
-        """
-        from verl.checkpoint_engine.base import CheckpointEngineManager
-
-        handle = self.handles[policy]
-        manager = CheckpointEngineManager(
-            config=handle.standalone_checkpoint_manager.config,
-            actor_wg=handle.actor_rollout_wg,
-            replicas=list(replicas),
-        )
-        await asyncio.wait_for(manager.update_weights(step), timeout)
+    async def _clone_weights(self, policy: str, replicas, step: int, timeout: float) -> None:
+        """Initialize from a published vLLM; caller holds topology/publish gate."""
+        from .replica_clone import clone_replica
+        manager = self.handles[policy].standalone_checkpoint_manager
+        version = getattr(manager, "_dynamic_published_version", None)
+        sources = [r for r in manager.replicas if r not in replicas
+                   and getattr(r, "_dynamic_weight_version", None) == version]
+        if version is None or not sources:
+            raise RuntimeError(f"No verified published vLLM seed for {policy}")
+        for target in replicas:
+            target_host = target.server_address.rsplit(':', 1)[0]
+            source = min(sources, key=lambda r: (
+                r.server_address.rsplit(':', 1)[0] != target_host, r.server_address))
+            result = await asyncio.wait_for(clone_replica(
+                source, target, policy=policy, version=version, timeout=timeout,
+                bucket_bytes=self.config.clone_bucket_megabytes << 20), timeout)
+            self._trace("replica_clone", step, **result)
 
     # ================================================================ helpers
     async def _ray(self, obj_ref) -> None:
@@ -385,24 +304,7 @@ class BoundaryExecutor:
         unit tests, or a future-like with ``result()``) is also accepted.
         """
         if hasattr(obj_ref, "__await__"):
-            await obj_ref
+            await asyncio.wait_for(obj_ref, self.config.borrow_drain_timeout_s)
         elif hasattr(obj_ref, "result"):
             obj_ref.result()
         # else: already a resolved value (test fakes) — nothing to wait on
-
-    def _note_pair_failure(self, home: str, donor: str, step: int, exc: Exception) -> None:
-        key = (home, donor)
-        self._pair_failures[key] = self._pair_failures.get(key, 0) + 1
-        count = self._pair_failures[key]
-        if self.scheduler is not None:
-            # block the direction for a while after a physical failure
-            self.scheduler.pair_block_until[key] = step + 10
-            if count >= _PAIR_FAILURE_LIMIT:
-                logger.error(
-                    "dynamic_inference: %d consecutive failures on pair %s->%s — "
-                    "degrading to static scheduling",
-                    count, home, donor,
-                )
-                self.scheduler.note_disabled_by_failures()
-        logger.warning("dynamic_inference: pair %s->%s failure #%d at step %d: %s",
-                       home, donor, count, step, exc)

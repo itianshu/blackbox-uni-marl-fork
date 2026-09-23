@@ -413,6 +413,11 @@ def apply_patch() -> None:
     from verl.single_controller.ray.base import RayResourcePool
     from verl.single_controller.ray.base import ResourcePoolManager
 
+    if os.environ.get("UNI_AGENT_MASTER_PORT_RANGE"):
+        from verl.single_controller.ray.base import RayWorkerGroup
+        from examples.multi_agent_blackbox import port_allocator
+        port_allocator.install(RayWorkerGroup)
+
     try:
         from verl.trainer.ppo.v1.trainer_base import PPOTrainer
     except Exception as exc:  # optional heavy deps (megatron/flashinfer) unavailable
@@ -506,6 +511,10 @@ def restore() -> None:
         from verl.single_controller.ray.base import ResourcePoolManager
 
         RayResourcePool.__init__ = _ORIG_INIT
+        from examples.multi_agent_blackbox import port_allocator
+        if port_allocator.is_installed():
+            from verl.single_controller.ray.base import RayWorkerGroup
+            port_allocator.restore(RayWorkerGroup)
         ResourcePoolManager.create_resource_pool = _ORIG_CREATE
         _ORIG_INIT = None
         _ORIG_CREATE = None

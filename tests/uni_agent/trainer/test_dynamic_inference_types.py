@@ -25,6 +25,13 @@ def _cfg(**overrides):
 
 
 class TestParseSchedulingConfig:
+    @pytest.mark.parametrize("value", [0, -1, 1.5, True])
+    def test_pair_cap_rejects_non_positive_or_non_integer_values(self, value):
+        with pytest.raises(ValueError, match="max_units"):
+            parse_scheduling_config(_cfg(borrowing={"pairs": [
+                {"home": "a", "donor": "b", "max_units": value},
+            ]}))
+
     def test_absent_or_disabled_returns_none(self):
         assert parse_scheduling_config(None) is None
         assert parse_scheduling_config({}) is None
@@ -33,13 +40,19 @@ class TestParseSchedulingConfig:
     def test_defaults(self):
         cfg = parse_scheduling_config(_cfg())
         assert isinstance(cfg, SchedulingConfig)
+        assert cfg.resource_usage.queue_signal_enabled is True
         assert cfg.resource_usage.kv_enter == 0.85
         assert cfg.resource_usage.kv_exit == 0.6
         assert cfg.resource_usage.kv_post_lend_max == 0.7
+        assert cfg.resource_usage.waiting_enter_per_replica == 8.0
+        assert cfg.resource_usage.waiting_exit_per_replica == 1.0
+        assert cfg.resource_usage.queue_time_enter_s == 2.0
+        assert cfg.resource_usage.queue_time_exit_s == 0.5
         assert cfg.resource_usage.kv_metric_names == [
             "kv_cache_usage_perc", "gpu_cache_usage_perc", "kv_cache_usage_ratio"]
         assert cfg.resource_usage.ema_alpha == 0.3
         assert cfg.metrics_scrape_interval_s == 1.0
+        assert cfg.poll_interval_s == cfg.metrics_scrape_interval_s
         assert cfg.bottleneck_confirm_polls == 10
         assert cfg.rebalance_confirm_polls == 2
         assert cfg.rebalance_settle_polls == 3
@@ -55,6 +68,12 @@ class TestParseSchedulingConfig:
         from_dict = parse_scheduling_config({"enable": True, "bottleneck_confirm_polls": 3})
         from_oc = parse_scheduling_config(_cfg(bottleneck_confirm_polls=3))
         assert from_dict.bottleneck_confirm_polls == from_oc.bottleneck_confirm_polls == 3
+
+    def test_lb_poll_interval_is_normalized_to_metrics_interval(self):
+        cfg = parse_scheduling_config(_cfg(
+            poll_interval_s=0.1, metrics_scrape_interval_s=0.75,
+        ))
+        assert cfg.poll_interval_s == cfg.metrics_scrape_interval_s == 0.75
 
     @pytest.mark.parametrize(
         "removed",
@@ -185,6 +204,9 @@ class TestParseSchedulingConfig:
             {"ema_alpha": 0.0},
             {"kv_enter": "0.9"},
             {"kv_metric_names": []},
+            {"waiting_exit_per_replica": 8, "waiting_enter_per_replica": 8},
+            {"queue_time_exit_s": 2, "queue_time_enter_s": 1},
+            {"queue_signal_enabled": "false"},
         ],
     )
     def test_invalid_resource_thresholds_rejected(self, resource_usage):

@@ -1,0 +1,72 @@
+# @package _global_
+# Raise actual concurrent token demand; reserve memory for weight transfer.
+defaults:
+- multi_agent_blackbox_borrow_verify
+- _self_
+data:
+  train_batch_size: 256
+actor_rollout_ref:
+  rollout:
+    custom:
+      agent_framework:
+        max_concurrent_rollouts: 1024
+        completion_timeout_seconds: 10800
+        multi_agent_runner_kwargs:
+          request_timeout_seconds: 7200
+          execution:
+            ray:
+              scheduling_strategy: SPREAD
+policies:
+  policy_1:
+    ppo_trainer_overrides:
+      actor_rollout_ref:
+        rollout:
+          prompt_length: 12288
+          response_length: 10240
+          max_model_len: 24576
+          max_num_seqs: 256
+          max_num_batched_tokens: 4096
+          gpu_memory_utilization: 0.5
+          checkpoint_engine:
+            update_weights_bucket_megabytes: 128
+  policy_2:
+    ppo_trainer_overrides:
+      actor_rollout_ref:
+        rollout:
+          prompt_length: 12288
+          response_length: 10240
+          max_model_len: 24576
+          max_num_seqs: 256
+          max_num_batched_tokens: 4096
+          gpu_memory_utilization: 0.5
+          checkpoint_engine:
+            update_weights_bucket_megabytes: 128
+  policy_3:
+    ppo_trainer_overrides:
+      actor_rollout_ref:
+        rollout:
+          max_num_seqs: 160
+          max_num_batched_tokens: 4096
+          gpu_memory_utilization: 0.5
+          checkpoint_engine:
+            update_weights_bucket_megabytes: 128
+dynamic_inference_scheduling:
+  resource_usage:
+    kv_enter: 0.55
+    kv_exit: 0.30
+    kv_post_lend_max: 0.40
+    # Recorded for observation only in this KV-only experiment.
+    waiting_enter_per_replica: 16
+    waiting_exit_per_replica: 2
+    queue_time_enter_s: 5.0
+    queue_time_exit_s: 1.0
+    ema_alpha: 0.3
+  bottleneck_confirm_polls: 10
+  rebalance_confirm_polls: 5
+  rebalance_settle_polls: 10
+  min_lend_polls: 120
+  # One unit per event, with enough separation to observe the previous move.
+  borrow_cooldown_s: 30.0
+  return_confirm_polls: 40
+  early_return_confirm_polls: 30
+  trace_interval_s: 2.0

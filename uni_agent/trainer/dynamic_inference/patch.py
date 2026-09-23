@@ -27,8 +27,8 @@ watcher installed by Ray's ``worker_process_setup_hook``):
 3. **Topology-aware NCCL checkpoint groups (worker side)** — verl normally
    keeps checkpoint collectives alive between updates. Dynamic borrowing
    changes the rollout worker set, so surviving workers can receive a new rank
-   or world size. The patch destroys and recreates a group only when that
-   topology actually changes; unchanged updates retain verl's fast path.
+   or world size. Each update uses a fresh shared group identity and bounded
+   waits; all participants must enable rebuild_group.
 
 Patch #1 runs in every Ray worker process via
 ``worker_process_setup_hook: uni_agent.trainer.dynamic_inference.patch.apply_worker_patch``
@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 _WORKER_HOOK_CHAIN = ["examples.multi_agent_blackbox.verl_patch.apply_worker_patch"]
 
 _ORIG_INIT_STANDALONE = None      # RolloutReplica.init_standalone at apply time
+_ORIG_SERVER_RUN = None
+_ORIG_SERVER_WORKER_EXTENSION = None
 _ORIG_SERVER_SLEEP = None         # vLLMHttpServer.sleep at patch time
 _ORIG_SERVER_WAKE_UP = None       # vLLMHttpServer.wake_up at patch time
 _ORIG_SERVER_IS_SLEEPING = None   # optional probe method at patch time
@@ -61,6 +63,7 @@ _ORIG_NCCL_INIT_PROCESS_GROUP = None
 _PATCHED_NCCL_CLASS = None
 _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP = None
 _CHECKPOINT_MANAGER_PATCHED = False
+_ORIG_CHECKPOINT_UPDATE_WEIGHTS = None
 _CHECKPOINT_GROUP_EPOCH = itertools.count()
 _PATCHED = False                  # driver-side external-pool patch (#2)
 _WORKER_PATCHED = False           # worker-side watcher armed (#1)
@@ -126,8 +129,43 @@ async def _dynamic_inference_is_sleeping(self):
     return bool(await checker())
 
 
+async def _dynamic_inference_clone_rpc(self, operation, payload, timeout):
+    if self.node_rank != 0:
+        raise RuntimeError("Clone RPC must be sent to the replica coordinator")
+    return await self.engine.collective_rpc(
+        method="dynamic_inference_clone_worker", timeout=timeout, args=(operation, payload))
+
+
+async def _server_run_with_port_lease(self, *args, **kwargs):
+    from .port_lease import lease_port_block
+    if "VLLM_PORT" not in os.environ:
+        base, handle = lease_port_block()
+        self._dynamic_vllm_port_lease = handle
+        os.environ["VLLM_PORT"] = str(base)
+        logger.warning("VLLM_PORT_LEASE pid=%s start=%s", os.getpid(), base)
+    return await _ORIG_SERVER_RUN(self, *args, **kwargs)
+
+
+def _clone_worker_extension(self):
+    original = _ORIG_SERVER_WORKER_EXTENSION
+    original_fqn = original(self) if callable(original) else None
+    supported = {
+        None,
+        "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension",
+        "uni_agent.trainer.dynamic_inference.vllm_worker_extension.CloneWorkerExtension",
+    }
+    if original_fqn not in supported:
+        raise RuntimeError(
+            "Dynamic inference clone support cannot replace the configured "
+            f"vLLM worker extension {original_fqn!r}. Disable dynamic inference "
+            "or make the custom extension inherit CloneWorkerExtension."
+        )
+    return "uni_agent.trainer.dynamic_inference.vllm_worker_extension.CloneWorkerExtension"
+
+
 def _patch_server_sleep_wake_in_module(module) -> None:
     """Wrap vLLMHttpServer.sleep/wake_up in this process (idempotent)."""
+    global _ORIG_SERVER_RUN, _ORIG_SERVER_WORKER_EXTENSION
     global _ORIG_SERVER_SLEEP, _ORIG_SERVER_WAKE_UP, _ORIG_SERVER_IS_SLEEPING
     global _PATCHED_SERVER_CLASS, _SERVER_PATCHED
     if _SERVER_PATCHED:
@@ -135,6 +173,11 @@ def _patch_server_sleep_wake_in_module(module) -> None:
     server_cls = getattr(module, "vLLMHttpServer", None)
     if server_cls is None:
         return
+    _ORIG_SERVER_RUN = getattr(server_cls, "run_server", None)
+    if _ORIG_SERVER_RUN is not None:
+        server_cls.run_server = _server_run_with_port_lease
+    _ORIG_SERVER_WORKER_EXTENSION = getattr(server_cls, "_get_worker_extension_cls", None)
+    server_cls._get_worker_extension_cls = _clone_worker_extension
     _ORIG_SERVER_SLEEP = server_cls.sleep
     _ORIG_SERVER_WAKE_UP = server_cls.wake_up
     _ORIG_SERVER_IS_SLEEPING = getattr(server_cls, "dynamic_inference_is_sleeping", None)
@@ -142,6 +185,7 @@ def _patch_server_sleep_wake_in_module(module) -> None:
     server_cls.sleep = _patched_server_sleep
     server_cls.wake_up = _patched_server_wake_up
     server_cls.dynamic_inference_is_sleeping = _dynamic_inference_is_sleeping
+    server_cls.dynamic_inference_clone_rpc = _dynamic_inference_clone_rpc
     _SERVER_PATCHED = True
     logger.info(
         "dynamic_inference.patch: standalone level-2 sleep/wake enabled on vLLMHttpServer"
@@ -168,37 +212,124 @@ def _patched_nccl_init_process_group(self, rank, world_size, master_metadata):
 
 
 def _patched_checkpoint_build_process_group(self, rollout):
-    """Give every elastic NCCL sync a fresh group shared by all participants."""
+    """Bounded prepare/init with a fresh shared identity for each sync."""
     if getattr(self, "backend", None) != "nccl":
         return _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP(self, rollout)
-
     import ray
-
-    try:
-        backend_cfg = self.config.engine_kwargs.get("nccl", {})
-        base_name = backend_cfg.get("group_name", "default")
-    except Exception:
-        base_name = "default"
+    timeout = float(getattr(self, "_dynamic_sync_timeout_s", 300.0))
+    deadline = getattr(self, "_dynamic_sync_deadline", time.monotonic() + timeout)
+    def get(refs):
+        return ray.get(refs, timeout=max(0.001, deadline - time.monotonic()))
+    nccl_config = self.config.engine_kwargs.get("nccl", {})
+    if not nccl_config.get("rebuild_group", False):
+        raise ValueError("Dynamic checkpoint membership requires nccl.rebuild_group=true")
+    base_name = nccl_config.get("group_name", "default")
     group_name = f"{base_name}__dynamic_epoch_{next(_CHECKPOINT_GROUP_EPOCH)}"
-    actor_wg = self.actor_wg
-    refs = actor_wg.execute_checkpoint_engine(
-        ["dynamic_inference_set_group_name"] * actor_wg.world_size,
-        group_name=[group_name] * actor_wg.world_size,
-    )
-    refs += rollout.execute_checkpoint_engine(
+    actor = self.actor_wg
+    get(actor.execute_checkpoint_engine(
+        ["dynamic_inference_set_group_name"] * actor.world_size,
+        group_name=[group_name] * actor.world_size,
+    ) + rollout.execute_checkpoint_engine(
         ["dynamic_inference_set_group_name"] * rollout.world_size,
         group_name=[group_name] * rollout.world_size,
-    )
-    ray.get(refs)
-    logger.info(
-        "dynamic_inference.patch: checkpoint sync uses fresh group %s (%d rollout workers)",
-        group_name, rollout.world_size,
-    )
-    return _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP(self, rollout)
+    ))
+    metadata = get(actor.execute_checkpoint_engine(["prepare"] * actor.world_size)
+                   + rollout.execute_checkpoint_engine(["prepare"] * rollout.world_size))
+    actor_args, rollout_args = self.backend_cls.build_topology(
+        actor.world_size, rollout.world_size, metadata)
+    actor_args["method"] = ["init_process_group"] * actor.world_size
+    rollout_args["method"] = ["init_process_group"] * rollout.world_size
+    get(actor.execute_checkpoint_engine(**actor_args)
+        + rollout.execute_checkpoint_engine(**rollout_args))
+    logger.warning("CHECKPOINT_GROUP_READY group=%s actor_workers=%d rollout_workers=%d",
+                   group_name, actor.world_size, rollout.world_size)
+
+
+def _mark_published(self, recipients, global_steps):
+    sequence = getattr(self, "_dynamic_publish_sequence", 0) + 1
+    version = (global_steps, sequence)
+    for replica in recipients:
+        replica._dynamic_weight_version = version
+    self._dynamic_publish_sequence = sequence
+    self._dynamic_published_version = version
+
+
+async def _patched_checkpoint_update_weights(self, global_steps=None):
+    """One bounded update over current membership; failures never resume service.
+
+    Timeout does not imply remote cancellation. Callers must stop on failure;
+    this implementation deliberately does not finalize or resume uncertain work.
+    """
+    if self.backend != "nccl":
+        recipients = tuple(self.replicas)
+        result = await _ORIG_CHECKPOINT_UPDATE_WEIGHTS(self, global_steps)
+        if tuple(self.replicas) != recipients:
+            raise RuntimeError("Checkpoint membership changed during publication")
+        _mark_published(self, recipients, global_steps)
+        return result
+    import asyncio
+    import ray
+    from verl.checkpoint_engine import base
+    timeout = float(getattr(self, "_dynamic_sync_timeout_s", 300.0))
+    deadline = time.monotonic() + timeout
+    self._dynamic_sync_deadline = deadline
+    started = time.monotonic()
+    stage = "abort"
+    recipients = tuple(self.replicas)
+    addresses = [r.server_address for r in recipients]
+    async def each(method):
+        if tuple(self.replicas) != recipients:
+            raise RuntimeError("Checkpoint membership changed during publication")
+        results = await asyncio.gather(*(getattr(r, method)() for r in recipients))
+        if method == "abort_all_requests":
+            from .replica_clone import check_abort_result
+            for result in results:
+                check_abort_result(result)
+    logger.warning("CHECKPOINT_SYNC_START step=%s targets=%s", global_steps, addresses)
+    async def wait(awaitable):
+        return await asyncio.wait_for(awaitable, max(0.001, deadline - time.monotonic()))
+    async def refs(values):
+        return await asyncio.gather(*values)
+    try:
+        await wait(each("abort_all_requests"))
+        workers = [w for replica in recipients for w in replica.workers]
+        if not workers:
+            raise RuntimeError("Empty checkpoint receiver set")
+        rollout = base.RayWorkerGroup(worker_handles=workers,
+            ray_cls_with_init=base.RayClassWithInitArgs(cls=base._worker_cls))
+        stage = "release_kv"
+        await wait(each("release_kv_cache"))
+        stage = "build_group"
+        # ray.get in build_group has its own deadline, even if the event loop is blocked.
+        self.build_process_group(rollout)
+        stage = "transfer"
+        results = await wait(refs(
+            self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend)
+            + rollout.update_weights(global_steps=global_steps)))
+        stage = "finalize"
+        await wait(refs(self.actor_wg.execute_checkpoint_engine(
+            ["finalize"] * self.actor_wg.world_size)
+            + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)))
+        stage = "resume_kv"
+        await wait(each("resume_kv_cache"))
+        stage = "resume_generation"
+        await wait(each("resume_generation"))
+    except BaseException as exc:
+        logger.exception("CHECKPOINT_SYNC_FAILED step=%s stage=%s targets=%s error=%r",
+                         global_steps, stage, addresses, exc)
+        raise
+    _mark_published(self, recipients, global_steps)
+    logger.warning("CHECKPOINT_SYNC_COMPLETE step=%s targets=%s elapsed_s=%.3f",
+                   global_steps, addresses, time.monotonic() - started)
+    metrics = {}
+    for result in results[:self.actor_wg.world_size]:
+        if isinstance(result, dict):
+            metrics.update(result)
+    return metrics
 
 
 def _patch_nccl_checkpoint_in_module(module) -> None:
-    """Install topology-aware NCCL checkpoint group reuse (idempotent)."""
+    """Install fresh-group NCCL checkpoint support (idempotent)."""
     global _ORIG_NCCL_INIT_PROCESS_GROUP, _PATCHED_NCCL_CLASS, _NCCL_PATCHED
     if _NCCL_PATCHED:
         return
@@ -429,7 +560,7 @@ def apply_patch() -> None:
     policy-suffixed wrapper.
     """
     global _PATCHED, _ORIG_INIT_STANDALONE
-    global _CHECKPOINT_MANAGER_PATCHED, _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP
+    global _CHECKPOINT_MANAGER_PATCHED, _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP, _ORIG_CHECKPOINT_UPDATE_WEIGHTS
     if _PATCHED:
         return
 
@@ -442,6 +573,9 @@ def apply_patch() -> None:
 
     _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP = CheckpointEngineManager.build_process_group
     CheckpointEngineManager.build_process_group = _patched_checkpoint_build_process_group
+    from verl.checkpoint_engine.base import auto_await
+    _ORIG_CHECKPOINT_UPDATE_WEIGHTS = CheckpointEngineManager.update_weights
+    CheckpointEngineManager.update_weights = auto_await(_patched_checkpoint_update_weights)
     _CHECKPOINT_MANAGER_PATCHED = True
 
     # Arm the sleep/wake watcher here as well (harmless in the driver; useful
@@ -455,9 +589,10 @@ def apply_patch() -> None:
 def restore() -> None:
     """Restore verl's original methods (idempotent)."""
     global _PATCHED, _ORIG_INIT_STANDALONE, _SERVER_PATCHED, _ORIG_SERVER_SLEEP, _ORIG_SERVER_WAKE_UP
+    global _ORIG_SERVER_RUN, _ORIG_SERVER_WORKER_EXTENSION
     global _ORIG_SERVER_IS_SLEEPING, _PATCHED_SERVER_CLASS
     global _NCCL_PATCHED, _ORIG_NCCL_INIT_PROCESS_GROUP, _PATCHED_NCCL_CLASS
-    global _CHECKPOINT_MANAGER_PATCHED, _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP
+    global _CHECKPOINT_MANAGER_PATCHED, _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP, _ORIG_CHECKPOINT_UPDATE_WEIGHTS
     global _WORKER_PATCHED, _WORKER_PATCH_GENERATION
     _WORKER_PATCH_GENERATION += 1
     _WORKER_PATCHED = False
@@ -472,6 +607,7 @@ def restore() -> None:
             from verl.checkpoint_engine.base import CheckpointEngineManager
 
             CheckpointEngineManager.build_process_group = _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP
+            CheckpointEngineManager.update_weights = _ORIG_CHECKPOINT_UPDATE_WEIGHTS
         except Exception:
             pass
         _ORIG_CHECKPOINT_BUILD_PROCESS_GROUP = None
@@ -481,8 +617,15 @@ def restore() -> None:
         # never call restore; the driver's in-process wrap is unwound here).
         try:
             server_cls = _PATCHED_SERVER_CLASS
+            if _ORIG_SERVER_RUN is not None:
+                server_cls.run_server = _ORIG_SERVER_RUN
+            if _ORIG_SERVER_WORKER_EXTENSION is not None:
+                server_cls._get_worker_extension_cls = _ORIG_SERVER_WORKER_EXTENSION
+            else:
+                delattr(server_cls, "_get_worker_extension_cls")
             server_cls.sleep = _ORIG_SERVER_SLEEP
             server_cls.wake_up = _ORIG_SERVER_WAKE_UP
+            delattr(server_cls, "dynamic_inference_clone_rpc")
             if _ORIG_SERVER_IS_SLEEPING is None:
                 delattr(server_cls, "dynamic_inference_is_sleeping")
             else:

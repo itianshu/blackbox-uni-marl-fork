@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib
 import sys
 import types
+import pytest
 from contextlib import nullcontext
+from pathlib import Path
 
 
 class ConfigNode(dict):
@@ -87,6 +89,8 @@ class FakeOmegaConf:
 
 
 def _install_entry_stubs(monkeypatch):
+    monkeypatch.setitem(sys.modules, "uni_agent.trainer.multi_agents_ppo_trainer",
+                        types.SimpleNamespace(MultiAgentsPPOTrainer=object))
     fake_ray = FakeRay()
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setitem(
@@ -130,6 +134,7 @@ def _install_entry_stubs(monkeypatch):
 
 
 def test_run_multi_agents_ppo_initializes_ray_and_runs_remote_task(monkeypatch):
+    monkeypatch.delenv("PYTHONPATH", raising=False)
     module, fake_ray = _install_entry_stubs(monkeypatch)
     assert not hasattr(module, "_enable_transfer_queue")
     assert not hasattr(module, "_merge_ray_runtime_env")
@@ -183,6 +188,7 @@ def test_run_multi_agents_ppo_initializes_ray_and_runs_remote_task(monkeypatch):
                     "BASE_ENV": "1",
                     "EXISTING_ENV": "1",
                     "TRANSFER_QUEUE_ENABLE": "1",
+                    "PYTHONPATH": str(Path(module.__file__).resolve().parents[2]),
                 },
                 "worker_process_setup_hook": (
                     "examples.multi_agent_blackbox.verl_patch.apply_worker_patch"
@@ -260,6 +266,9 @@ def test_task_runner_builds_agent_loop_manager_and_calls_fit(monkeypatch):
         def get_gateway_actor_kwargs(self):
             return {"tokenizer": "tokenizer"}
 
+        def cleanup(self):
+            pass
+
         def fit(self, agent_loop_manager):
             self.fit_calls += 1
             self.fit_agent_loop_managers.append(agent_loop_manager)
@@ -301,3 +310,32 @@ def test_task_runner_builds_agent_loop_manager_and_calls_fit(monkeypatch):
             "gateway_actor_kwargs": {"tokenizer": "tokenizer"},
         }
     ]
+
+
+@pytest.mark.parametrize("primary_fails,cleanup_fails,queue_fails,expected", [
+    (True, True, True, "primary"),
+    (True, False, True, "primary"),
+    (False, True, True, "cleanup"),
+    (False, False, True, "queue"),
+])
+def test_task_runner_preserves_first_error(monkeypatch, primary_fails, cleanup_fails, queue_fails, expected):
+    module, _ = _install_entry_stubs(monkeypatch)
+    def fail(message):
+        raise RuntimeError(message)
+    class Trainer:
+        def __init__(self, **kwargs):
+            pass
+        def init(self):
+            if primary_fails:
+                fail("primary")
+        def fit(self, manager):
+            pass
+        def cleanup(self):
+            if cleanup_fails:
+                fail("cleanup")
+    monkeypatch.setattr(module, "MultiAgentsPPOTrainer", Trainer)
+    monkeypatch.setattr(module.MultiAgentsTaskRunner, "init_agent_loop_manager", lambda self: None)
+    monkeypatch.setitem(sys.modules, "transfer_queue", types.SimpleNamespace(
+        init=lambda config: None, close=lambda: fail("queue") if queue_fails else None))
+    with pytest.raises(RuntimeError, match=expected):
+        module.MultiAgentsTaskRunner().run(ConfigNode(transfer_queue=ConfigNode(enable=False)))

@@ -1,0 +1,9 @@
+# @package _global_
+# Replay the failed 2026-09-21 high-load run with the current transaction code.
+defaults:
+- multi_agent_blackbox_borrow_random_routing
+- _self_
+example_patch_fqn: examples.multi_agent_blackbox.stress_observation_patch
+dynamic_inference_scheduling:
+  borrow_drain_timeout_s: 60.0
+  weight_sync_timeout_s: 300.0

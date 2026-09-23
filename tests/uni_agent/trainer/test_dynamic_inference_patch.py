@@ -88,10 +88,14 @@ def _install_verl_stubs(monkeypatch):
     checkpoint_mod = types.ModuleType("verl.checkpoint_engine.base")
 
     class FakeCheckpointEngineManager:
+        async def update_weights(self, global_steps=None):
+            return {}
+
         def build_process_group(self, rollout):
             calls.append(("orig_build_process_group", rollout))
 
     checkpoint_mod.CheckpointEngineManager = FakeCheckpointEngineManager
+    checkpoint_mod.auto_await = lambda fn: fn
 
     for name in ("verl", "verl.utils", "verl.workers", "verl.workers.rollout",
                  "verl.single_controller", "verl.checkpoint_engine"):
@@ -253,6 +257,34 @@ def _server_module():
 
 
 class TestServerSleepWakePatch:
+    def test_clone_rpc_uses_named_method_and_preserves_default_worker_extension(self):
+        module, _ = _server_module()
+        original = lambda self: (
+            "verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
+        )
+        module.vLLMHttpServer._get_worker_extension_cls = original
+        patch._patch_server_sleep_wake_in_module(module)
+        server = module.vLLMHttpServer()
+        calls = []
+        async def collective_rpc(**kwargs):
+            calls.append(kwargs)
+            return [{"rank": 0}]
+        server.engine.collective_rpc = collective_rpc
+        assert asyncio.run(server.dynamic_inference_clone_rpc("inspect", {}, 30)) == [{"rank": 0}]
+        assert calls == [{"method": "dynamic_inference_clone_worker", "timeout": 30,
+                          "args": ("inspect", {})}]
+        assert server._get_worker_extension_cls().endswith("CloneWorkerExtension")
+        patch.restore()
+        assert module.vLLMHttpServer._get_worker_extension_cls is original
+
+    def test_custom_worker_extension_is_rejected_instead_of_silently_replaced(self):
+        module, _ = _server_module()
+        module.vLLMHttpServer._get_worker_extension_cls = lambda self: "custom.Extension"
+        patch._patch_server_sleep_wake_in_module(module)
+
+        with pytest.raises(RuntimeError, match="cannot replace.*custom.Extension"):
+            module.vLLMHttpServer()._get_worker_extension_cls()
+
     def test_standalone_sleep_hits_engine(self):
         module, calls = _server_module()
         patch._patch_server_sleep_wake_in_module(module)
@@ -373,3 +405,76 @@ class TestWorkerWatcher:
         monkeypatch.setenv("UNI_AGENT_WORKER_HOOK_CHAIN", "fake_worker_hooks.apply_worker_patch")
         patch.apply_worker_patch()
         assert chain_calls == ["chained"]
+
+
+def test_weight_sync_timeout_does_not_finalize_or_resume(monkeypatch):
+    """Receiver hang must surface by deadline and leave uncertain work untouched."""
+    calls = []
+    async def done():
+        calls.append('control')
+    async def hung():
+        await asyncio.sleep(60)
+    class Group:
+        world_size = 1
+        def __init__(self, **kwargs):
+            pass
+        def update_weights(self, **kwargs):
+            return [hung()]
+        def execute_checkpoint_engine(self, *args, **kwargs):
+            calls.append('finalize')
+            return []
+    base = types.ModuleType('verl.checkpoint_engine.base')
+    base.RayWorkerGroup = Group
+    base.RayClassWithInitArgs = lambda **kw: None
+    base._worker_cls = object
+    package = types.ModuleType('verl.checkpoint_engine')
+    package.base = base
+    monkeypatch.setitem(sys.modules, 'verl.checkpoint_engine', package)
+    monkeypatch.setitem(sys.modules, 'verl.checkpoint_engine.base', base)
+    monkeypatch.setitem(sys.modules, 'ray', types.ModuleType('ray'))
+    manager = SimpleNamespace(backend='nccl', _dynamic_sync_timeout_s=0.05,
+        replicas=[SimpleNamespace(server_address='guest', workers=[object()],
+            abort_all_requests=done, release_kv_cache=done,
+            resume_kv_cache=done, resume_generation=done)],
+        actor_wg=Group(), abort_replicas=done, release_kv_cache_replicas=done,
+        build_process_group=lambda rollout: None,
+        resume_kv_cache_replicas=done, resume_generation_replicas=done)
+    before = time.monotonic()
+    with pytest.raises(TimeoutError):
+        asyncio.run(patch._patched_checkpoint_update_weights(manager, 1))
+    assert time.monotonic() - before < 2
+    assert calls == ['control', 'control']
+
+
+def test_changing_receiver_set_rebuilds_all_participants(monkeypatch):
+    names, sizes = [], []
+    class Group:
+        def __init__(self, size):
+            self.world_size = size
+        def execute_checkpoint_engine(self, methods=None, **kwargs):
+            methods = methods or kwargs['method']
+            assert len(methods) == self.world_size
+            if methods[0] == 'dynamic_inference_set_group_name':
+                names.append(kwargs['group_name'])
+            if methods[0] == 'init_process_group':
+                sizes.append(kwargs['world_size'])
+            return [None] * self.world_size
+    class Backend:
+        @staticmethod
+        def build_topology(actor_size, rollout_size, metadata):
+            assert len(metadata) == actor_size + rollout_size
+            size = rollout_size + 1
+            return ({'world_size': [size] * actor_size},
+                    {'world_size': [size] * rollout_size})
+    def get(refs, timeout):
+        assert 0 < timeout <= 300
+        return refs
+    monkeypatch.setitem(sys.modules, 'ray', SimpleNamespace(get=get))
+    manager = SimpleNamespace(backend='nccl', backend_cls=Backend, actor_wg=Group(4),
+        config=SimpleNamespace(engine_kwargs={'nccl': {'group_name': 'p1', 'rebuild_group': True}}))
+    for size in (4, 6, 4):
+        patch._patched_checkpoint_build_process_group(manager, Group(size))
+    assert [set(s) for s in sizes] == [{5}, {5}, {7}, {7}, {5}, {5}]
+    assert names[0][0] == names[1][0]
+    assert names[2][0] == names[3][0]
+    assert len({names[i][0] for i in (0, 2, 4)}) == 3

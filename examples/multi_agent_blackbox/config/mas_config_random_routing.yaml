@@ -1,0 +1,35 @@
+harness:
+  # Every request is first processed by agent_1. Remaining turns are routed
+  # randomly, with no more than ten total processing turns.
+  entry_agent: agent_1
+  min_rounds: 7
+  max_rounds: 10
+  random_seed: 42
+  route_weights:
+    agent_1: 1.0
+    agent_2: 1.0
+    agent_3: 1.0
+
+  # A different aligned budget is sampled for every turn. Natural EOS remains
+  # enabled; min_tokens prevents tiny completions from removing the KV load.
+  output_tokens_min: 8192
+  output_tokens_max: 10240
+  output_tokens_step: 512
+  minimum_completion_ratio: 0.90
+
+agents:
+  agent_1:
+    system_prompt: >-
+      You are the entry and routing agent. Develop a very detailed solution,
+      preserve all facts needed by downstream agents, and end with a clear
+      candidate final answer.
+  agent_2:
+    system_prompt: >-
+      You are a specialist worker. Thoroughly inspect the task and prior work,
+      add missing reasoning and details, and preserve a clear candidate final
+      answer for the next agent.
+  agent_3:
+    system_prompt: >-
+      You are a verification worker. Check the prior work carefully, correct
+      mistakes, expand the analysis, and preserve a clear candidate final
+      answer for the next agent.
