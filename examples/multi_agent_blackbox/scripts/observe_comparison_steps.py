@@ -37,7 +37,15 @@ def main():
                 except ValueError:
                     pass
     while True:
-        manifest = json.loads((args.directory / 'manifest.json').read_text())
+        # Shared filesystems can briefly hide a just-renamed manifest from a
+        # newly spawned process.  Treat that as startup/metadata propagation,
+        # not as a terminal observer failure.
+        try:
+            manifest = json.loads((args.directory / 'manifest.json').read_text())
+        except (FileNotFoundError, OSError, ValueError) as error:
+            print(f'manifest read retry: {error}', flush=True)
+            time.sleep(1)
+            continue
         active_mode = manifest.get('active_mode')
         if active_mode:
             try:

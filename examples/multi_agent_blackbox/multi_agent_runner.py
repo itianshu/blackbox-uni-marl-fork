@@ -9,8 +9,13 @@ implementation.
 from __future__ import annotations
 
 import json
+import asyncio
+import logging
 from collections.abc import Mapping
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def _content_to_text(content: Any) -> str:
@@ -92,15 +97,52 @@ async def _chat_completion(
     if tools:
         payload["tools"] = tools
 
-    async with httpx.AsyncClient(timeout=request_timeout_seconds) as client:
-        response = await client.post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            json=payload,
-        )
-        response.raise_for_status()
-        data = response.json()
+    # Dynamic inference borrowing deliberately aborts requests that are still
+    # running on a replica after that replica has been removed from the load
+    # balancer.  Retrying the same turn through the rollout gateway is safe:
+    # the role/session mapping is unchanged and the gateway selects one of the
+    # remaining replicas.  Without this retry, a topology change can evict an
+    # entire MAS rollout even though healthy replicas are available.
+    max_retries = max(0, int(agent_cfg.get("request_max_retries", 4)))
+    retry_delay = max(0.0, float(agent_cfg.get("request_retry_backoff_seconds", 1.0)))
+    retry_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
 
-    return str(data["choices"][0]["message"].get("content", ""))
+    async with httpx.AsyncClient(timeout=request_timeout_seconds) as client:
+        for attempt in range(max_retries + 1):
+            try:
+                response = await client.post(
+                    f"{base_url.rstrip('/')}/chat/completions",
+                    json=payload,
+                )
+                status_code = int(getattr(response, "status_code", 200))
+                response.raise_for_status()
+                data = response.json()
+                return str(data["choices"][0]["message"].get("content", ""))
+            except Exception as exc:
+                status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                retryable = (
+                    isinstance(exc, getattr(httpx, "TransportError", ()))
+                    or isinstance(exc, getattr(httpx, "TimeoutException", ()))
+                    or status_code in retry_statuses
+                    # An aborted non-streaming vLLM request can close after an
+                    # HTTP 200 but before a complete OpenAI JSON body arrives.
+                    or isinstance(exc, (KeyError, IndexError, TypeError, ValueError))
+                )
+                if not retryable or attempt >= max_retries:
+                    raise
+                delay = min(8.0, retry_delay * (2**attempt))
+                logger.warning(
+                    "chat completion interrupted for role=%s; retrying attempt %d/%d in %.1fs: %s",
+                    role,
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                    exc,
+                )
+                if delay:
+                    await asyncio.sleep(delay)
+
+    raise RuntimeError("chat completion retry loop exited unexpectedly")
 
 
 async def multi_agent_runner(

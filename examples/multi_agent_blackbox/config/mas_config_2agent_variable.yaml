@@ -1,0 +1,34 @@
+harness:
+  # Variable-length conversations keep the workload realistic.  Both fixed
+  # endpoints run on policy_1; middle turns are sampled 1:1 so policy_1 is the
+  # expected inference bottleneck without asymmetric per-call token budgets.
+  entry_agent: agent_1
+  final_agent: agent_1
+  min_rounds: 7
+  max_rounds: 10
+  random_seed: 42
+  route_weights:
+    agent_1: 1.0
+    agent_2: 1.0
+
+  output_tokens_min: 8192
+  output_tokens_max: 10240
+  output_tokens_step: 512
+  minimum_completion_ratio: 0.90
+
+agents:
+  agent_1:
+    # A borrow/return transaction can keep a replica unavailable for 8-17s.
+    # Eight bounded retries cover the whole migration window without dropping
+    # the trajectory that happened to be routed to the draining replica.
+    request_max_retries: 8
+    request_retry_backoff_seconds: 1.0
+    system_prompt: >-
+      Analyze the task carefully, improve the current solution, preserve all
+      information needed by the next agent, and provide a clear candidate answer.
+  agent_2:
+    request_max_retries: 8
+    request_retry_backoff_seconds: 1.0
+    system_prompt: >-
+      Analyze the task carefully, check and improve the previous work, preserve
+      all information needed by the next agent, and provide a clear candidate answer.

@@ -36,31 +36,41 @@ def build_random_route(
     *,
     roles: Sequence[str],
     entry_agent: str,
+    final_agent: str | None,
     min_rounds: int,
     max_rounds: int,
     rng: random.Random,
     route_weights: Mapping[str, Any] | None = None,
 ) -> list[str]:
-    """Route a bounded conversation whose first turn is handled by the entry agent."""
+    """Route a bounded conversation with optional fixed entry and final agents."""
     if not roles:
         raise ValueError("random-routing harness requires at least one role")
     if entry_agent not in roles:
         raise ValueError(f"entry_agent {entry_agent!r} is not in configured roles {list(roles)!r}")
+    if final_agent is not None and final_agent not in roles:
+        raise ValueError(f"final_agent {final_agent!r} is not in configured roles {list(roles)!r}")
     if min_rounds <= 0 or max_rounds < min_rounds:
         raise ValueError(
             f"invalid round range: min_rounds={min_rounds}, max_rounds={max_rounds}"
         )
     if max_rounds > 10:
         raise ValueError(f"max_rounds cannot exceed the harness safety limit of 10, got {max_rounds}")
+    if final_agent is not None and min_rounds < 2:
+        raise ValueError("min_rounds must be at least 2 when final_agent is configured")
 
     weights = [float((route_weights or {}).get(role, 1.0)) for role in roles]
     if any(weight < 0 for weight in weights) or not any(weights):
         raise ValueError("route_weights must be non-negative with at least one positive value")
 
     rounds = rng.randint(min_rounds, max_rounds)
-    # The entry agent is a real processing hop, not just metadata attached to a
-    # request that starts at an arbitrary worker.  Subsequent hops are random.
-    return [entry_agent, *rng.choices(list(roles), weights=weights, k=rounds - 1)]
+    # Entry/final agents are real processing hops.  Fixing both endpoints while
+    # sampling only the middle turns creates a reproducible, intentionally
+    # asymmetric workload without changing either role's per-call token budget.
+    middle_rounds = rounds - 2 if final_agent is not None else rounds - 1
+    route = [entry_agent, *rng.choices(list(roles), weights=weights, k=middle_rounds)]
+    if final_agent is not None:
+        route.append(final_agent)
+    return route
 
 
 def _sample_token_budget(
@@ -151,9 +161,12 @@ async def random_routing_agent_runner(
         task=task,
     )
     entry_agent = str(config.get("entry_agent", "agent_1"))
+    final_agent_value = config.get("final_agent")
+    final_agent = str(final_agent_value) if final_agent_value is not None else None
     route = build_random_route(
         roles=roles,
         entry_agent=entry_agent,
+        final_agent=final_agent,
         min_rounds=_integer(config, "min_rounds", 1),
         max_rounds=_integer(config, "max_rounds", 10),
         rng=rng,
@@ -216,6 +229,7 @@ async def random_routing_agent_runner(
         "agent_outputs": latest_agent_outputs,
         "round_count": len(route),
         "entry_agent": entry_agent,
+        "final_agent": final_agent,
         "route": route,
         "routing_trace": routing_trace,
     }

@@ -1,0 +1,206 @@
+# @package _global_
+# Two-policy, 32-GPU comparison profile.  The launcher removes inherited
+# policy_3 and agent_3 keys because OmegaConf mapping merges do not delete them.
+defaults:
+- multi_agent_blackbox
+- _self_
+
+data:
+  seed: 42
+  train_batch_size: 128
+  max_prompt_length: 12288
+  max_response_length: 10240
+
+trainer:
+  test_freq: -1
+  v1:
+    separate_async:
+      num_warmup_batches: 1
+
+actor_rollout_ref:
+  rollout:
+    seed: 42
+    custom:
+      agent_framework:
+        gateway_count: 16
+        max_concurrent_rollouts: 512
+        completion_timeout_seconds: 10800
+        multi_agent_runner_fqn: examples.multi_agent_blackbox.random_routing_harness.random_routing_agent_runner
+        multi_agent_runner_kwargs:
+          mas_config_path: examples/multi_agent_blackbox/config/mas_config_2agent_variable.yaml
+          max_tokens: 10240
+          request_timeout_seconds: 7200
+          execution:
+            ray:
+              scheduling_strategy: SPREAD
+        role_policy_mapping:
+          agent_1: policy_1
+          agent_2: policy_2
+
+policies:
+  policy_1:
+    ppo_trainer_overrides:
+      trainer:
+        nnodes: 1
+        n_gpus_per_node: 8
+        default_local_dir: ${trainer.default_local_dir}/policy_1
+      actor_rollout_ref:
+        model:
+          path: /mnt/bn/chenghao1026/models/Qwen3-1.7B
+          trust_remote_code: true
+          use_remove_padding: true
+          enable_gradient_checkpointing: true
+          enable_activation_offload: false
+          use_fused_kernels: false
+        actor:
+          strategy: fsdp
+          use_dynamic_bsz: true
+          ppo_max_token_len_per_gpu: 24576
+          ulysses_sequence_parallel_size: 2
+          entropy_from_logits_with_chunking: true
+          entropy_checkpointing: true
+          fsdp_config:
+            fsdp_size: 8
+            param_offload: false
+            optimizer_offload: false
+            offload_policy: false
+            reshard_after_forward: true
+            use_torch_compile: true
+        rollout:
+          nnodes: 3
+          n_gpus_per_node: 4
+          tensor_model_parallel_size: 1
+          data_parallel_size: 1
+          pipeline_model_parallel_size: 1
+          prompt_length: 12288
+          response_length: 10240
+          max_model_len: 24576
+          # Leave enough device headroom for checkpoint-engine weight merges.
+          # The largest Qwen parameter materializes a ~1.16 GiB receive tensor;
+          # 0.75 left only ~0.72 GiB free after a long rollout (step-8 OOM).
+          gpu_memory_utilization: 0.70
+          max_num_seqs: 48
+          max_num_batched_tokens: 12288
+          enable_chunked_prefill: true
+          enable_prefix_caching: false
+          enforce_eager: false
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+          calculate_log_probs: true
+          disable_log_stats: false
+          full_determinism: false
+          enable_sleep_mode: true
+          free_cache_engine: true
+          checkpoint_engine:
+            backend: nccl
+            update_weights_bucket_megabytes: 128
+            engine_kwargs:
+              nccl:
+                group_name: checkpoint_policy_1
+                rebuild_group: true
+
+  policy_2:
+    ppo_trainer_overrides:
+      trainer:
+        nnodes: 1
+        n_gpus_per_node: 4
+        default_local_dir: ${trainer.default_local_dir}/policy_2
+      actor_rollout_ref:
+        model:
+          path: /mnt/bn/chenghao1026/models/Qwen3-1.7B
+          trust_remote_code: true
+          use_remove_padding: true
+          enable_gradient_checkpointing: true
+          enable_activation_offload: false
+          use_fused_kernels: false
+        actor:
+          strategy: fsdp
+          use_dynamic_bsz: true
+          ppo_max_token_len_per_gpu: 24576
+          ulysses_sequence_parallel_size: 2
+          entropy_from_logits_with_chunking: true
+          entropy_checkpointing: true
+          fsdp_config:
+            fsdp_size: 4
+            param_offload: false
+            optimizer_offload: false
+            offload_policy: false
+            reshard_after_forward: true
+            use_torch_compile: true
+        rollout:
+          nnodes: 2
+          n_gpus_per_node: 4
+          tensor_model_parallel_size: 1
+          data_parallel_size: 1
+          pipeline_model_parallel_size: 1
+          prompt_length: 12288
+          response_length: 10240
+          max_model_len: 24576
+          # Keep the same weight-sync headroom on both policies.
+          gpu_memory_utilization: 0.70
+          max_num_seqs: 48
+          max_num_batched_tokens: 12288
+          enable_chunked_prefill: true
+          enable_prefix_caching: false
+          enforce_eager: false
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32]
+          calculate_log_probs: true
+          disable_log_stats: false
+          full_determinism: false
+          enable_sleep_mode: true
+          free_cache_engine: true
+          checkpoint_engine:
+            backend: nccl
+            update_weights_bucket_megabytes: 128
+            engine_kwargs:
+              nccl:
+                group_name: checkpoint_policy_2
+                rebuild_group: true
+
+dynamic_inference_scheduling:
+  enable: true
+  resource_usage:
+    queue_signal_enabled: true
+    kv_enter: 0.80
+    kv_exit: 0.62
+    kv_post_lend_max: 0.76
+    waiting_enter_per_replica: 6
+    waiting_exit_per_replica: 1
+    queue_time_enter_s: 2.0
+    queue_time_exit_s: 0.5
+    ema_alpha: 0.3
+  # With 1 s polling, require roughly 10 s of sustained pressure before
+  # switching the bottleneck.  This avoids reacting to short rollout bursts.
+  bottleneck_confirm_polls: 10
+  rebalance_confirm_polls: 3
+  rebalance_settle_polls: 5
+  min_lend_polls: 10
+  borrow_cooldown_s: 15.0
+  return_confirm_polls: 10
+  early_return_confirm_polls: 8
+  poll_interval_s: 1.0
+  metrics_scrape_interval_s: 1.0
+  trace_path: ${trainer.default_local_dir}/dynamic_inference.jsonl
+  trace_interval_s: 2.0
+  borrow_drain_timeout_s: 120.0
+  weight_sync_timeout_s: 600.0
+  sleep_patch_mode: patched
+  borrowing:
+    guest_master_port_range: [20010, 20522]
+    guest_master_port_stride: 4
+    guest_init_max_attempts: 4
+    guest_init_retry_backoff_s: 2.0
+    guest_init_retry_jitter_s: 2.0
+    pairs:
+    # `home` lends physical rollout replicas; `donor` receives guest replicas.
+    # Allow up to four atomic replica units in either direction. Runtime
+    # safety checks still retain a home seed and enforce kv_post_lend_max.
+    - home: policy_1
+      donor: policy_2
+      home_replicas_per_unit: 1
+      guest_replicas_per_unit: 1
+      max_units: 4
+    - home: policy_2
+      donor: policy_1
+      home_replicas_per_unit: 1
+      guest_replicas_per_unit: 1
+      max_units: 4

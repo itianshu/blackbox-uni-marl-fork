@@ -148,6 +148,51 @@ def test_random_routing_harness_uses_entry_agent_and_bounded_handoffs(monkeypatc
     assert result["reward_info"]["final_result"] == "output from agent_2"
 
 
+def test_random_routing_harness_can_fix_both_endpoints(monkeypatch):
+    from examples.multi_agent_blackbox import random_routing_harness as harness
+
+    calls = []
+
+    async def fake_chat_completion(*, role, **_):
+        calls.append(role)
+        return f"output from {role}"
+
+    monkeypatch.setattr(harness, "_chat_completion", fake_chat_completion)
+    result = asyncio.run(
+        harness.random_routing_agent_runner(
+            raw_prompt="solve",
+            rollout=SimpleNamespace(
+                base_url="http://gateway/rollouts/random/v1",
+                sessions={"agent_1": object(), "agent_2": object()},
+            ),
+            sample_index=3,
+            session_runtime=None,
+            role_policy_mapping={"agent_1": "policy_1", "agent_2": "policy_2"},
+            mas_config={
+                "harness": {
+                    "entry_agent": "agent_1",
+                    "final_agent": "agent_1",
+                    "min_rounds": 7,
+                    "max_rounds": 7,
+                    "random_seed": 42,
+                    "route_weights": {"agent_1": 1, "agent_2": 1},
+                    "output_tokens_min": 128,
+                    "output_tokens_max": 128,
+                    "minimum_completion_ratio": 0.9,
+                },
+                "agents": {},
+            },
+            max_tokens=128,
+        )
+    )
+
+    assert len(result["route"]) == 7
+    assert result["route"][0] == result["route"][-1] == "agent_1"
+    assert calls == result["route"]
+    assert result["reward_info"]["final_agent"] == "agent_1"
+    assert result["final_result"] == "output from agent_1"
+
+
 def test_random_routing_recipe_selects_new_harness_and_random_token_range():
     mas_cfg = yaml.safe_load(
         (EXAMPLE_DIR / "config" / "mas_config_random_routing.yaml").read_text(encoding="utf-8")
@@ -219,6 +264,64 @@ def test_chat_completion_forwards_deterministic_length_options(monkeypatch):
     assert captured["payload"]["max_tokens"] == 64
     assert captured["payload"]["min_tokens"] == 63
     assert captured["payload"]["ignore_eos"] is True
+
+
+def test_chat_completion_retries_interrupted_dynamic_inference_request(monkeypatch):
+    from examples.multi_agent_blackbox import multi_agent_runner as runner_module
+
+    attempts = []
+
+    class FakeTransportError(Exception):
+        pass
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "recovered"}}]}
+
+    class FakeClient:
+        def __init__(self, *, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def post(self, url, *, json):
+            attempts.append((url, json))
+            if len(attempts) == 1:
+                raise FakeTransportError("replica was reconfigured")
+            return FakeResponse()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "httpx",
+        types.SimpleNamespace(
+            AsyncClient=FakeClient,
+            TransportError=FakeTransportError,
+            TimeoutException=TimeoutError,
+        ),
+    )
+
+    result = asyncio.run(
+        runner_module._chat_completion(
+            base_url="http://gateway/v1",
+            role="agent_2",
+            messages=[{"role": "user", "content": "load"}],
+            agent_cfg={"request_max_retries": 2, "request_retry_backoff_seconds": 0},
+            max_tokens=32,
+            request_timeout_seconds=12.0,
+        )
+    )
+
+    assert result == "recovered"
+    assert len(attempts) == 2
 
 
 def test_borrow_verify_recipe_forces_asymmetric_load_and_lends_to_both_busy_policies():

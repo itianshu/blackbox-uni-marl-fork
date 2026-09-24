@@ -994,6 +994,19 @@ class MultiAgentsPPOTrainer:
             )
             policy_masks[policy_name] = mask
 
+        # A MAS rollout yields one trajectory record per processing turn.  Log
+        # both records and unique (prompt uid, rollout sample) groups so reports
+        # can distinguish generated trajectories from top-level MAS rollouts.
+        metrics["training/trajectory_count"] = int(non_padding_mask.sum())
+        rollout_ids = {
+            (str(tag.get("uid", "")), int(tag.get("sample_idx", 0)))
+            for tag, keep in zip(batch.tags, non_padding_mask, strict=True)
+            if keep
+        }
+        metrics["training/mas_rollout_count"] = len(rollout_ids)
+        for policy_name, mask in policy_masks.items():
+            metrics[f"{policy_name}/trajectory_count"] = int(mask.sum())
+
         if all(
             tag.get("is_padding", False)
             or ("min_global_steps" in tag and "max_global_steps" in tag)

@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -25,7 +26,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--steps', type=int, default=20)
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--profile', choices=['standard', 'high_kv', 'random_routing'], default='standard')
+    parser.add_argument('--profile', choices=['standard', 'high_kv', 'random_routing', 'two_policy_2b'], default='standard')
     parser.add_argument('--modes', nargs='+', choices=['dynamic', 'static'], default=['dynamic', 'static'])
     parser.add_argument('--baseline', type=Path, help='Historical failed run for a dynamic-only regression report')
     parser.add_argument('--ray-address', default=os.environ.get('RAY_ADDRESS'),
@@ -69,15 +70,38 @@ def main():
     save()
     subprocess.run(['git', 'diff', '--', '.', ':!verl'], cwd=root,
                    stdout=(output / 'source_changes.patch').open('w'), check=True)
+    snapshot = output / 'source_snapshot'
+    snapshot.mkdir(exist_ok=True)
+    for relative in [
+        'examples/multi_agent_blackbox/config/multi_agent_blackbox_2policy_2b_comparison.yaml',
+        'examples/multi_agent_blackbox/config/mas_config_2agent_variable.yaml',
+        'examples/multi_agent_blackbox/scripts/run_e2e_2policy_2b.sh',
+        'examples/multi_agent_blackbox/scripts/run_e2e_train.sh',
+        'examples/multi_agent_blackbox/scripts/observe_comparison_steps.py',
+        'examples/multi_agent_blackbox/scripts/analyze_2policy_comparison.py',
+    ]:
+        source = root / relative
+        if source.exists():
+            destination = snapshot / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
     for mode in args.modes:
         run_dir = output / mode
         run_dir.mkdir(exist_ok=True)
         env = os.environ.copy()
-        env.update(BORROW_LOAD_PROFILE=args.profile, PYTHON=sys.executable, PYTHONPATH=str(root), TOTAL_TRAINING_STEPS=str(args.steps),
+        env.update(BORROW_LOAD_PROFILE=args.profile, PYTHON=sys.executable, PYTHONPATH=str(root),
+                   RAY_ADDRESS=args.ray_address,
+                   RAY_DASHBOARD_ADDRESS=args.dashboard_address,
+                   TOTAL_TRAINING_STEPS=str(args.steps),
                    DYNAMIC_INFERENCE_SCHEDULING=str(mode == 'dynamic').lower(),
                    LOG_PATH=str(run_dir / 'train.log'), CKPT_DIR=str(run_dir / 'checkpoints'))
+        launcher = 'run_e2e_2policy_2b.sh' if args.profile == 'two_policy_2b' else 'run_e2e_borrow_verify.sh'
+        if args.profile == 'two_policy_2b':
+            # Standalone TP1 rollout actors are per-policy replica ranks;
+            # training workers are WorkerDict actors rather than vLLM servers.
+            env['MONITOR_POLICY_TRAIN_RANKS'] = json.dumps({'policy_1': 0, 'policy_2': 0})
         with (run_dir / 'launcher.log').open('w') as stream:
-            process = subprocess.Popen(['bash', str(root / 'examples/multi_agent_blackbox/scripts/run_e2e_borrow_verify.sh')],
+            process = subprocess.Popen(['bash', str(root / 'examples/multi_agent_blackbox/scripts' / launcher)],
                 env=env, cwd=root, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         info = {'launcher_pid': process.pid, 'started_unix_s': time.time(),
                 'log': env['LOG_PATH'], 'trace': str(run_dir / 'checkpoints/dynamic_inference.jsonl'),
@@ -122,8 +146,9 @@ def main():
     if args.baseline:
         regression_report()
         return
+    analyzer = 'analyze_2policy_comparison.py' if args.profile == 'two_policy_2b' else 'analyze_borrow_comparison.py'
     subprocess.run([sys.executable,
-        str(root / 'examples/multi_agent_blackbox/scripts/analyze_borrow_comparison.py'), str(output)],
+        str(root / 'examples/multi_agent_blackbox/scripts' / analyzer), str(output)],
         cwd=root, check=True)
 
 

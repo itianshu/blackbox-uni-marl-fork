@@ -1,0 +1,1627 @@
+{
+  "source_run": "/mnt/hdfs/haruna/home/byte_ailab_vc_moderation/user/chenghao/litianshu/blackbox-uni-marl-fork/examples/multi_agent_blackbox/logs/two_policy_2b_bidir4_8step_comparison_retry1_20260923_234357",
+  "included_steps": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "excluded_failure_step": 8,
+  "metrics": {
+    "advantage_s": {
+      "mean": 6.690909734794071,
+      "min": 5.626515202224255,
+      "max": 8.297205060720444
+    },
+    "dynamic_scheduling/active_lends_max": {
+      "mean": 4.0,
+      "min": 4.0,
+      "max": 4.0
+    },
+    "dynamic_scheduling/active_lends_mean": {
+      "mean": 2.10748136164221,
+      "min": 1.7648648648648648,
+      "max": 2.7604790419161676
+    },
+    "dynamic_scheduling/borrow_completions": {
+      "mean": 4.857142857142857,
+      "min": 0.0,
+      "max": 11.0
+    },
+    "dynamic_scheduling/borrow_events": {
+      "mean": 7.571428571428571,
+      "min": 4.0,
+      "max": 11.0
+    },
+    "dynamic_scheduling/borrow_events_explicit": {
+      "mean": 4.857142857142857,
+      "min": 0.0,
+      "max": 11.0
+    },
+    "dynamic_scheduling/borrow_events_inferred_from_topology": {
+      "mean": 2.7142857142857144,
+      "min": 0.0,
+      "max": 6.0
+    },
+    "dynamic_scheduling/borrow_execution_s_mean": {
+      "mean": 19.59017359285117,
+      "min": 13.271789147622055,
+      "max": 27.894034172097843
+    },
+    "dynamic_scheduling/borrow_execution_s_p90": {
+      "mean": 28.575465346872807,
+      "min": 20.8105580881238,
+      "max": 38.64718948304653
+    },
+    "dynamic_scheduling/borrow_failures": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "dynamic_scheduling/borrow_starts": {
+      "mean": 4.571428571428571,
+      "min": 0.0,
+      "max": 10.0
+    },
+    "dynamic_scheduling/early_return_requests": {
+      "mean": 3.142857142857143,
+      "min": 0.0,
+      "max": 8.0
+    },
+    "dynamic_scheduling/replica_clone_events": {
+      "mean": 10.571428571428571,
+      "min": 0.0,
+      "max": 19.0
+    },
+    "dynamic_scheduling/replica_clone_s_mean": {
+      "mean": 6.915563950401896,
+      "min": 6.613289945820967,
+      "max": 7.134456487165557
+    },
+    "dynamic_scheduling/replica_clone_s_p90": {
+      "mean": 7.534567682693402,
+      "min": 6.911817625164986,
+      "max": 8.763019628822803
+    },
+    "dynamic_scheduling/return_completions": {
+      "mean": 5.714285714285714,
+      "min": 0.0,
+      "max": 9.0
+    },
+    "dynamic_scheduling/return_events": {
+      "mean": 7.428571428571429,
+      "min": 0.0,
+      "max": 14.0
+    },
+    "dynamic_scheduling/return_events_explicit": {
+      "mean": 5.714285714285714,
+      "min": 0.0,
+      "max": 9.0
+    },
+    "dynamic_scheduling/return_events_inferred_from_topology": {
+      "mean": 1.7142857142857142,
+      "min": 0.0,
+      "max": 9.0
+    },
+    "dynamic_scheduling/return_execution_s_mean": {
+      "mean": 22.713654885430717,
+      "min": 13.112528701623281,
+      "max": 39.376653999090195
+    },
+    "dynamic_scheduling/return_execution_s_p90": {
+      "mean": 36.14380797743797,
+      "min": 17.59015468508005,
+      "max": 73.07863786071539
+    },
+    "dynamic_scheduling/return_failures": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "dynamic_scheduling/return_starts": {
+      "mean": 5.571428571428571,
+      "min": 0.0,
+      "max": 9.0
+    },
+    "dynamic_scheduling/serving_cards_mean/policy_1": {
+      "mean": 10.612628128115421,
+      "min": 9.463087248322148,
+      "max": 11.945454545454545
+    },
+    "dynamic_scheduling/serving_cards_mean/policy_2": {
+      "mean": 9.387371871884579,
+      "min": 8.054545454545455,
+      "max": 10.536912751677852
+    },
+    "gpu/bubble_fraction_lt_10pct": {
+      "mean": 0.34000976479587447,
+      "min": 0.11970029239766082,
+      "max": 0.41259765625
+    },
+    "gpu/bubble_fraction_lt_30pct": {
+      "mean": 0.3437494458539136,
+      "min": 0.12463450292397661,
+      "max": 0.41650390625
+    },
+    "gpu/effective_utilization": {
+      "mean": 64.66459119534271,
+      "min": 57.52685546875,
+      "max": 86.29824561403508
+    },
+    "gpu/memory_used_mib_max": {
+      "mean": 37413.42857142857,
+      "min": 35994.0,
+      "max": 39132.0
+    },
+    "gpu/memory_used_mib_mean": {
+      "mean": 27618.30417767251,
+      "min": 25231.513313609466,
+      "max": 32858.91081871345
+    },
+    "gpu/memory_used_mib_p90": {
+      "mean": 36158.28571428572,
+      "min": 34443.0,
+      "max": 37495.0
+    },
+    "gpu/memory_utilization_fraction_mean": {
+      "mean": 0.6742750043377078,
+      "min": 0.6160037430080436,
+      "max": 0.8022195024099964
+    },
+    "gpu/power_w_mean": {
+      "mean": 261.8123238299956,
+      "min": 245.92134033203126,
+      "max": 307.82877375730993
+    },
+    "gpu/sample_count": {
+      "mean": 4310.857142857143,
+      "min": 3296.0,
+      "max": 5472.0
+    },
+    "gpu/utilization_max": {
+      "mean": 100.0,
+      "min": 100.0,
+      "max": 100.0
+    },
+    "gpu/utilization_p90": {
+      "mean": 100.0,
+      "min": 100.0,
+      "max": 100.0
+    },
+    "mas_rollout_count": {
+      "mean": 290.7142857142857,
+      "min": 252.0,
+      "max": 365.0
+    },
+    "mfu_mean": {
+      "mean": 0.36761700630417415,
+      "min": 0.36357620494226905,
+      "max": 0.3710122002000763
+    },
+    "phase_accounted_fraction": {
+      "mean": 0.9964985903597129,
+      "min": 0.9941880899067962,
+      "max": 0.9974332446093221
+    },
+    "policies/policy_1/actor_memory_allocated_gib": {
+      "mean": 24.910340785980225,
+      "min": 24.910340785980225,
+      "max": 24.910340785980225
+    },
+    "policies/policy_1/actor_memory_reserved_gib": {
+      "mean": 28.767299107142858,
+      "min": 28.68359375,
+      "max": 28.830078125
+    },
+    "policies/policy_1/entropy": {
+      "mean": 0.009100935687976224,
+      "min": 0.006870822049677372,
+      "max": 0.010946063324809074
+    },
+    "policies/policy_1/grad_norm": {
+      "mean": 0.17936751275278984,
+      "min": 0.07024455567200978,
+      "max": 0.46848024101927876
+    },
+    "policies/policy_1/mfu": {
+      "mean": 0.37624312237924024,
+      "min": 0.3677556582340325,
+      "max": 0.3820067291936729
+    },
+    "policies/policy_1/old_log_prob_s": {
+      "mean": 156.84144683395112,
+      "min": 131.07084579765797,
+      "max": 223.97214376181364
+    },
+    "policies/policy_1/pg_loss": {
+      "mean": -0.13065176766498812,
+      "min": -0.18756861961446702,
+      "max": -0.04015888059802819
+    },
+    "policies/policy_1/ppo_kl": {
+      "mean": -0.0007916619989742197,
+      "min": -0.0017682124762069277,
+      "max": -0.0002614183524869478
+    },
+    "policies/policy_1/reward_mean": {
+      "mean": 0.9961163997650146,
+      "min": 0.9939960241317749,
+      "max": 0.9980928301811218
+    },
+    "policies/policy_1/rollout_actor_probs_corr": {
+      "mean": 0.6950761931283134,
+      "min": 0.5971340537071228,
+      "max": 0.8118278384208679
+    },
+    "policies/policy_1/rollout_probs_diff_max": {
+      "mean": 0.9982416374342782,
+      "min": 0.9975414872169495,
+      "max": 0.999998927116394
+    },
+    "policies/policy_1/rollout_probs_diff_mean": {
+      "mean": 0.0036035030747630765,
+      "min": 0.002554709790274501,
+      "max": 0.004280854016542435
+    },
+    "policies/policy_1/staleness_max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "policies/policy_1/staleness_mean": {
+      "mean": 0.7033334577240679,
+      "min": 0.0,
+      "max": 0.9701207883026065
+    },
+    "policies/policy_1/trajectory_count": {
+      "mean": 1522.7142857142858,
+      "min": 1318.0,
+      "max": 1871.0
+    },
+    "policies/policy_1/update_actor_s": {
+      "mean": 490.7758106844766,
+      "min": 425.40105006843805,
+      "max": 603.3315581381321
+    },
+    "policies/policy_1/update_weights_s": {
+      "mean": 13.560306495853833,
+      "min": 8.81667260080576,
+      "max": 21.962662182748318
+    },
+    "policies/policy_2/actor_memory_allocated_gib": {
+      "mean": 27.58262825012207,
+      "min": 27.58262825012207,
+      "max": 27.58262825012207
+    },
+    "policies/policy_2/actor_memory_reserved_gib": {
+      "mean": 32.5078125,
+      "min": 32.4296875,
+      "max": 32.5390625
+    },
+    "policies/policy_2/entropy": {
+      "mean": 0.007063174553747688,
+      "min": 0.005304549355059862,
+      "max": 0.010755184106528759
+    },
+    "policies/policy_2/grad_norm": {
+      "mean": 0.3800772549584508,
+      "min": 0.18274885322898626,
+      "max": 0.7100944966077805
+    },
+    "policies/policy_2/mfu": {
+      "mean": 0.35899089022910813,
+      "min": 0.351050858393095,
+      "max": 0.3621638048787592
+    },
+    "policies/policy_2/old_log_prob_s": {
+      "mean": 214.0245525645358,
+      "min": 160.21887620538473,
+      "max": 323.4013123065233
+    },
+    "policies/policy_2/pg_loss": {
+      "mean": -0.1440364362635938,
+      "min": -0.23810197226703167,
+      "max": -0.027537127297061186
+    },
+    "policies/policy_2/ppo_kl": {
+      "mean": -0.0007031751733222114,
+      "min": -0.0022830535166558346,
+      "max": -0.0001398244005950703
+    },
+    "policies/policy_2/reward_mean": {
+      "mean": 0.995055615901947,
+      "min": 0.993934154510498,
+      "max": 0.9972602725028992
+    },
+    "policies/policy_2/rollout_actor_probs_corr": {
+      "mean": 0.5694685578346252,
+      "min": 0.5264742970466614,
+      "max": 0.6404750347137451
+    },
+    "policies/policy_2/rollout_probs_diff_max": {
+      "mean": 0.9978342652320862,
+      "min": 0.9967507123947144,
+      "max": 0.9981957674026489
+    },
+    "policies/policy_2/rollout_probs_diff_mean": {
+      "mean": 0.004233683991645064,
+      "min": 0.0031178451608866453,
+      "max": 0.004831856582313776
+    },
+    "policies/policy_2/staleness_max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "policies/policy_2/staleness_mean": {
+      "mean": 0.7417294024712799,
+      "min": 0.0,
+      "max": 0.9909729187562688
+    },
+    "policies/policy_2/trajectory_count": {
+      "mean": 899.5714285714286,
+      "min": 693.0,
+      "max": 1154.0
+    },
+    "policies/policy_2/update_actor_s": {
+      "mean": 685.3034944736531,
+      "min": 531.4930660352111,
+      "max": 873.8940417394042
+    },
+    "policies/policy_2/update_weights_s": {
+      "mean": 13.915962757808822,
+      "min": 9.756174877285957,
+      "max": 23.840168967843056
+    },
+    "policy_parallel_efficiency": {
+      "mean": 0.8648041480048877,
+      "min": 0.8109319753169987,
+      "max": 0.9612954549914949
+    },
+    "policy_parallel_overlap_saved_s": {
+      "mean": 658.1813362655895,
+      "min": 568.0992724224925,
+      "max": 836.1203745007515
+    },
+    "policy_phase_critical_path_s": {
+      "mean": 916.2402375446899,
+      "min": 712.7150213494897,
+      "max": 1207.440530255437
+    },
+    "policy_phase_serial_s": {
+      "mean": 1574.4215738102794,
+      "min": 1280.8142937719822,
+      "max": 2043.5609047561884
+    },
+    "rollout/completed_requests": {
+      "mean": 4483.428571428572,
+      "min": 3563.0,
+      "max": 6770.0
+    },
+    "rollout/generation_tokens": {
+      "mean": 38032332.14285714,
+      "min": 30126862.0,
+      "max": 58523011.0
+    },
+    "rollout/generation_tokens_per_s": {
+      "mean": 11654.59275293723,
+      "min": 10173.544950459536,
+      "max": 15650.378349665109
+    },
+    "rollout/overall_tokens_per_s": {
+      "mean": 22365.68615534074,
+      "min": 19456.858774156644,
+      "max": 29837.13277820772
+    },
+    "rollout/policies/policy_1/completed_requests": {
+      "mean": 2782.285714285714,
+      "min": 2159.0,
+      "max": 4236.0
+    },
+    "rollout/policies/policy_1/failed_requests": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "rollout/policies/policy_1/generation_tokens": {
+      "mean": 23670873.14285714,
+      "min": 18406608.0,
+      "max": 37277531.0
+    },
+    "rollout/policies/policy_1/generation_tokens_per_s": {
+      "mean": 7239.390452754157,
+      "min": 6395.71543822818,
+      "max": 9968.85591022256
+    },
+    "rollout/policies/policy_1/kv_max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "rollout/policies/policy_1/kv_mean": {
+      "mean": 0.44315211996408665,
+      "min": 0.38584546204693765,
+      "max": 0.5104147970432141
+    },
+    "rollout/policies/policy_1/kv_p90": {
+      "mean": 0.9840311033142098,
+      "min": 0.9742449385994025,
+      "max": 0.9871224692997013
+    },
+    "rollout/policies/policy_1/preemptions": {
+      "mean": 1199.142857142857,
+      "min": 862.0,
+      "max": 1530.0
+    },
+    "rollout/policies/policy_1/prefix_cache_hit_rate": {
+      "mean": 0.007073364613545541,
+      "min": 0.006557437652329361,
+      "max": 0.007348694756674594
+    },
+    "rollout/policies/policy_1/prefix_cache_hits": {
+      "mean": 8041723.428571428,
+      "min": 5288688.0,
+      "max": 10317440.0
+    },
+    "rollout/policies/policy_1/prefix_cache_queries": {
+      "mean": 1136107440.857143,
+      "min": 719677191.0,
+      "max": 1439776051.0
+    },
+    "rollout/policies/policy_1/prompt_tokens": {
+      "mean": 19087703.57142857,
+      "min": 15176544.0,
+      "max": 29495798.0
+    },
+    "rollout/policies/policy_1/requests_running_mean": {
+      "mean": 173.4396812596142,
+      "min": 150.5374149659864,
+      "max": 203.7029876977153
+    },
+    "rollout/policies/policy_1/requests_waiting_max": {
+      "mean": 133.42857142857142,
+      "min": 90.0,
+      "max": 213.0
+    },
+    "rollout/policies/policy_1/requests_waiting_mean": {
+      "mean": 34.358157266347284,
+      "min": 15.13884007029877,
+      "max": 56.81274900398407
+    },
+    "rollout/policies/policy_1/total_tokens_per_s": {
+      "mean": 13086.838863450872,
+      "min": 11495.278717124456,
+      "max": 17856.700204927347
+    },
+    "rollout/policies/policy_2/completed_requests": {
+      "mean": 1701.142857142857,
+      "min": 1404.0,
+      "max": 2534.0
+    },
+    "rollout/policies/policy_2/failed_requests": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "rollout/policies/policy_2/generation_tokens": {
+      "mean": 14361459.0,
+      "min": 11720254.0,
+      "max": 21245480.0
+    },
+    "rollout/policies/policy_2/generation_tokens_per_s": {
+      "mean": 4415.202300183073,
+      "min": 3777.829512231357,
+      "max": 5681.522439442548
+    },
+    "rollout/policies/policy_2/kv_max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "rollout/policies/policy_2/kv_mean": {
+      "mean": 0.4546901702470958,
+      "min": 0.3766797666839771,
+      "max": 0.5695674026897996
+    },
+    "rollout/policies/policy_2/kv_p90": {
+      "mean": 0.987653501493528,
+      "min": 0.9847992034517092,
+      "max": 0.9903750414868902
+    },
+    "rollout/policies/policy_2/preemptions": {
+      "mean": 925.5714285714286,
+      "min": 663.0,
+      "max": 1180.0
+    },
+    "rollout/policies/policy_2/prefix_cache_hit_rate": {
+      "mean": 0.007614727971728107,
+      "min": 0.0070415575787170885,
+      "max": 0.007939092587382223
+    },
+    "rollout/policies/policy_2/prefix_cache_hits": {
+      "mean": 7926404.571428572,
+      "min": 5921440.0,
+      "max": 9724400.0
+    },
+    "rollout/policies/policy_2/prefix_cache_queries": {
+      "mean": 1040452664.5714285,
+      "min": 774086626.0,
+      "max": 1259361674.0
+    },
+    "rollout/policies/policy_2/prompt_tokens": {
+      "mean": 15804503.42857143,
+      "min": 13067444.0,
+      "max": 23554139.0
+    },
+    "rollout/policies/policy_2/requests_running_mean": {
+      "mean": 105.35423399025939,
+      "min": 87.76643990929705,
+      "max": 124.58347978910369
+    },
+    "rollout/policies/policy_2/requests_waiting_max": {
+      "mean": 158.14285714285714,
+      "min": 84.0,
+      "max": 230.0
+    },
+    "rollout/policies/policy_2/requests_waiting_mean": {
+      "mean": 61.93009514812973,
+      "min": 16.10720562390158,
+      "max": 98.41739130434783
+    },
+    "rollout/policies/policy_2/total_tokens_per_s": {
+      "mean": 9278.847291889866,
+      "min": 7961.580057032189,
+      "max": 11980.432573280374
+    },
+    "rollout/prompt_tokens": {
+      "mean": 34892207.0,
+      "min": 28243988.0,
+      "max": 53049937.0
+    },
+    "rollout_training_kl": {
+      "mean": 0.012954115867614746,
+      "min": 0.007761057466268539,
+      "max": 0.017917143180966377
+    },
+    "rollout_training_log_ppl_abs_diff": {
+      "mean": 0.011714771057346038,
+      "min": 0.00641237199306488,
+      "max": 0.016292855143547058
+    },
+    "rollout_training_ppl_ratio": {
+      "mean": 1.0134035348892212,
+      "min": 1.0066907405853271,
+      "max": 1.0198673009872437
+    },
+    "rollout_wait_s": {
+      "mean": 2313.22040874511,
+      "min": 1732.5242792740464,
+      "max": 2925.4616954922676
+    },
+    "staleness_max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "staleness_mean": {
+      "mean": 0.7171948818825025,
+      "min": 0.0,
+      "max": 0.9782101167315175
+    },
+    "staleness_worst_mean": {
+      "mean": 0.7239322096970502,
+      "min": 0.0,
+      "max": 0.9782101167315175
+    },
+    "step": {
+      "mean": 4.0,
+      "min": 1.0,
+      "max": 7.0
+    },
+    "trainer_throughput": {
+      "mean": 409.6263047718562,
+      "min": 320.8507442746856,
+      "max": 507.12776120514275
+    },
+    "trainer_tracking/dynamic_inference/active_lends": {
+      "mean": 1.5714285714285714,
+      "min": 0.0,
+      "max": 4.0
+    },
+    "trainer_tracking/dynamic_inference/borrow_cooldown_remaining_s": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/dynamic_inference/disabled_by_failures": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/dynamic_inference/early_returns": {
+      "mean": 17.571428571428573,
+      "min": 3.0,
+      "max": 31.0
+    },
+    "trainer_tracking/dynamic_inference/kv_util/policy_1": {
+      "mean": 0.30619857142857143,
+      "min": 0.022548,
+      "max": 0.653824
+    },
+    "trainer_tracking/dynamic_inference/kv_util/policy_2": {
+      "mean": 0.127453,
+      "min": 0.0,
+      "max": 0.394061
+    },
+    "trainer_tracking/dynamic_inference/queue_time_s/policy_1": {
+      "mean": 88.22,
+      "min": 0.27,
+      "max": 208.0
+    },
+    "trainer_tracking/dynamic_inference/queue_time_s/policy_2": {
+      "mean": 63.752857142857145,
+      "min": 0.0,
+      "max": 240.0
+    },
+    "trainer_tracking/dynamic_inference/renewals": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/dynamic_inference/returns": {
+      "mean": 14.285714285714286,
+      "min": 6.0,
+      "max": 24.0
+    },
+    "trainer_tracking/dynamic_inference/swap_episodes": {
+      "mean": 33.42857142857143,
+      "min": 9.0,
+      "max": 56.0
+    },
+    "trainer_tracking/dynamic_inference/waiting_per_replica/policy_1": {
+      "mean": 0.95775,
+      "min": 0.0,
+      "max": 3.736111
+    },
+    "trainer_tracking/dynamic_inference/waiting_per_replica/policy_2": {
+      "mean": 0.15759642857142858,
+      "min": 0.0,
+      "max": 0.589286
+    },
+    "trainer_tracking/perf/throughput": {
+      "mean": 409.6263047718562,
+      "min": 320.8507442746856,
+      "max": 507.12776120514275
+    },
+    "trainer_tracking/perf/time_per_step": {
+      "mean": 3240.602321130889,
+      "min": 2631.8402702212334,
+      "max": 3739.3991181626916
+    },
+    "trainer_tracking/perf/total_num_tokens": {
+      "mean": 41953116.0,
+      "min": 34607993.0,
+      "max": 52363507.0
+    },
+    "trainer_tracking/policy_1/actor/advantages_abs_mean": {
+      "mean": 0.13733003873910224,
+      "min": 0.05548267439007759,
+      "max": 0.2043170928955078
+    },
+    "trainer_tracking/policy_1/actor/advantages_max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_1/actor/advantages_mean": {
+      "mean": 0.12881395433630263,
+      "min": 0.04123423993587494,
+      "max": 0.19738709926605225
+    },
+    "trainer_tracking/policy_1/actor/advantages_min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/actor/advantages_positive_ratio": {
+      "mean": 0.13665702140757016,
+      "min": 0.05479248985648155,
+      "max": 0.20339781045913696
+    },
+    "trainer_tracking/policy_1/actor/advantages_std": {
+      "mean": 0.33915851584502626,
+      "min": 0.23047052323818207,
+      "max": 0.4054892361164093
+    },
+    "trainer_tracking/policy_1/actor/entropy": {
+      "mean": 0.009100935687976224,
+      "min": 0.006870822049677372,
+      "max": 0.010946063324809074
+    },
+    "trainer_tracking/policy_1/actor/grad_norm": {
+      "mean": 0.17936751275278984,
+      "min": 0.07024455567200978,
+      "max": 0.46848024101927876
+    },
+    "trainer_tracking/policy_1/actor/loss": {
+      "mean": -0.1306517658356045,
+      "min": -0.18756861488024393,
+      "max": -0.04015888040885329
+    },
+    "trainer_tracking/policy_1/actor/lr": {
+      "mean": 1e-06,
+      "min": 1e-06,
+      "max": 1e-06
+    },
+    "trainer_tracking/policy_1/actor/perf/cpu_memory_used_gb": {
+      "mean": 582.4896622612363,
+      "min": 574.3651466369629,
+      "max": 586.6385065714518
+    },
+    "trainer_tracking/policy_1/actor/perf/max_memory_allocated_gb": {
+      "mean": 24.910340785980225,
+      "min": 24.910340785980225,
+      "max": 24.910340785980225
+    },
+    "trainer_tracking/policy_1/actor/perf/max_memory_reserved_gb": {
+      "mean": 28.767299107142858,
+      "min": 28.68359375,
+      "max": 28.830078125
+    },
+    "trainer_tracking/policy_1/actor/pg_clipfrac": {
+      "mean": 0.0002219949924853921,
+      "min": 7.611638552237122e-05,
+      "max": 0.00048378512039686026
+    },
+    "trainer_tracking/policy_1/actor/pg_clipfrac_lower": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/actor/pg_loss": {
+      "mean": -0.13065176766498812,
+      "min": -0.18756861961446702,
+      "max": -0.04015888059802819
+    },
+    "trainer_tracking/policy_1/actor/ppo_kl": {
+      "mean": -0.0007916619989742197,
+      "min": -0.0017682124762069277,
+      "max": -0.0002614183524869478
+    },
+    "trainer_tracking/policy_1/critic/advantages/max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_1/critic/advantages/mean": {
+      "mean": 0.12881395433630263,
+      "min": 0.04123423993587494,
+      "max": 0.19738709926605225
+    },
+    "trainer_tracking/policy_1/critic/advantages/min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/critic/returns/max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_1/critic/returns/mean": {
+      "mean": 0.12881395433630263,
+      "min": 0.04123423993587494,
+      "max": 0.19738709926605225
+    },
+    "trainer_tracking/policy_1/critic/returns/min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/critic/rewards/max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/critic/rewards/mean": {
+      "mean": 0.9961163997650146,
+      "min": 0.9939960241317749,
+      "max": 0.9980928301811218
+    },
+    "trainer_tracking/policy_1/critic/rewards/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/critic/score/max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/critic/score/mean": {
+      "mean": 0.9961163997650146,
+      "min": 0.9939960241317749,
+      "max": 0.9980928301811218
+    },
+    "trainer_tracking/policy_1/critic/score/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/global_seqlen/balanced_max": {
+      "mean": 6347349.428571428,
+      "min": 5479075.0,
+      "max": 7780991.0
+    },
+    "trainer_tracking/policy_1/global_seqlen/balanced_min": {
+      "mean": 6344099.0,
+      "min": 5476172.0,
+      "max": 7777912.0
+    },
+    "trainer_tracking/policy_1/global_seqlen/max": {
+      "mean": 7367964.714285715,
+      "min": 6398934.0,
+      "max": 8645863.0
+    },
+    "trainer_tracking/policy_1/global_seqlen/mean": {
+      "mean": 6345934.035714285,
+      "min": 5477674.25,
+      "max": 7780007.75
+    },
+    "trainer_tracking/policy_1/global_seqlen/min": {
+      "mean": 3433609.1428571427,
+      "min": 574685.0,
+      "max": 5765906.0
+    },
+    "trainer_tracking/policy_1/global_seqlen/minmax_diff": {
+      "mean": 3934355.5714285714,
+      "min": 651309.0,
+      "max": 8071178.0
+    },
+    "trainer_tracking/policy_1/num_turns/max": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_1/num_turns/mean": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_1/num_turns/min": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_spans/max": {
+      "mean": 1.5714285714285714,
+      "min": 1.0,
+      "max": 2.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_spans/mean": {
+      "mean": 1.0086458265488805,
+      "min": 1.0,
+      "max": 1.0288315629742033
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_spans/min": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness/mean": {
+      "mean": 0.7033334577240679,
+      "min": 0.0,
+      "max": 0.9701207883026065
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness_worst/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness_worst/mean": {
+      "mean": 0.7119792842729484,
+      "min": 0.0,
+      "max": 0.9701207883026065
+    },
+    "trainer_tracking/policy_1/off_policy/trajectory_staleness_worst/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/perf/mfu/actor": {
+      "mean": 0.37624312237924024,
+      "min": 0.3677556582340325,
+      "max": 0.3820067291936729
+    },
+    "trainer_tracking/policy_1/prompt_length/clip_ratio": {
+      "mean": 0.0003964772165220763,
+      "min": 0.0,
+      "max": 0.0007587253348901868
+    },
+    "trainer_tracking/policy_1/prompt_length/max": {
+      "mean": 11787.714285714286,
+      "min": 10344.0,
+      "max": 12956.0
+    },
+    "trainer_tracking/policy_1/prompt_length/mean": {
+      "mean": 7501.593122209822,
+      "min": 7397.14794921875,
+      "max": 7652.55517578125
+    },
+    "trainer_tracking/policy_1/prompt_length/min": {
+      "mean": 89.0,
+      "min": 89.0,
+      "max": 89.0
+    },
+    "trainer_tracking/policy_1/response/aborted_ratio": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_1/response_length/clip_ratio": {
+      "mean": 0.17816609357084548,
+      "min": 0.15631692111492157,
+      "max": 0.19879919290542603
+    },
+    "trainer_tracking/policy_1/response_length/max": {
+      "mean": 10240.0,
+      "min": 10240.0,
+      "max": 10240.0
+    },
+    "trainer_tracking/policy_1/response_length/mean": {
+      "mean": 9165.666573660714,
+      "min": 9127.615234375,
+      "max": 9202.1396484375
+    },
+    "trainer_tracking/policy_1/response_length/min": {
+      "mean": 7373.0,
+      "min": 7373.0,
+      "max": 7373.0
+    },
+    "trainer_tracking/policy_1/response_length_non_aborted/clip_ratio": {
+      "mean": 0.17816609357084548,
+      "min": 0.15631692111492157,
+      "max": 0.19879919290542603
+    },
+    "trainer_tracking/policy_1/response_length_non_aborted/max": {
+      "mean": 10240.0,
+      "min": 10240.0,
+      "max": 10240.0
+    },
+    "trainer_tracking/policy_1/response_length_non_aborted/mean": {
+      "mean": 9165.666573660714,
+      "min": 9127.615234375,
+      "max": 9202.1396484375
+    },
+    "trainer_tracking/policy_1/response_length_non_aborted/min": {
+      "mean": 7373.0,
+      "min": 7373.0,
+      "max": 7373.0
+    },
+    "trainer_tracking/policy_1/training/rollout_actor_probs_pearson_corr": {
+      "mean": 0.6950761931283134,
+      "min": 0.5971340537071228,
+      "max": 0.8118278384208679
+    },
+    "trainer_tracking/policy_1/training/rollout_probs_diff_max": {
+      "mean": 0.9982416374342782,
+      "min": 0.9975414872169495,
+      "max": 0.999998927116394
+    },
+    "trainer_tracking/policy_1/training/rollout_probs_diff_mean": {
+      "mean": 0.0036035030747630765,
+      "min": 0.002554709790274501,
+      "max": 0.004280854016542435
+    },
+    "trainer_tracking/policy_1/training/rollout_probs_diff_std": {
+      "mean": 0.049470862107617516,
+      "min": 0.03329852595925331,
+      "max": 0.06102650985121727
+    },
+    "trainer_tracking/policy_1/training/rollout_probs_diff_valid": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_1/trajectory_count": {
+      "mean": 1522.7142857142858,
+      "min": 1318.0,
+      "max": 1871.0
+    },
+    "trainer_tracking/policy_2/actor/advantages_abs_mean": {
+      "mean": 0.15597095074398176,
+      "min": 0.052891749888658524,
+      "max": 0.2557983994483948
+    },
+    "trainer_tracking/policy_2/actor/advantages_max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_2/actor/advantages_mean": {
+      "mean": 0.14543295438800538,
+      "min": 0.03663334250450134,
+      "max": 0.2449011355638504
+    },
+    "trainer_tracking/policy_2/actor/advantages_min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/actor/advantages_positive_ratio": {
+      "mean": 0.15513619195137704,
+      "min": 0.052080247551202774,
+      "max": 0.25433868169784546
+    },
+    "trainer_tracking/policy_2/actor/advantages_std": {
+      "mean": 0.3555988499096462,
+      "min": 0.2252512276172638,
+      "max": 0.4408646523952484
+    },
+    "trainer_tracking/policy_2/actor/entropy": {
+      "mean": 0.007063174553747688,
+      "min": 0.005304549355059862,
+      "max": 0.010755184106528759
+    },
+    "trainer_tracking/policy_2/actor/grad_norm": {
+      "mean": 0.3800772549584508,
+      "min": 0.18274885322898626,
+      "max": 0.7100944966077805
+    },
+    "trainer_tracking/policy_2/actor/loss": {
+      "mean": -0.14403643707434335,
+      "min": -0.23810195922851562,
+      "max": -0.027537128577629726
+    },
+    "trainer_tracking/policy_2/actor/lr": {
+      "mean": 1e-06,
+      "min": 1e-06,
+      "max": 1e-06
+    },
+    "trainer_tracking/policy_2/actor/perf/cpu_memory_used_gb": {
+      "mean": 630.8977009001233,
+      "min": 627.8405513763428,
+      "max": 636.5045700073242
+    },
+    "trainer_tracking/policy_2/actor/perf/max_memory_allocated_gb": {
+      "mean": 27.58262825012207,
+      "min": 27.58262825012207,
+      "max": 27.58262825012207
+    },
+    "trainer_tracking/policy_2/actor/perf/max_memory_reserved_gb": {
+      "mean": 32.5078125,
+      "min": 32.4296875,
+      "max": 32.5390625
+    },
+    "trainer_tracking/policy_2/actor/pg_clipfrac": {
+      "mean": 0.00011862953999800821,
+      "min": 1.0899065470307364e-05,
+      "max": 0.0003488365823346505
+    },
+    "trainer_tracking/policy_2/actor/pg_clipfrac_lower": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/actor/pg_loss": {
+      "mean": -0.1440364362635938,
+      "min": -0.23810197226703167,
+      "max": -0.027537127297061186
+    },
+    "trainer_tracking/policy_2/actor/ppo_kl": {
+      "mean": -0.0007031751733222114,
+      "min": -0.0022830535166558346,
+      "max": -0.0001398244005950703
+    },
+    "trainer_tracking/policy_2/critic/advantages/max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_2/critic/advantages/mean": {
+      "mean": 0.14543295438800538,
+      "min": 0.03663334250450134,
+      "max": 0.2449011355638504
+    },
+    "trainer_tracking/policy_2/critic/advantages/min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/critic/returns/max": {
+      "mean": 0.9999990463256836,
+      "min": 0.9999990463256836,
+      "max": 0.9999990463256836
+    },
+    "trainer_tracking/policy_2/critic/returns/mean": {
+      "mean": 0.14543295438800538,
+      "min": 0.03663334250450134,
+      "max": 0.2449011355638504
+    },
+    "trainer_tracking/policy_2/critic/returns/min": {
+      "mean": -1.1377266986029488,
+      "min": -1.4999970197677612,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/critic/rewards/max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/critic/rewards/mean": {
+      "mean": 0.995055615901947,
+      "min": 0.993934154510498,
+      "max": 0.9972602725028992
+    },
+    "trainer_tracking/policy_2/critic/rewards/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/critic/score/max": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/critic/score/mean": {
+      "mean": 0.995055615901947,
+      "min": 0.993934154510498,
+      "max": 0.9972602725028992
+    },
+    "trainer_tracking/policy_2/critic/score/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/balanced_max": {
+      "mean": 8287434.857142857,
+      "min": 6354679.0,
+      "max": 10621907.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/balanced_min": {
+      "mean": 8281945.0,
+      "min": 6342617.0,
+      "max": 10621569.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/max": {
+      "mean": 10083067.142857144,
+      "min": 9344596.0,
+      "max": 14097827.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/mean": {
+      "mean": 8284689.928571428,
+      "min": 6348648.0,
+      "max": 10621738.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/min": {
+      "mean": 6486312.714285715,
+      "min": 3323218.0,
+      "max": 9341306.0
+    },
+    "trainer_tracking/policy_2/global_seqlen/minmax_diff": {
+      "mean": 3596754.4285714286,
+      "min": 124910.0,
+      "max": 6952178.0
+    },
+    "trainer_tracking/policy_2/num_turns/max": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_2/num_turns/mean": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_2/num_turns/min": {
+      "mean": 3.0,
+      "min": 3.0,
+      "max": 3.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_spans/max": {
+      "mean": 1.4285714285714286,
+      "min": 1.0,
+      "max": 2.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_spans/mean": {
+      "mean": 1.003437998853746,
+      "min": 1.0,
+      "max": 1.0141843971631206
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_spans/min": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness/mean": {
+      "mean": 0.7417294024712799,
+      "min": 0.0,
+      "max": 0.9909729187562688
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness_worst/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness_worst/mean": {
+      "mean": 0.745167401325026,
+      "min": 0.0,
+      "max": 0.9909729187562688
+    },
+    "trainer_tracking/policy_2/off_policy/trajectory_staleness_worst/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/perf/mfu/actor": {
+      "mean": 0.35899089022910813,
+      "min": 0.351050858393095,
+      "max": 0.3621638048787592
+    },
+    "trainer_tracking/policy_2/prompt_length/clip_ratio": {
+      "mean": 0.00048560069574575337,
+      "min": 0.0,
+      "max": 0.001369863050058484
+    },
+    "trainer_tracking/policy_2/prompt_length/max": {
+      "mean": 11377.142857142857,
+      "min": 10345.0,
+      "max": 13577.0
+    },
+    "trainer_tracking/policy_2/prompt_length/mean": {
+      "mean": 9267.46177455357,
+      "min": 9226.140625,
+      "max": 9314.853515625
+    },
+    "trainer_tracking/policy_2/prompt_length/min": {
+      "mean": 7259.0,
+      "min": 5973.0,
+      "max": 7480.0
+    },
+    "trainer_tracking/policy_2/response/aborted_ratio": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/policy_2/response_length/clip_ratio": {
+      "mean": 0.17369658393519266,
+      "min": 0.15440115332603455,
+      "max": 0.21564693748950958
+    },
+    "trainer_tracking/policy_2/response_length/max": {
+      "mean": 10240.0,
+      "min": 10240.0,
+      "max": 10240.0
+    },
+    "trainer_tracking/policy_2/response_length/mean": {
+      "mean": 9142.8564453125,
+      "min": 9081.2265625,
+      "max": 9231.1123046875
+    },
+    "trainer_tracking/policy_2/response_length/min": {
+      "mean": 7373.714285714285,
+      "min": 7373.0,
+      "max": 7375.0
+    },
+    "trainer_tracking/policy_2/response_length_non_aborted/clip_ratio": {
+      "mean": 0.17369658393519266,
+      "min": 0.15440115332603455,
+      "max": 0.21564693748950958
+    },
+    "trainer_tracking/policy_2/response_length_non_aborted/max": {
+      "mean": 10240.0,
+      "min": 10240.0,
+      "max": 10240.0
+    },
+    "trainer_tracking/policy_2/response_length_non_aborted/mean": {
+      "mean": 9142.8564453125,
+      "min": 9081.2265625,
+      "max": 9231.1123046875
+    },
+    "trainer_tracking/policy_2/response_length_non_aborted/min": {
+      "mean": 7373.714285714285,
+      "min": 7373.0,
+      "max": 7375.0
+    },
+    "trainer_tracking/policy_2/training/rollout_actor_probs_pearson_corr": {
+      "mean": 0.5694685578346252,
+      "min": 0.5264742970466614,
+      "max": 0.6404750347137451
+    },
+    "trainer_tracking/policy_2/training/rollout_probs_diff_max": {
+      "mean": 0.9978342652320862,
+      "min": 0.9967507123947144,
+      "max": 0.9981957674026489
+    },
+    "trainer_tracking/policy_2/training/rollout_probs_diff_mean": {
+      "mean": 0.004233683991645064,
+      "min": 0.0031178451608866453,
+      "max": 0.004831856582313776
+    },
+    "trainer_tracking/policy_2/training/rollout_probs_diff_std": {
+      "mean": 0.057003977575472424,
+      "min": 0.048162367194890976,
+      "max": 0.06456214934587479
+    },
+    "trainer_tracking/policy_2/training/rollout_probs_diff_valid": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/policy_2/trajectory_count": {
+      "mean": 899.5714285714286,
+      "min": 693.0,
+      "max": 1154.0
+    },
+    "trainer_tracking/rollout_corr/chi2_seq": {
+      "mean": -0.8266637580735343,
+      "min": -0.9573277235031128,
+      "max": -0.7322871685028076
+    },
+    "trainer_tracking/rollout_corr/chi2_token": {
+      "mean": -0.004529680524553571,
+      "min": -0.005267739295959473,
+      "max": -0.003871023654937744
+    },
+    "trainer_tracking/rollout_corr/k3_kl": {
+      "mean": 0.009106199855783157,
+      "min": 0.004610453732311726,
+      "max": 0.013600499369204044
+    },
+    "trainer_tracking/rollout_corr/kl": {
+      "mean": 0.012954115867614746,
+      "min": 0.007761057466268539,
+      "max": 0.017917143180966377
+    },
+    "trainer_tracking/rollout_corr/log_ppl_abs_diff": {
+      "mean": 0.011714771057346038,
+      "min": 0.00641237199306488,
+      "max": 0.016292855143547058
+    },
+    "trainer_tracking/rollout_corr/log_ppl_diff": {
+      "mean": 0.011714402985359942,
+      "min": 0.006411814130842686,
+      "max": 0.016292612999677658
+    },
+    "trainer_tracking/rollout_corr/log_ppl_diff_max": {
+      "mean": 0.595621624163219,
+      "min": 0.3580126166343689,
+      "max": 0.9558734893798828
+    },
+    "trainer_tracking/rollout_corr/log_ppl_diff_min": {
+      "mean": -0.00011271826224401593,
+      "min": -0.0002126116305589676,
+      "max": -8.209416409954429e-05
+    },
+    "trainer_tracking/rollout_corr/ppl_ratio": {
+      "mean": 1.0134035348892212,
+      "min": 1.0066907405853271,
+      "max": 1.0198673009872437
+    },
+    "trainer_tracking/rollout_corr/rollout_log_ppl": {
+      "mean": 0.005632249505392143,
+      "min": 0.005122625268995762,
+      "max": 0.006349911447614431
+    },
+    "trainer_tracking/rollout_corr/rollout_ppl": {
+      "mean": 1.0058622871126448,
+      "min": 1.005182147026062,
+      "max": 1.0072845220565796
+    },
+    "trainer_tracking/rollout_corr/training_log_ppl": {
+      "mean": 0.017346651426383426,
+      "min": 0.011736186221241951,
+      "max": 0.021615590900182724
+    },
+    "trainer_tracking/rollout_corr/training_ppl": {
+      "mean": 1.0194838217326574,
+      "min": 1.012162446975708,
+      "max": 1.0254226922988892
+    },
+    "trainer_tracking/timing_per_token_ms/adv": {
+      "mean": 0.000159774413024187,
+      "min": 0.0001333573270638344,
+      "max": 0.0001754922227228246
+    },
+    "trainer_tracking/timing_per_token_ms/gen": {
+      "mean": 0.10631992421178872,
+      "min": 0.07316747414865912,
+      "max": 0.14406260964087786
+    },
+    "trainer_tracking/timing_s/adv": {
+      "mean": 6.690909734794071,
+      "min": 5.626515202224255,
+      "max": 8.297205060720444
+    },
+    "trainer_tracking/timing_s/gen": {
+      "mean": 2313.22040874511,
+      "min": 1732.5242792740464,
+      "max": 2925.4616954922676
+    },
+    "trainer_tracking/timing_s/policy_1/old_log_prob": {
+      "mean": 156.84144683395112,
+      "min": 131.07084579765797,
+      "max": 223.97214376181364
+    },
+    "trainer_tracking/timing_s/policy_1/update_actor": {
+      "mean": 490.7758106844766,
+      "min": 425.40105006843805,
+      "max": 603.3315581381321
+    },
+    "trainer_tracking/timing_s/policy_1/update_weights": {
+      "mean": 13.560306495853833,
+      "min": 8.81667260080576,
+      "max": 21.962662182748318
+    },
+    "trainer_tracking/timing_s/policy_2/old_log_prob": {
+      "mean": 214.0245525645358,
+      "min": 160.21887620538473,
+      "max": 323.4013123065233
+    },
+    "trainer_tracking/timing_s/policy_2/update_actor": {
+      "mean": 685.3034944736531,
+      "min": 531.4930660352111,
+      "max": 873.8940417394042
+    },
+    "trainer_tracking/timing_s/policy_2/update_weights": {
+      "mean": 13.915962757808822,
+      "min": 9.756174877285957,
+      "max": 23.840168967843056
+    },
+    "trainer_tracking/timing_s/step": {
+      "mean": 3240.602321130889,
+      "min": 2631.8402702212334,
+      "max": 3739.3991181626916
+    },
+    "trainer_tracking/training/global_step": {
+      "mean": 4.0,
+      "min": 1.0,
+      "max": 7.0
+    },
+    "trainer_tracking/training/mas_rollout_count": {
+      "mean": 290.7142857142857,
+      "min": 252.0,
+      "max": 365.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_spans/max": {
+      "mean": 1.7142857142857142,
+      "min": 1.0,
+      "max": 2.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_spans/mean": {
+      "mean": 1.0067373278145477,
+      "min": 1.0,
+      "max": 1.020885131775236
+    },
+    "trainer_tracking/training/off_policy/trajectory_spans/min": {
+      "mean": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness/mean": {
+      "mean": 0.7171948818825025,
+      "min": 0.0,
+      "max": 0.9782101167315175
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness_worst/max": {
+      "mean": 0.8571428571428571,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness_worst/mean": {
+      "mean": 0.7239322096970502,
+      "min": 0.0,
+      "max": 0.9782101167315175
+    },
+    "trainer_tracking/training/off_policy/trajectory_staleness_worst/min": {
+      "mean": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "trainer_tracking/training/rollout_failure/evicted_samples": {
+      "mean": 30.714285714285715,
+      "min": 5.0,
+      "max": 66.0
+    },
+    "trainer_tracking/training/trajectory_count": {
+      "mean": 2422.285714285714,
+      "min": 2011.0,
+      "max": 3025.0
+    },
+    "training_tokens": {
+      "mean": 41953116.0,
+      "min": 34607993.0,
+      "max": 52363507.0
+    },
+    "trajectory_count": {
+      "mean": 2422.285714285714,
+      "min": 2011.0,
+      "max": 3025.0
+    },
+    "wall_clock_s": {
+      "mean": 3240.602321130889,
+      "min": 2631.8402702212334,
+      "max": 3739.3991181626916
+    },
+    "window_end_unix_s": {
+      "mean": 1790192921.5773063,
+      "min": 1790183247.7056057,
+      "max": 1790202211.0657291
+    },
+    "window_start_unix_s": {
+      "mean": 1790189681.4637938,
+      "min": 1790179508.3064876,
+      "max": 1790198840.3402421
+    }
+  },
+  "instantaneous_generation_tokens_per_s": {
+    "1": {
+      "policy_1": 9817.187367641229,
+      "policy_2": 5385.532079029212,
+      "total": 15202.71944667044
+    },
+    "2": {
+      "policy_1": 6998.558508391606,
+      "policy_2": 4626.223520098526,
+      "total": 11624.782028490132
+    },
+    "3": {
+      "policy_1": 5495.815915008758,
+      "policy_2": 4182.917667951995,
+      "total": 9678.733582960753
+    },
+    "4": {
+      "policy_1": 6711.20409439043,
+      "policy_2": 4838.657132284903,
+      "total": 11549.861226675333
+    },
+    "5": {
+      "policy_1": 6545.045218826779,
+      "policy_2": 4064.651745965596,
+      "total": 10609.696964792376
+    },
+    "6": {
+      "policy_1": 6670.605117467005,
+      "policy_2": 4919.333904478806,
+      "total": 11589.939021945811
+    },
+    "7": {
+      "policy_1": 5818.570394951094,
+      "policy_2": 4046.538269578582,
+      "total": 9865.108664529676
+    }
+  }
+}

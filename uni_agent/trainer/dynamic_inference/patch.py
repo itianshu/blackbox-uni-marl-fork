@@ -44,6 +44,7 @@ import logging
 import os
 import itertools
 import time
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +446,27 @@ def _dynamic_max_colocate_count(config) -> int | None:
         return None
 
 
+def _single_rank_checkpoint_worker_env(resource_pool) -> dict[str, str] | None:
+    """Use a collision-free rendezvous for TP1 checkpoint workers.
+
+    ``RayWorkerGroup`` normally probes an ephemeral TCP port and releases the
+    probe socket before the worker binds its Gloo ``TCPStore``.  Initialising
+    many standalone TP1 replicas concurrently can therefore hand the same
+    port to two workers (TOCTOU), killing one actor with ``EADDRINUSE``.  A
+    one-rank process group does not need a network rendezvous, so use a unique
+    local ``FileStore`` instead.  Multi-rank groups retain verl's normal TCP
+    rendezvous because their store must be reachable from every rank.
+    """
+    try:
+        world_size = int(resource_pool.world_size)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if world_size != 1:
+        return None
+    store_path = f"/tmp/uni_agent_checkpoint_pg_{uuid.uuid4().hex}"
+    return {"DIST_INIT_METHOD": f"file://{store_path}"}
+
+
 async def _patched_init_standalone(self):
     """RolloutReplica.init_standalone with a guest external-pool path.
 
@@ -478,6 +500,7 @@ async def _patched_init_standalone(self):
             bin_pack=False,
             name_prefix=f"rollout_guest_{self.replica_rank}{self.name_suffix}",
             master_port_range=getattr(self, "_guest_master_port_range", None),
+            worker_env=_single_rank_checkpoint_worker_env(pool),
             use_gpu=True,
             device_name=get_device_name(),
         )
@@ -537,6 +560,7 @@ async def _patched_init_standalone(self):
             ray_cls_with_init=self.get_ray_class_with_init_args(),
             bin_pack=False,
             name_prefix=worker_prefix,
+            worker_env=_single_rank_checkpoint_worker_env(self.resource_pool),
             use_gpu=True,
             device_name=get_device_name(),
         )

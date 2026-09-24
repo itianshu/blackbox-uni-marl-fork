@@ -60,8 +60,10 @@ def _install_verl_stubs(monkeypatch):
     class FakeRayWorkerGroup:
         def __init__(self, *, resource_pool=None, ray_cls_with_init=None,
                      bin_pack=False, name_prefix="", master_port_range=None,
-                     use_gpu=True, device_name=None):
+                     worker_env=None, use_gpu=True, device_name=None):
             calls.append(("worker_group", resource_pool, name_prefix, master_port_range))
+            if worker_env is not None:
+                calls.append(("worker_env", worker_env))
             self.workers = [f"worker:{name_prefix}"]
 
     class FakeResourcePoolManager:
@@ -71,6 +73,7 @@ def _install_verl_stubs(monkeypatch):
                 name: SimpleNamespace(
                     name=f"pool:{name}",
                     max_colocate_count=max_colocate_count,
+                    world_size=1,
                 )
                 for name in resource_pool_spec
             }
@@ -172,6 +175,27 @@ class TestInitStandalonePatch:
         asyncio.run(replica.init_standalone())
 
         assert ("worker_group", "home-pool", "rollout_guest_1", None) in calls
+
+    def test_guest_tp1_uses_unique_file_store(self, monkeypatch):
+        replica_mod, calls = _install_verl_stubs(monkeypatch)
+        patch.apply_patch()
+        pool = SimpleNamespace(world_size=1)
+        replica = _make_replica(replica_mod, _guest_external_pool=pool)
+        asyncio.run(replica.init_standalone())
+
+        worker_env = next(call[1] for call in calls if call[0] == "worker_env")
+        assert worker_env["DIST_INIT_METHOD"].startswith(
+            "file:///tmp/uni_agent_checkpoint_pg_"
+        )
+
+    def test_multi_rank_keeps_verl_tcp_rendezvous(self, monkeypatch):
+        replica_mod, calls = _install_verl_stubs(monkeypatch)
+        patch.apply_patch()
+        pool = SimpleNamespace(world_size=2)
+        replica = _make_replica(replica_mod, _guest_external_pool=pool)
+        asyncio.run(replica.init_standalone())
+
+        assert not any(call[0] == "worker_env" for call in calls)
 
     def test_guest_path_injects_policy_label(self, monkeypatch):
         replica_mod, calls = _install_verl_stubs(monkeypatch)
