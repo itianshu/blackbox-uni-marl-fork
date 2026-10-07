@@ -81,7 +81,7 @@ def _config(**overrides):
     # defaults are covered independently by test_dynamic_inference_types.py.
     data = {
         "enable": True,
-        "bottleneck_confirm_polls": 2,
+        "rebalance_confirm_polls": 2,
         "borrow_cooldown_s": 0,
         "return_confirm_polls": 1,
     }
@@ -89,7 +89,7 @@ def _config(**overrides):
     return parse_scheduling_config(data)
 
 
-def _scheduler(policies=("a", "b"), *, signals=None, units=None, on_early_return=None, **overrides):
+def _scheduler(policies=("a", "b"), *, signals=None, units=None, **overrides):
     handles = {p: _handle(p) for p in policies}
     signals = signals or SignalStore(list(policies), max_num_seqs={p: 32 for p in policies})
     units = units or FakeGuestUnits()
@@ -98,7 +98,6 @@ def _scheduler(policies=("a", "b"), *, signals=None, units=None, on_early_return
         handles=handles,
         signals=signals,
         guest_units=units,
-        on_early_return=on_early_return,
     )
     return sched
 
@@ -155,9 +154,9 @@ def test_one_quantity_plan_selects_only_the_requested_borrowers_best_unit():
     ]})
     sched.handles['b'].replicas = [FakeReplica('b', i) for i in range(4)]
     sched.ema_kv.update(a=.9, b=.01, c=.95)
-    plans = sched.quantity.plan(sched, 'c', step=1)
-    assert [plan.donor for plan in plans] == ['c']
-    assert sum(len(plan.home_replicas) for plan in plans) == 1
+    plan = sched.quantity.select_borrow(sched, 'c', step=1)
+    assert plan.donor == 'c'
+    assert len(plan.home_replicas) == 1
 
 
 def test_diluted_incumbent_does_not_block_another_borrower_or_move_physical_units():
@@ -171,10 +170,14 @@ def test_diluted_incumbent_does_not_block_another_borrower_or_move_physical_unit
         home_replicas=[incumbent_replica], guests=[FakeReplica('a', 10000)], since_step=1)
     sched.note_borrow_started(lend)
     sched.ema_kv.update(a=.007, b=.002, c=.03)
-    plans = sched._guard_normal_returns(sched.quantity.plan(sched, 'c', step=2))
-    assert sorted(plan.donor for plan in plans) == ['a', 'c']
-    assert next(plan for plan in plans if plan.donor == 'a').home_replicas == [incumbent_replica]
-    assert incumbent_replica not in next(plan for plan in plans if plan.donor == 'c').home_replicas
+    sched._settle_polls_remaining = 0
+    plan = None
+    for step in range(sched.config.rebalance_confirm_polls):
+        plan = sched.decide(_stats(step))
+    assert plan.returns == []
+    assert [borrow.donor for borrow in plan.borrows] == ['c']
+    assert incumbent_replica not in plan.borrows[0].home_replicas
+    assert sched.active_lends == [lend]
 
 
 # ------------------------------------------------------------ SignalStore
@@ -214,69 +217,60 @@ class TestSignalStore:
         assert store.stat_inflight("a", "instant") == 7
 
 
-# ------------------------------------------------------------- bottleneck FSM
-class TestBottleneckDetection:
-    def _saturate(self, sched, kv_a, kv_b):
-        store = sched.signals
-        _feed(store, "a", {"a-rep0": 4}, kv={"a-rep0": kv_a})
-        _feed(store, "b", {"b-rep0": 4}, kv={"b-rep0": kv_b})
-        _saturate_kv(sched)
+# ------------------------------------------------------------- borrow confirmation
+class TestBorrowConfirmation:
+    def test_only_one_confirmation_stage(self):
+        sched = _prepared_scheduler(kv_a=.95, kv_b=.1)
+        assert sched.decide(_stats(10)).borrows == []
+        assert sched._pending_borrow_pair == ("b", "a")
+        assert sched._pending_borrow_polls == 1
+        assert len(sched.decide(_stats(11)).borrows) == 1
+        assert not hasattr(sched, "bottleneck")
+        assert not hasattr(sched, "confirm")
 
-    def test_confirm_steps_required(self):
+    def test_no_safe_plan_clears_confirmation(self):
+        sched = _prepared_scheduler(kv_a=.95, kv_b=.1)
+        sched.decide(_stats(10))
+        sched.pair_block_until[("b", "a")] = 20
+        assert sched.decide(_stats(11)).borrows == []
+        assert sched._pending_borrow_pair is None
+        assert sched._pending_borrow_polls == 0
+        assert sched.decide(_stats(20)).borrows == []
+        assert len(sched.decide(_stats(21)).borrows) == 1
+
+    def test_below_enter_clears_confirmation(self):
+        sched = _prepared_scheduler(kv_a=.95, kv_b=.1)
+        sched.decide(_stats(10))
+        sched.ema_kv["a"] = .7
+        assert sched.decide(_stats(11)).borrows == []
+        assert sched._pending_borrow_pair is None
+        assert sched._pending_borrow_polls == 0
+
+    def test_highest_load_is_candidate_but_not_necessarily_borrowable(self):
         sched = _scheduler()
-        self._saturate(sched, kv_a=0.95, kv_b=0.1)
-        # first sighting: candidate seen, not yet confirmed
-        sched.decide(_stats(step=10))
-        assert sched.bottleneck is None
-        sched.decide(_stats(step=11))
-        assert sched.bottleneck == "a"
+        sched.ema_kv.update(a=.9, b=.97)
+        assert sched._pick_candidate() == "b"
+        for step in range(3):
+            assert sched.decide(_stats(step)).borrows == []
+        assert sched._pending_borrow_pair is None
 
-    def test_below_enter_never_bottlenecks(self):
-        sched = _scheduler()
-        self._saturate(sched, kv_a=0.7, kv_b=0.1)  # < kv_enter 0.85
-        _decides(sched, range(10, 16))
-        assert sched.bottleneck is None
-
-    def test_highest_kv_wins_when_both_hot(self):
-        sched = _scheduler()
-        self._saturate(sched, kv_a=0.9, kv_b=0.97)
-        _decides(sched, [10, 11])
-        assert sched.bottleneck == "b"
-
-    def test_exit_at_or_below_kv_exit(self):
-        sched = _scheduler()
-        self._saturate(sched, kv_a=0.95, kv_b=0.1)
-        _decides(sched, [10, 11])
-        assert sched.bottleneck == "a"
-        # a recovers below kv_exit (0.6) — EMA must decay first
-        store2 = SignalStore(["a", "b"], max_num_seqs={"a": 32, "b": 32})
-        sched.signals = store2
-        _feed(store2, "a", {"a-rep0": 4}, kv={"a-rep0": 0.2})
-        _feed(store2, "b", {"b-rep0": 4}, kv={"b-rep0": 0.1})
-        _saturate_kv(sched)
-        sched.decide(_stats(step=12))
-        assert sched.bottleneck is None
-
-        sched.bottleneck = "a"
-        sched.ema_kv["a"] = sched.ru.kv_exit
-        sched.decide(_stats(step=13))
-        assert sched.bottleneck is None
-
-    def test_candidate_switch_needs_reconfirmation(self):
-        sched = _scheduler()
-        self._saturate(sched, kv_a=0.95, kv_b=0.1)
-        _decides(sched, [10, 11])
-        assert sched.bottleneck == "a"
-        # b overtakes a: two more consecutive sightings required
-        store2 = SignalStore(["a", "b"], max_num_seqs={"a": 32, "b": 32})
-        sched.signals = store2
-        _feed(store2, "a", {"a-rep0": 4}, kv={"a-rep0": 0.1})
-        _feed(store2, "b", {"b-rep0": 4}, kv={"b-rep0": 0.95})
-        _saturate_kv(sched)
-        sched.decide(_stats(step=12))
-        assert sched.bottleneck == "a"  # not yet
-        sched.decide(_stats(step=13))
-        assert sched.bottleneck == "b"
+    @pytest.mark.parametrize("switch_borrower", [False, True])
+    def test_pair_change_restarts_confirmation(self, switch_borrower):
+        sched = _scheduler(policies=("a", "b", "c"))
+        sched.ema_kv.update(a=.95, b=.1, c=.2)
+        assert sched.decide(_stats(10)).borrows == []
+        assert sched._pending_borrow_pair == ("b", "a")
+        if switch_borrower:
+            sched.ema_kv.update(a=.1, b=.2, c=.95)
+            expected = ("a", "c")
+        else:
+            sched.ema_kv.update(b=.2, c=.1)
+            expected = ("c", "a")
+        assert sched.decide(_stats(11)).borrows == []
+        assert sched._pending_borrow_pair == expected
+        assert sched._pending_borrow_polls == 1
+        plan = sched.decide(_stats(12))
+        assert [(p.home_policy, p.donor) for p in plan.borrows] == [expected]
 
     def test_long_deep_queue_can_trigger_when_kv_is_low(self):
         sched = _scheduler()
@@ -287,7 +281,7 @@ class TestBottleneckDetection:
         sched.decide(_stats(step=10))
         sched.decide(_stats(step=11))
 
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
 
     def test_queue_trigger_requires_both_depth_and_duration(self):
         sched = _scheduler()
@@ -316,17 +310,16 @@ class TestBottleneckDetection:
 
     def test_composite_exit_requires_kv_and_queue_to_recover(self):
         sched = _scheduler()
-        sched.bottleneck = "a"
         sched.ema_kv["a"] = sched.ru.kv_exit
         sched.waiting_per_replica["a"] = sched.ru.waiting_exit_per_replica + 1
         sched.queue_time_s["a"] = sched.ru.queue_time_exit_s + 1
         sched.decide(_stats(step=10))
-        assert sched.bottleneck == "a"
+        assert not sched._is_relieved("a")
 
         sched.waiting_per_replica["a"] = 0
         sched.queue_time_s["a"] = 0
         sched.decide(_stats(step=11))
-        assert sched.bottleneck is None
+        assert sched._is_relieved("a")
 
 
 # ------------------------------------------------------------- borrow planning
@@ -336,7 +329,7 @@ class TestBorrowPlanning:
     def test_borrows_one_unit_when_that_is_all_the_lender_can_spare(self):
         sched = _prepared_scheduler(kv_a=0.95, kv_b=0.1)
         plan = _decides(sched, [10, 11, 12])
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
         assert len(plan.borrows) == 1
         assert plan.borrows[0].home_policy == "b"
         assert plan.borrows[0].donor == "a"
@@ -395,14 +388,14 @@ class TestBorrowPlanning:
         # lender's single spare replica must stay home (keep >= 1)
         sched = _prepared_scheduler(kv_a=0.95, kv_b=0.1, b_replicas=1)
         plan = _decides(sched, [10, 11, 12])
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
         assert plan.borrows == []
 
     def test_failed_pair_is_blocked(self):
         sched = _prepared_scheduler(kv_a=0.95, kv_b=0.1)
         sched.pair_block_until[("b", "a")] = 99
         plan = _decides(sched, [10, 11, 12])
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
         assert plan.borrows == []
         # after the block expires the pair is eligible again
         sched.pair_block_until[("b", "a")] = 10
@@ -435,7 +428,7 @@ class TestSingleUnitPlanning:
         sched = _prepared_scheduler(
             kv_a=1.0, kv_b=0.48, b_replicas=2, a_replicas=10)
         plan = _decides(sched, [10, 11])
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
         assert plan.borrows == []
         # a cooler lender (.35 -> lender_after .7) is allowed
         sched2 = _prepared_scheduler(
@@ -473,6 +466,130 @@ class TestSingleUnitPlanning:
 
 # ------------------------------------------------------------- returns
 class TestReturns:
+    def test_no_new_candidate_keeps_existing_lend_in_hysteresis_band(self):
+        sched = _scheduler(min_lend_polls=1)
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched.ema_kv.update(a=.7, b=.1)
+        assert sched._pick_candidate() is None
+        plan = sched.decide(_stats(11))
+        assert sched.active_lends == [lend]
+        assert plan.returns == [] and plan.borrows == []
+        assert sched._pending_borrow_pair is None
+
+    def test_return_does_not_wait_for_borrow_confirmation(self):
+        sched = _scheduler(rebalance_confirm_polls=100, min_lend_polls=1)
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched.ema_kv.update(a=.2, b=.1)
+        sched._return_low_polls["a"] = sched.config.return_confirm_polls
+        sched._pending_borrow_pair = ("a", "b")
+        sched._pending_borrow_polls = 1
+        plan = sched.decide(_stats(11))
+        assert plan.returns == [lend]
+        assert plan.borrows == []
+        assert sched._pending_borrow_polls == 0
+        assert sched._pending_borrow_pair is None
+
+    @pytest.mark.parametrize("blocked_by", ["confirmation", "age", "capacity"])
+    def test_blocked_return_does_not_block_an_unrelated_safe_borrow(self, blocked_by):
+        sched = _scheduler(
+            policies=("a", "b", "c", "d"),
+            min_lend_polls=10,
+            return_confirm_polls=10,
+            borrowing={"pairs": [
+                {"home": "b", "donor": "a"},
+                {"home": "d", "donor": "c"},
+            ]},
+        )
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched._decision_count = 0 if blocked_by == "age" else 10
+        sched._return_low_polls["a"] = 9 if blocked_by == "confirmation" else 10
+        sched.ema_kv.update(a=.6 if blocked_by == "capacity" else .2, b=.1, c=.95, d=.1)
+
+        assert sched.decide(_stats(11)).borrows == []
+        plan = sched.decide(_stats(12))
+        assert plan.returns == []
+        assert [(p.home_policy, p.donor) for p in plan.borrows] == [("d", "c")]
+        assert sched.active_lends == [lend]
+
+    def test_borrow_uses_current_capacity_not_capacity_after_pending_return(self):
+        sched = _scheduler(
+            policies=("a", "b", "c"), min_lend_polls=1,
+            rebalance_confirm_polls=1,
+            borrowing={"pairs": [
+                {"home": "b", "donor": "a"},
+                {"home": "b", "donor": "c"},
+            ]},
+        )
+        sched.handles["b"].replicas.append(FakeReplica("b", 2))
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched._return_low_polls["a"] = sched.config.return_confirm_polls
+        sched.ema_kv.update(a=.6, b=.4, c=.95)
+        # Returning a's guest would predict .6 * 24 / 16 = .9: unsafe.
+        # b has 16 cards NOW, not its original 24. Another lend would predict
+        # .4 * 16 / 8 = .8: unsafe, even though .4 * 24 / 16 = .6 looks safe.
+        plan = sched.decide(_stats(11))
+        assert plan.returns == [] and plan.borrows == []
+        assert sched._pending_borrow_pair is None
+
+        sched.ema_kv["b"] = .3
+        plan = sched.decide(_stats(12))
+        assert plan.returns == []
+        assert len(plan.borrows) == 1
+        assert plan.borrows[0].donor == "c"
+        assert lend.home_replicas[0] not in plan.borrows[0].home_replicas
+        assert sched.active_lends == [lend]
+
+    def test_young_lend_does_not_block_return_of_another_mature_lend(self):
+        sched = _scheduler(policies=("a", "b", "c"), min_lend_polls=10)
+        young = self._active_lend(sched)
+        mature = LendRecord(
+            lend_id=2, home_policy="c", donor="a",
+            home_replicas=[sched.handles["c"].replicas[0]], guests=[object()], since_step=11,
+        )
+        sched.note_borrow_started(mature)
+        sched._settle_polls_remaining = 0
+        sched._decision_count = 10
+        sched._lend_start_poll[id(young)] = 10
+        sched._return_low_polls["a"] = sched.config.return_confirm_polls
+        sched.ema_kv.update(a=.2, b=.1, c=.1)
+        plan = sched.decide(_stats(12))
+        assert plan.returns == [mature]
+        assert plan.borrows == []
+        assert sched.active_lends == [young, mature]
+
+    def test_ready_return_skips_borrow_selection_entirely(self):
+        sched = _scheduler(min_lend_polls=1)
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched._return_low_polls["a"] = sched.config.return_confirm_polls
+
+        def unexpected_borrow(*args):
+            pytest.fail("Borrow selection must not run when a return is selected")
+
+        sched.quantity.select_borrow = unexpected_borrow
+        plan = sched.decide(_stats(11))
+        assert plan.returns == [lend]
+        assert plan.borrows == []
+
+    @pytest.mark.parametrize("action", ["borrow", "return", "early_return"])
+    def test_successful_action_resets_borrow_confirmation(self, action):
+        sched = _scheduler()
+        lend = self._active_lend(sched)
+        sched._pending_borrow_pair = ("a", "b")
+        sched._pending_borrow_polls = 1
+        if action == "borrow":
+            sched.active_lends.remove(lend)
+            sched.note_borrow_started(lend)
+        else:
+            sched.note_lend_returned(lend, step=11, early=action == "early_return")
+        assert sched._pending_borrow_pair is None
+        assert sched._pending_borrow_polls == 0
+        assert sched._settle_polls_remaining == sched.config.rebalance_settle_polls
+
     def _active_lend(self, sched):
         lend = LendRecord(
             lend_id=1, home_policy="b", donor="a",
@@ -482,7 +599,7 @@ class TestReturns:
         sched.note_borrow_started(lend)
         return lend
 
-    def test_matching_target_renews_in_place_and_only_borrows_delta(self):
+    def test_matching_target_keeps_active_lend_and_only_borrows_delta(self):
         sched = _scheduler()
         sched.handles["b"].replicas = [FakeReplica("b", i) for i in range(3)]
         store = sched.signals
@@ -491,13 +608,13 @@ class TestReturns:
               kv={f"b-rep{i}": 0.1 for i in range(3)})
         _saturate_kv(sched)
         _decides(sched, [10, 11])
-        assert sched.bottleneck == "a"
+        assert sched._pick_candidate() == "a"
         lend = self._active_lend(sched)
         _saturate_kv(sched, n=sched.config.rebalance_settle_polls)
-        sched.decide(_stats(step=12))
-        plan = sched.decide(_stats(step=12))
+        for _ in range(sched.config.rebalance_confirm_polls):
+            plan = sched.decide(_stats(step=12))
         assert plan.returns == []
-        assert plan.renewals == [lend]
+        assert sched.active_lends == [lend]
         assert len(plan.borrows) == 1
         assert lend.home_replicas[0] not in plan.borrows[0].home_replicas
 
@@ -505,43 +622,73 @@ class TestReturns:
         sched = _scheduler()
         lend = self._active_lend(sched)
         plan = sched.decide(_stats(step=11))
-        assert plan.renewals == [lend]
+        assert sched.active_lends == [lend]
         assert plan.returns == []
+        assert plan.borrows == []
+        assert set(vars(plan)) == {"returns", "borrows"}
 
-    def test_settle_window_counts_fresh_metrics_not_lb_polls(self):
+    def test_disabled_plan_returns_one_lend_without_mutating_active_lends(self):
+        sched = _scheduler(policies=("a", "b", "c"))
+        lends = [LendRecord(
+            lend_id=i, home_policy=home, donor="a",
+            home_replicas=[sched.handles[home].replicas[0]],
+            guests=[object()], since_step=10,
+        ) for i, home in enumerate(("b", "c"), 1)]
+        for lend in lends:
+            sched.note_borrow_started(lend)
+        sched.disabled = True
+        plan = sched.decide(_stats(11))
+        assert plan.returns == lends[:1]
+        assert plan.borrows == []
+        assert sched.active_lends == lends
+
+    def test_retained_lend_prevents_overlapping_new_borrow(self):
+        sched = _scheduler(policies=("a", "b", "c"), rebalance_confirm_polls=1)
+        lend = self._active_lend(sched)
+        sched._settle_polls_remaining = 0
+        sched.ema_kv.update(a=.7, b=.1, c=.95)
+        # Only b may lend to c, but its remaining home replica is the seed.
+        sched.pairs = [BorrowPairSpec(home="b", donor="c")]
+        assert sched.quantity.select_borrow(sched, "c", 11) is None
+        plan = sched.decide(_stats(11))
+        assert plan.returns == [] and plan.borrows == []
+        assert sched.active_lends == [lend]
+
+    def test_settle_window_counts_complete_metric_polls(self):
         sched = _scheduler()
         self._active_lend(sched)
         _feed(sched.signals, "a", {"a-rep0": 1}, kv={"a-rep0": 0.5})
         _feed(sched.signals, "b", {"b-rep1": 1}, kv={"b-rep1": 0.2})
         remaining = sched._settle_polls_remaining
-        sched.poll(metrics_fresh=False)
-        assert sched._settle_polls_remaining == remaining
-        sched.poll(metrics_fresh=True)
+        sched.poll()
         assert sched._settle_polls_remaining == remaining - 1
 
-    def test_invalid_fresh_metrics_do_not_consume_settle_window(self):
+    def test_invalid_metrics_do_not_consume_settle_window(self):
         sched = _scheduler()
         self._active_lend(sched)
         _feed(sched.signals, "a", {"a-rep0": 1}, kv={"a-rep0": float("nan")})
         _feed(sched.signals, "b", {"b-rep1": 1}, kv={"b-rep1": 0.2})
 
         remaining = sched._settle_polls_remaining
-        sched.poll(metrics_fresh=True)
+        assert sched.poll() is False
 
         assert sched._settle_polls_remaining == remaining
         assert "a" not in sched._ema_initialized
+        assert "b" in sched._ema_initialized
+        assert sched.ema_kv["b"] == pytest.approx(0.2)
 
-    def test_empty_target_must_be_confirmed_and_respects_minimum_lend_age(self):
+    def test_return_respects_minimum_lend_age(self):
         sched = _scheduler()
         lend = self._active_lend(sched)
         sched._settle_polls_remaining = 0
         sched._return_low_polls["a"] = sched.config.return_confirm_polls
         first = sched.decide(_stats(step=10))
-        assert first.renewals == [lend]
+        assert first.returns == [] and first.borrows == []
+        assert sched.active_lends == [lend]
         second = sched.decide(_stats(step=10))
         assert second.returns == [lend]
 
-    def test_multiple_polls_can_swap_a_young_lend_within_one_step(self):
+    def test_target_switch_returns_before_any_new_borrow(self):
         sched = _scheduler(policies=("a", "b", "c"), borrowing={"pairs": [
             {"home": "b", "donor": "a"},
             {"home": "b", "donor": "c"},
@@ -553,30 +700,18 @@ class TestReturns:
         )
         sched.note_borrow_started(lend)
         sched._settle_polls_remaining = 0
-        new_target = BorrowPlan(
-            home_policy="b", donor="c",
-            home_replicas=[sched.handles["b"].replicas[0]],
-        )
-        sched.quantity.plan = lambda *_: [new_target]
-        sched.bottleneck = "c"
         sched.ema_kv.update({"a": 0.4, "b": 0.1, "c": 0.95})
         sched._return_low_polls["a"] = sched.config.return_confirm_polls
 
         first = sched.decide(_stats(step=11))
         plan = sched.decide(_stats(step=11))
-        assert first.renewals == [lend]
+        assert first.returns == [] and first.borrows == []
+        assert sched.active_lends == [lend]
         assert plan.returns == [lend]
-        assert plan.borrows == [new_target]
-
-    def test_partial_return_resumes_before_rebalancing(self):
-        sched = _scheduler()
-        lend = self._active_lend(sched)
-        lend.return_stage = 2
-        sched._settle_polls_remaining = 0
-        plan = sched.decide(_stats(step=20))
-        assert plan.returns == [lend]
-        assert plan.renewals == []
         assert plan.borrows == []
+        sched.note_lend_returned(lend, step=11)
+        assert sched.decide(_stats(step=11)).borrows == []
+        assert sched._pending_borrow_pair is None
 
     def test_ten_low_kv_scrapes_return_only_post_return_safe_units(self):
         sched = _scheduler(
@@ -614,7 +749,8 @@ class TestReturns:
         # one 8-card guest predicts .667 and is safe; returning both predicts
         # 1.0, so one lend remains active.
         assert plan.returns == [lends[0]]
-        assert plan.renewals == [lends[1]]
+        assert lends[1] in sched.active_lends
+        assert lends[1] not in plan.returns
 
     def test_low_kv_does_not_return_when_shrunk_donor_would_exceed_guard(self):
         sched = _scheduler(return_confirm_polls=10, min_lend_polls=1)
@@ -629,29 +765,26 @@ class TestReturns:
 
         # 24 current cards * .6 demand / 16 cards after return = .9 > .7.
         assert plan.returns == []
-        assert plan.renewals == [lend]
+        assert sched.active_lends == [lend]
 
 
 class TestAntiJitter:
-    def test_target_requires_separate_confirmation(self):
-        sched = _prepared_scheduler(kv_a=0.95, kv_b=0.1)
-        sched.decide(_stats(step=10))
-        first_target = sched.decide(_stats(step=11))
-        assert sched.bottleneck == "a"
-        assert first_target.borrows == []
-        confirmed = sched.decide(_stats(step=12))
-        assert len(confirmed.borrows) == 1
+    def test_borrow_confirmation_uses_configured_threshold(self):
+        sched = _prepared_scheduler(kv_a=.95, kv_b=.1)
+        sched.config.rebalance_confirm_polls = 3
+        assert sched.decide(_stats(10)).borrows == []
+        assert sched.decide(_stats(11)).borrows == []
+        assert len(sched.decide(_stats(12)).borrows) == 1
 
-    def test_confirmation_tracks_unit_count_not_replica_identity(self):
+    def test_confirmation_tracks_pair_not_replica_identity(self):
         sched = _scheduler(rebalance_confirm_polls=2)
         r0, r1 = sched.handles["b"].replicas
-        sched.bottleneck = "a"
         sched.ema_kv.update({"a": 0.95, "b": 0.1})
         targets = iter([
-            [BorrowPlan(home_policy="b", donor="a", home_replicas=[r0])],
-            [BorrowPlan(home_policy="b", donor="a", home_replicas=[r1])],
+            BorrowPlan(home_policy="b", donor="a", home_replicas=[r0]),
+            BorrowPlan(home_policy="b", donor="a", home_replicas=[r1]),
         ])
-        sched.quantity.plan = lambda *_: next(targets)
+        sched.quantity.select_borrow = lambda *_: next(targets)
 
         assert sched.decide(_stats(step=10)).borrows == []
         plan = sched.decide(_stats(step=11))
@@ -681,8 +814,8 @@ class TestAntiJitter:
         sched.note_borrow_started(lend)
         sched.ema_kv.update({"a": 0.99, "b": 0.95, "c": 0.1})
 
-        desired = sched.quantity.plan(sched, "a", step=10)
-        assert [(item.home_policy, item.donor) for item in desired] == [("c", "a")]
+        borrow = sched.quantity.select_borrow(sched, "a", step=10)
+        assert (borrow.home_policy, borrow.donor) == ("c", "a")
 
 
 class TestBorrowBatchAndCooldown:
@@ -692,16 +825,7 @@ class TestBorrowBatchAndCooldown:
             rebalance_confirm_polls=1,
         )
         sched.handles["b"].replicas.append(FakeReplica("b", 2))
-        b0, b1 = sched.handles["b"].replicas[:2]
-        c0 = sched.handles["c"].replicas[0]
-        desired = [
-            BorrowPlan(home_policy="b", donor="a", home_replicas=[b0]),
-            BorrowPlan(home_policy="b", donor="a", home_replicas=[b1]),
-            BorrowPlan(home_policy="c", donor="a", home_replicas=[c0]),
-        ]
-        sched.bottleneck = "a"
-        sched.ema_kv.update({"a": 0.95, "b": 0.1, "c": 0.1})
-        sched.quantity.plan = lambda *_: desired
+        sched.ema_kv.update({"a": 0.95, "b": 0.05, "c": 0.1})
 
         plan = sched.decide(_stats(step=10))
 
@@ -720,28 +844,24 @@ class TestBorrowBatchAndCooldown:
             borrow_cooldown_s=10,
         )
         b0 = sched.handles["b"].replicas[0]
-        c0 = sched.handles["c"].replicas[0]
         lend = LendRecord(
             lend_id=1, home_policy="b", donor="a",
             home_replicas=[b0], guests=[object()], since_step=10,
         )
         sched.note_borrow_started(lend)
         sched._settle_polls_remaining = 0
-        sched.bottleneck = "a"
         sched.ema_kv.update({"a": 0.95, "b": 0.1, "c": 0.1})
-        sched.quantity.plan = lambda *_: [
-            BorrowPlan(home_policy="b", donor="a", home_replicas=[b0]),
-            BorrowPlan(home_policy="c", donor="a", home_replicas=[c0]),
-        ]
 
         cooling = sched.decide(_stats(step=10))
-        assert cooling.renewals == [lend]
+        assert cooling.returns == []
+        assert sched.active_lends == [lend]
         assert cooling.borrows == []
         assert sched.metrics_snapshot()["borrow_cooldown_remaining_s"] == 10.0
 
         now[0] = 110.0
         after_cooldown = sched.decide(_stats(step=10))
-        assert after_cooldown.renewals == [lend]
+        assert after_cooldown.returns == []
+        assert sched.active_lends == [lend]
         assert [(item.home_policy, item.donor) for item in after_cooldown.borrows] == [
             ("c", "a"),
         ]
@@ -770,9 +890,30 @@ class TestBorrowBatchAndCooldown:
 
 # ------------------------------------------------------------- early return
 class TestEarlyReturn:
+    def test_one_early_return_then_all_pairs_wait_for_settle(self):
+        sched = _scheduler(policies=("a", "b", "c"))
+        lends = [LendRecord(
+            lend_id=i, home_policy=home, donor="a",
+            home_replicas=[sched.handles[home].replicas[0]],
+            guests=[object()], since_step=10,
+        ) for i, home in enumerate(("b", "c"), 1)]
+        for lend in lends:
+            sched.note_borrow_started(lend)
+        sched._settle_polls_remaining = 0
+        for lend in lends:
+            lend.home_kv_hot_polls = sched.config.early_return_confirm_polls
+        assert sched.decide_early_returns() == [lends[0]]
+        sched.note_lend_returned(lends[0], step=11, early=True)
+        assert sched.decide_early_returns() == []
+        plan = sched.decide(_stats(step=11))
+        assert plan.returns == [] and plan.borrows == []
+        assert lends[1] in sched.active_lends
+        assert lends[1] not in plan.returns
+        assert lends[1].home_kv_hot_polls == 0
+        assert sched._settle_polls_remaining == sched.config.rebalance_settle_polls
+
     def test_persistent_home_kv_saturation_triggers_early_return(self):
-        seen = []
-        sched = _scheduler(on_early_return=seen.append)
+        sched = _scheduler()
         lend = LendRecord(
             lend_id=1, home_policy="b", donor="a",
             home_replicas=[sched.handles["b"].replicas[0]],
@@ -782,11 +923,16 @@ class TestEarlyReturn:
         store = sched.signals
         _feed(store, "a", {"a-rep0": 4}, kv={"a-rep0": 0.5})
         _feed(store, "b", {"b-rep1": 70}, kv={"b-rep1": 0.95})
+        for _ in range(sched.config.rebalance_settle_polls - 1):
+            assert sched.poll() is True
+            assert sched.decide_early_returns() == []
+            assert lend.home_kv_hot_polls == 0
         sched.poll()
-        assert seen == [] and lend.home_kv_hot_polls == 1
+        assert sched.decide_early_returns() == [] and lend.home_kv_hot_polls == 1
         for _ in range(sched.config.early_return_confirm_polls - 1):
             sched.poll()
-        assert seen == [lend]
+        assert sched.decide_early_returns() == [lend]
+        assert lend in sched.active_lends  # Planning does not execute the return.
         # A complete cool KV sample resets the counter.
         lend.home_kv_hot_polls = 0
         cool = SignalStore(["a", "b"], max_num_seqs={"a": 32, "b": 32})
@@ -797,8 +943,7 @@ class TestEarlyReturn:
         assert lend.home_kv_hot_polls == 0
 
     def test_missing_kv_metrics_does_not_trigger_early_return(self):
-        seen = []
-        sched = _scheduler(on_early_return=seen.append)
+        sched = _scheduler()
         lend = LendRecord(
             lend_id=1, home_policy="b", donor="a",
             home_replicas=[sched.handles["b"].replicas[0]],
@@ -808,7 +953,7 @@ class TestEarlyReturn:
 
         for _ in range(sched.config.early_return_confirm_polls + 1):
             sched.poll()
-        assert seen == []
+        assert sched.decide_early_returns() == []
         assert lend.home_kv_hot_polls == 0
 
 
@@ -868,10 +1013,12 @@ class TestMetricsSnapshot:
     def test_snapshot_shape(self):
         sched = _scheduler()
         snap = sched.metrics_snapshot()
-        assert snap["bottleneck"] == ""
+        assert snap["pending_borrow_pair"] is None
+        assert snap["borrow_confirmations"] == 0
         assert snap["disabled"] is False
         assert snap["active_lends"] == 0
         assert set(snap["kv_util"]) == {"a", "b"}
         assert snap["kv_util/a"] == pytest.approx(sched.ema_kv["a"])
         assert snap["kv_util/b"] == pytest.approx(sched.ema_kv["b"])
         assert "swap_episodes" in snap and "early_returns" in snap
+        assert "renewals" not in snap

@@ -1,9 +1,9 @@
 """Select at most one safe atomic replica unit for a borrow event.
 
 The scheduler already decides whether a policy is overloaded and provides
-hysteresis, confirmation, settling and cooldown. Quantity planning therefore
-does not solve a multi-unit equalisation problem. It retains necessary
-incumbents and selects the safest single available unit, or selects nothing.
+pair confirmation, settling and cooldown. Quantity planning therefore
+does not solve a multi-unit equalisation problem. It selects one safe
+available unit using current capacity, without assuming any pending returns.
 """
 
 from __future__ import annotations
@@ -15,24 +15,11 @@ from .types import BorrowPlan
 
 
 class SingleUnitStrategy:
-    """Retain needed lends and add no more than one safe atomic unit."""
+    """Select one new safe atomic unit; existing lends are managed separately."""
 
-    def plan(self, sched: Any, bottleneck: str, step: int) -> list[BorrowPlan]:
-        retained = [
-            BorrowPlan(
-                home_policy=lend.home_policy,
-                donor=lend.donor,
-                home_replicas=list(lend.home_replicas),
-            )
-            for lend in sched.active_lends
-            if not sched._is_relieved(lend.donor)
-            and not sched._is_overloaded(lend.home_policy)
-        ]
-
-        # Hysteresis may retain the bottleneck after its entry condition has
-        # cleared. Keep existing capacity in that band, but do not add more.
-        if not sched._is_overloaded(bottleneck):
-            return retained
+    def select_borrow(self, sched: Any, bottleneck: str | None, step: int) -> BorrowPlan | None:
+        if bottleneck is None or not sched._is_overloaded(bottleneck):
+            return None
 
         active_per_pair = Counter(
             (lend.home_policy, lend.donor) for lend in sched.active_lends
@@ -65,8 +52,8 @@ class SingleUnitStrategy:
                 ))
 
         if not choices:
-            return retained
-        return retained + [min(choices, key=lambda item: item[:3])[3]]
+            return None
+        return min(choices, key=lambda item: item[:3])[3]
 
     @staticmethod
     def _safe_after_lend(sched: Any, lender: str, unit: list[Any]) -> bool:

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from contextlib import contextmanager
 from typing import Any
 
 from . import patch
@@ -49,27 +48,9 @@ class BoundaryGate:
     """Topology transactions vs step-end publication; never actor training."""
 
     def __init__(self):
-        self._lock = threading.RLock()
-        self._pending_lock = threading.Lock()
-        self._in_boundary = False
+        self._lock = threading.Lock()
         self._generation = 0
         self.failure: BaseException | None = None
-        self._pending_early_returns: list[Any] = []
-
-    @contextmanager
-    def boundary(self):
-        with self._lock:
-            self.raise_if_failed()
-            was_in_boundary = self._in_boundary
-            self._in_boundary = True
-            try:
-                yield
-            except BaseException as exc:
-                self.failure = exc
-                raise
-            finally:
-                self._in_boundary = was_in_boundary
-                self._generation += 1
 
     def raise_if_failed(self):
         if self.failure is not None:
@@ -79,34 +60,36 @@ class BoundaryGate:
         # Reading an integer does not need to block metric sampling on publish.
         return self._generation
 
-    def run_exclusive(self, fn, *, expected_generation: int | None = None) -> bool:
-        """Run ``fn`` unless a boundary is active; defer then, return False."""
-        if not self._lock.acquire(blocking=False):
+    def run_exclusive(
+        self,
+        fn,
+        *,
+        blocking: bool = False,
+        expected_generation: int | None = None,
+    ) -> bool:
+        """Run one topology transaction under the gate's sole lock.
+
+        Poll commits use the non-blocking default and may discard stale work.
+        Trainer publication uses the same entry in blocking mode. Every
+        completed transaction invalidates samples taken before it.
+        """
+        if not self._lock.acquire(blocking=blocking):
             return False
         try:
             self.raise_if_failed()
-            if self._in_boundary:
-                return False
             if (expected_generation is not None
                     and expected_generation != self._generation):
                 return False
-            fn()
+            try:
+                fn()
+            except BaseException as exc:
+                self.failure = exc
+                raise
+            finally:
+                self._generation += 1
             return True
-        except BaseException as exc:
-            self.failure = exc
-            raise
         finally:
             self._lock.release()
-
-    def defer_early_return(self, lend) -> None:
-        with self._pending_lock:
-            if lend not in self._pending_early_returns:
-                self._pending_early_returns.append(lend)
-
-    def take_pending(self) -> list:
-        with self._pending_lock:
-            pending, self._pending_early_returns = self._pending_early_returns, []
-            return pending
 
 
 class PollLoop(threading.Thread):
@@ -146,8 +129,7 @@ class PollLoop(threading.Thread):
 
     def _commit(self, samples):
         self._store.record_all(samples)
-        metrics_fresh = any(sample.metrics_fresh for sample in samples.values())
-        metrics_ready = self._scheduler.poll(metrics_fresh=metrics_fresh)
+        metrics_ready = self._scheduler.poll()
         if metrics_ready and self._on_metrics_ready is not None:
             self._on_metrics_ready()
 
@@ -235,7 +217,6 @@ class DynamicInferenceController:
 
         self.scheduler = MultiPolicyInferenceScheduler(
             config=self.config, handles=handles, signals=None, guest_units=None,
-            on_early_return=self._on_early_return,
         )
         self.guest_engine = GuestEngineManager(
             config=self.config, handles=handles, pairs=self.scheduler.pairs,
@@ -343,24 +324,46 @@ class DynamicInferenceController:
 
     # ================================================================ boundary
     def run_boundary(self, trainer) -> None:
-        """Require stable ownership, then synchronize each policy exactly once."""
+        """Run step-end work while the outer trainer holds the topology gate."""
         stats = self._build_stats(trainer)
         self._last_step = stats.step
-        with self.gate.boundary():
-            plan = self._boundary_maintenance_plan()
-            deferred_early_ids = self._fold_deferred_early_returns(plan)
-            self.executor.assert_stable()
-            self._run_returns(plan.returns, stats.step, deferred_early_ids)
-            self.executor.validate_membership()
-            self._run_policy_hooks(trainer)
-            self.executor.validate_membership()
+        self.executor.assert_stable()
+        if self.scheduler.disabled:
+            self._run_returns(list(self.scheduler.active_lends), stats.step)
+        self.executor.validate_membership()
+        self._run_policy_hooks(trainer)
+        self.executor.validate_membership()
 
         self.last_metrics = self.metrics_snapshot()
 
     def _rebalance_now(self) -> None:
-        """Apply a metrics-driven allocation immediately on the poll thread."""
+        """Execute at most one pair's topology action per metrics commit."""
         step = int(self.trainer.global_steps)
         self._last_step = step
+
+        if self._run_early_returns(step):
+            return
+        plan = self._decide_rebalance(step)
+        if plan.returns:
+            self._run_returns(plan.returns[:1], step)
+        elif plan.borrows:
+            self.executor.borrow(plan.borrows[0], step)
+
+    def _run_early_returns(self, step: int) -> bool:
+        """Execute one safety return and end this round before ordinary planning."""
+        for lend in self.scheduler.decide_early_returns()[:1]:
+            self.scheduler.trace.emit(
+                self.scheduler, "early_return_requested", step,
+                lend_id=lend.lend_id, lender=lend.home_policy, borrower=lend.donor,
+                reason="lender_composite_load_above_enter",
+            )
+            if not self.executor.return_(lend, step, early=True):
+                raise RuntimeError("Early return executor reported failure")
+            return True
+        return False
+
+    def _decide_rebalance(self, step: int) -> BoundaryPlan:
+        """Compute and trace the ordinary allocation plan."""
         plan = self.scheduler.decide(StepStats(step=step))
         if (plan.borrows or plan.returns) and getattr(self.scheduler, "trace", None) is not None:
             self.scheduler.trace.emit(self.scheduler, "decision", step,
@@ -368,87 +371,13 @@ class DynamicInferenceController:
                           "home_servers": [getattr(r, "server_address", None) for r in p.home_replicas]}
                          for p in plan.borrows],
                 returns=[p.lend_id for p in plan.returns])
+        return plan
 
-        borrows_by_unit = {
-            self._allocation_unit_key(plan.home_policy, plan.home_replicas): plan
-            for plan in plan.borrows
-        }
-        handoffs = []
-        regular_returns = []
-        for lend in plan.returns:
-            key = self._allocation_unit_key(lend.home_policy, lend.home_replicas)
-            # Direct handoff assumes home is still fully asleep and detached.
-            # A resumable return may already have woken or re-attached home, so
-            # finish it normally and let the next borrow tear home down again.
-            borrow = (
-                borrows_by_unit.pop(key, None)
-                if lend.return_stage == 0
-                else None
-            )
-            if borrow is None:
-                regular_returns.append(lend)
-            else:
-                handoffs.append((lend, borrow))
-
-        if not self._run_returns(regular_returns, step, set()):
-            self._log_skipped_borrows(len(plan.borrows), "a return failed")
-            return
-
-        for lend, borrow_plan in handoffs:
-            if not self.executor.return_(
-                lend, step, reactivate_home=False,
-            ):
-                self._log_skipped_borrows(len(plan.borrows), "a handoff return failed")
-                return
-            if self.executor.borrow(
-                borrow_plan, step, home_already_sleeping=True,
-            ) is None:
-                self._log_skipped_borrows(
-                    len(borrows_by_unit), "a handoff borrow failed")
-                return
-
-        for borrow_plan in borrows_by_unit.values():
-            self.executor.borrow(borrow_plan, step)
-
-    @staticmethod
-    def _allocation_unit_key(home_policy: str, replicas: list[Any]) -> tuple:
-        return home_policy, tuple(sorted(id(replica) for replica in replicas))
-
-    @staticmethod
-    def _log_skipped_borrows(count: int, reason: str) -> None:
-        if count:
-            logger.warning(
-                "dynamic_inference: skipping %d immediate borrows because %s",
-                count, reason,
-            )
-
-    def _boundary_maintenance_plan(self) -> BoundaryPlan:
-        """Build the non-scheduling work that must remain at step boundaries."""
-        active = list(self.scheduler.active_lends)
-        if getattr(self.scheduler, "disabled", False):
-            return BoundaryPlan(returns=active)
-        return BoundaryPlan(returns=[lend for lend in active if lend.return_stage > 0])
-
-    def _fold_deferred_early_returns(self, plan) -> set[int]:
-        """Move still-active deferred returns out of renewals and into returns."""
-        pending = [
-            lend for lend in self.gate.take_pending()
-            if lend in self.scheduler.active_lends
-        ]
-        for lend in pending:
-            if lend not in plan.returns:
-                plan.returns.append(lend)
-            if lend in plan.renewals:
-                plan.renewals.remove(lend)
-        return {id(lend) for lend in pending}
-
-    def _run_returns(self, lends, step: int, early_ids: set[int]) -> bool:
+    def _run_returns(self, lends, step: int) -> None:
         """Return every requested lend; any failure prevents boundary progression."""
-        succeeded = True
         for lend in lends:
-            if not self.executor.return_(lend, step, early=id(lend) in early_ids):
+            if not self.executor.return_(lend, step, early=False):
                 raise RuntimeError("Return executor reported failure")
-        return succeeded
 
     @staticmethod
     def _run_policy_hooks(trainer) -> None:
@@ -476,16 +405,6 @@ class DynamicInferenceController:
     def _build_stats(self, trainer) -> StepStats:
         return StepStats(step=trainer.global_steps)
 
-    # ================================================================ early return
-    def _on_early_return(self, lend) -> None:
-        """Scheduler callback (poll thread): return the lend immediately."""
-        def _run():
-            self.executor.return_(lend, self._last_step, early=True)
-
-        if not self.gate.run_exclusive(_run):
-            # a boundary is running — the next decide() folds this lend in
-            self.gate.defer_early_return(lend)
-
     # ================================================================ shutdown
     def shutdown(self) -> None:
         """Best-effort teardown; each step isolated (a failure must not block
@@ -497,7 +416,7 @@ class DynamicInferenceController:
             except Exception:
                 pass
         try:
-            with self.gate.boundary():
+            def _return_active_lends():
                 for lend in list(self.scheduler.active_lends):
                     try:
                         self.executor.return_(lend, self._last_step, early=False)
@@ -505,6 +424,10 @@ class DynamicInferenceController:
                         logger.warning(
                             "dynamic_inference: final return of %s->%s failed",
                             lend.home_policy, lend.donor, exc_info=True)
+            self.gate.run_exclusive(
+                _return_active_lends,
+                blocking=True,
+            )
         except Exception:
             logger.warning("dynamic_inference: final boundary failed", exc_info=True)
         try:

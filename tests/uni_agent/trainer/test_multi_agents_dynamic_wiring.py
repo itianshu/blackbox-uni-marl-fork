@@ -130,6 +130,9 @@ class FakeScheduler:
         self.decide_calls = []
         self.active_lends = []
 
+    def decide_early_returns(self):
+        return []
+
     def decide(self, stats):
         self.decide_calls.append(stats)
         self.log.append(("decide", stats.step))
@@ -157,14 +160,6 @@ class FakeExecutor:
         self.log.append(("borrow", borrow_plan.home_policy, borrow_plan.donor, step))
         return object()
 
-    def renew(self, lend, step):
-        self.log.append(("renew", lend.lend_id, step))
-        return True
-
-    def renew_many(self, lends, step):
-        self.log.append(("renew_batch", tuple(lend.lend_id for lend in lends), step))
-        return True
-
 
 def _lend(home="b", donor="a", lend_id=1):
     return LendRecord(lend_id=lend_id, home_policy=home, donor=donor,
@@ -177,6 +172,7 @@ def _controller(trainer, plan):
     controller.trainer = trainer
     controller.gate = BoundaryGate()
     controller.scheduler = FakeScheduler(trainer.log, plan)
+    controller.scheduler.disabled = False
     controller.executor = FakeExecutor(trainer.log)
     controller.guest_engine = None
     controller.store = None
@@ -186,35 +182,42 @@ def _controller(trainer, plan):
     return controller
 
 
+def _run_boundary(controller, trainer):
+    return controller.gate.run_exclusive(
+        lambda: controller.run_boundary(trainer),
+        blocking=True,
+    )
+
+
 # ------------------------------------------------------- boundary orchestration
 class TestRunBoundary:
-    def test_incomplete_return_precedes_policy_hooks(self):
+    def test_disabled_scheduler_returns_lends_before_policy_hooks(self):
         log = []
         trainer = FakeOuterTrainer(log)
         lend = _lend(lend_id=2, home="a", donor="b")
-        lend.return_stage = 1
         controller = _controller(trainer, BoundaryPlan())
         controller.scheduler.active_lends.append(lend)
+        controller.scheduler.disabled = True
 
-        controller.run_boundary(trainer)
+        _run_boundary(controller, trainer)
         trainer.close()
 
-        # A partially completed return is retried before every policy update.
+        # Disabling scheduling still returns active lends before policy updates.
         first_hook = min(i for i, e in enumerate(log) if e[0] == "hook")
         assert log.index(("return", 2, 11, False)) < first_hook
         assert not any(event[0] == "borrow" for event in log)
         assert {e for e in log if e[0] == "hook"} == {("hook", "a"), ("hook", "b")}
 
-    def test_renewal_runs_after_hooks_without_returning(self):
+    def test_existing_lend_is_kept_during_policy_hooks(self):
         log = []
         trainer = FakeOuterTrainer(log)
         lend = _lend()
         controller = _controller(trainer, BoundaryPlan())
         controller.scheduler.active_lends.append(lend)
-        controller.run_boundary(trainer)
+        _run_boundary(controller, trainer)
         trainer.close()
 
-        assert not any(event[0].startswith("renew") for event in log)
+        assert controller.scheduler.active_lends == [lend]
         assert sum(event[0] == "hook" for event in log) == 2
         assert not any(event[0] == "return" for event in log)
 
@@ -222,7 +225,7 @@ class TestRunBoundary:
         log = []
         trainer = FakeOuterTrainer(log)
         controller = _controller(trainer, BoundaryPlan())
-        controller.run_boundary(trainer)
+        _run_boundary(controller, trainer)
         trainer.close()
         assert controller.last_metrics == {
             "dynamic_inference/swap_episodes": 3,
@@ -237,7 +240,7 @@ class TestRunBoundary:
             policy.on_step_end = lambda policy=policy: policy.timing_raw.update(update_weights=1.5)
         controller = _controller(trainer, BoundaryPlan())
         try:
-            controller.run_boundary(trainer)
+            _run_boundary(controller, trainer)
         finally:
             trainer.close()
         assert trainer.timing_raw == {
@@ -257,28 +260,49 @@ class TestRunBoundary:
             policy.on_step_end = lambda name=name: hook(name)
         controller = _controller(trainer, BoundaryPlan())
         with pytest.raises(RuntimeError, match="update failed"):
-            controller.run_boundary(trainer)
+            _run_boundary(controller, trainer)
         trainer.close()
         assert {event for event in log if event[0] == "hook"} == {
             ("hook", "a"), ("hook", "b"),
         }
 
-    def test_failed_recovery_return_blocks_hooks_and_poisons_gate(self):
+    def test_failed_disabled_return_blocks_hooks_and_poisons_gate(self):
         trainer = FakeOuterTrainer([])
         controller = _controller(trainer, BoundaryPlan())
         lend = _lend()
-        lend.return_stage = 1
         controller.scheduler.active_lends.append(lend)
+        controller.scheduler.disabled = True
         controller.executor.return_ = lambda *a, **k: False
         with pytest.raises(RuntimeError, match="reported failure"):
-            controller.run_boundary(trainer)
+            _run_boundary(controller, trainer)
         assert not any(e[0] == "hook" for e in trainer.log)
         with pytest.raises(RuntimeError, match="gate failed"):
-            controller.run_boundary(trainer)
+            _run_boundary(controller, trainer)
         trainer.close()
 
 
 class TestImmediateRebalance:
+    @pytest.mark.parametrize("action", ["early_return", "return", "borrow"])
+    def test_multiple_pairs_execute_only_one_action(self, action):
+        trainer = FakeOuterTrainer([])
+        lends = [_lend(lend_id=1, home="a", donor="b"),
+                 _lend(lend_id=2, home="b", donor="c")]
+        borrows = [BorrowPlan(home_policy="a", donor="b", home_replicas=[object()]),
+                   BorrowPlan(home_policy="b", donor="c", home_replicas=[object()])]
+        controller = _controller(trainer, BoundaryPlan(
+            returns=lends if action == "return" else [], borrows=borrows,
+        ))
+        if action == "early_return":
+            controller.scheduler.decide_early_returns = lambda: lends
+            controller.scheduler.trace = SimpleNamespace(emit=lambda *a, **k: None)
+        controller._rebalance_now()
+        operations = [event for event in trainer.log if event[0] in ("return", "borrow")]
+        assert len(operations) == 1
+        assert operations[0][0] == ("borrow" if action == "borrow" else "return")
+        if action == "early_return":
+            assert controller.scheduler.decide_calls == []
+        trainer.close()
+
     def test_fresh_metrics_can_borrow_without_waiting_for_step_end(self):
         log = []
         trainer = FakeOuterTrainer(log)
@@ -307,7 +331,7 @@ class TestImmediateRebalance:
 
         assert not any(event[0] == "borrow" for event in log)
 
-    def test_same_unit_handoff_keeps_home_inactive(self):
+    def test_same_unit_transfer_only_returns_home_this_round(self):
         log = []
         trainer = FakeOuterTrainer(log)
         replica = object()
@@ -334,125 +358,92 @@ class TestImmediateRebalance:
         controller._rebalance_now()
         trainer.close()
 
-        assert calls == [
-            ("return", {"reactivate_home": False}),
-            ("borrow", {"home_already_sleeping": True}),
-        ]
+        assert calls == [("return", {})]
 
-    def test_partial_return_is_not_treated_as_direct_handoff(self):
+
+
+class TestEarlyReturn:
+    def test_early_return_ends_round_without_ordinary_decision(self):
         log = []
         trainer = FakeOuterTrainer(log)
-        replica = object()
-        lend = LendRecord(
-            lend_id=1, home_policy="b", donor="a",
-            home_replicas=[replica], guests=[object()], since_step=10,
-            return_stage=4,
-        )
-        borrow = BorrowPlan(
-            home_policy="b", donor="c", home_replicas=[replica])
-        controller = _controller(
-            trainer, BoundaryPlan(returns=[lend], borrows=[borrow]))
-        calls = []
-
-        def return_(item, step, early=False, **kwargs):
-            calls.append(("return", kwargs))
+        lend = _lend()
+        controller = _controller(trainer, BoundaryPlan())
+        controller.scheduler.active_lends = [lend]
+        controller.scheduler.decide_early_returns = lambda: [lend]
+        controller.scheduler.trace = SimpleNamespace(emit=lambda *a, **k: None)
+        def return_(item, step, early=False):
+            assert early is True
+            controller.scheduler.active_lends.remove(item)
+            log.append(("return", item.lend_id, step, early))
             return True
-
-        def borrow_(item, step, **kwargs):
-            calls.append(("borrow", kwargs))
-            return object()
-
         controller.executor.return_ = return_
-        controller.executor.borrow = borrow_
-        controller._rebalance_now()
+        def decide(stats):
+            assert controller.scheduler.active_lends == []
+            log.append(("decide", stats.step))
+            return BoundaryPlan()
+        controller.scheduler.decide = decide
+        assert controller.gate.run_exclusive(
+            controller._rebalance_now,
+        ) is True
+        assert log == [("return", 1, 11, True)]
         trainer.close()
 
-        assert calls == [("return", {}), ("borrow", {})]
-
-
-class TestEarlyReturnDeferral:
-    def test_early_return_deferred_during_boundary(self):
-        log = []
-        trainer = FakeOuterTrainer(log)
-        lend = _lend()  # donor a
+    def test_failed_early_return_prevents_ordinary_decision(self):
+        trainer = FakeOuterTrainer([])
         controller = _controller(trainer, BoundaryPlan())
-        controller.scheduler.active_lends.append(lend)
-
-        # an early return fires while a boundary is active: deferred, not run
-        with controller.gate.boundary():
-            controller._on_early_return(lend)
-        assert not any(e[0] == "return" for e in log)
-        assert controller.gate.take_pending() == [lend]
-
-        # hand it back to the deferral list (the next boundary consumes it)
-        controller.gate.defer_early_return(lend)
-        controller.run_boundary(trainer)
+        controller.scheduler.decide_early_returns = lambda: [_lend()]
+        controller.scheduler.trace = SimpleNamespace(emit=lambda *a, **k: None)
+        controller.executor.return_ = lambda *a, **k: False
+        with pytest.raises(RuntimeError, match="Early return executor reported failure"):
+            controller.gate.run_exclusive(controller._rebalance_now)
+        assert controller.scheduler.decide_calls == []
+        assert controller.gate.failure is not None
         trainer.close()
-
-        # the deferred early return was physically returned at the next boundary
-        assert ("return", 1, 11, True) in log
-
-    def test_stale_deferred_return_is_ignored(self):
-        log = []
-        trainer = FakeOuterTrainer(log)
-        lend = _lend()
-        controller = _controller(trainer, BoundaryPlan())
-        controller.gate.defer_early_return(lend)
-
-        # The lend was already returned by the boundary that raced with the
-        # deferral, so it is no longer present in the scheduler registry.
-        controller.run_boundary(trainer)
-        trainer.close()
-
-        assert not any(event[0] == "return" for event in log)
-
-    def test_early_return_runs_immediately_outside_boundary(self):
-        log = []
-        trainer = FakeOuterTrainer(log)
-        lend = _lend()
-        controller = _controller(trainer, BoundaryPlan())
-
-        controller._on_early_return(lend)
-        assert ("return", 1, 0, True) in log  # early=True, executed inline
 
 
 class TestBoundaryGate:
-    def test_exclusive_sections_serialize(self):
+    def test_blocking_publication_uses_same_exclusive_entry(self):
         gate = BoundaryGate()
         order = []
 
-        with gate.boundary():
-            ran = gate.run_exclusive(lambda: order.append("early"))  # deferred
-            assert ran is False
-        assert gate.run_exclusive(lambda: order.append("early")) is True
-        assert order == ["early"]
+        assert gate.run_exclusive(
+            lambda: order.append("boundary"),
+            blocking=True,
+        ) is True
+        assert order == ["boundary"]
+        assert gate.snapshot_generation() == 1
 
-    def test_cross_thread_call_is_deferred_without_waiting_for_boundary(self):
+    def test_nonblocking_call_is_skipped_while_transaction_runs(self):
         gate = BoundaryGate()
-        result = []
+        started, release = threading.Event(), threading.Event()
 
-        with gate.boundary():
-            thread = threading.Thread(
-                target=lambda: result.append(gate.run_exclusive(lambda: None)))
-            thread.start()
-            thread.join(timeout=1.0)
-            assert not thread.is_alive()
-            assert result == [False]
+        def operation():
+            started.set()
+            assert release.wait(2)
+
+        thread = threading.Thread(target=lambda: gate.run_exclusive(
+            operation, blocking=True,
+        ))
+        thread.start()
+        assert started.wait(2)
+        assert gate.run_exclusive(lambda: None) is False
+        release.set()
+        thread.join(2)
+        assert not thread.is_alive()
 
     def test_poll_loop_stops_and_joins_cleanly(self):
         seen = threading.Event()
 
         class Source:
             def sample_all(self):
-                return {"a": SimpleNamespace(metrics_fresh=True)}
+                return {"a": SimpleNamespace()}
 
         class Store:
             def record_all(self, samples):
                 assert set(samples) == {"a"}
 
         class Scheduler:
-            def poll(self, *, metrics_fresh):
-                assert metrics_fresh is True
+            def poll(self):
                 seen.set()
                 return True
 
@@ -471,8 +462,10 @@ class TestBoundaryGate:
     def test_stale_poll_result_is_rejected_after_boundary(self):
         gate = BoundaryGate()
         generation = gate.snapshot_generation()
-        with gate.boundary():
-            pass
+        gate.run_exclusive(
+            lambda: None,
+            blocking=True,
+        )
 
         committed = []
         assert gate.run_exclusive(
@@ -657,14 +650,16 @@ class TestTrainerWiring:
 def test_boundary_waits_for_entire_physical_operation():
     gate = BoundaryGate()
     started, release, reached = threading.Event(), threading.Event(), threading.Event()
+
     def operation():
         started.set()
         assert release.wait(2)
+
     poll = threading.Thread(target=lambda: gate.run_exclusive(operation))
-    def boundary():
-        with gate.boundary():
-            reached.set()
-    main = threading.Thread(target=boundary)
+    main = threading.Thread(target=lambda: gate.run_exclusive(
+        reached.set,
+        blocking=True,
+    ))
     poll.start()
     assert started.wait(2)
     main.start()
@@ -677,10 +672,14 @@ def test_boundary_waits_for_entire_physical_operation():
 
 def test_remote_timeout_poison_survives_local_return():
     gate = BoundaryGate()
+
     def operation():
         raise TimeoutError('remote completion unknown')
+
     with pytest.raises(TimeoutError):
         gate.run_exclusive(operation)
     with pytest.raises(RuntimeError, match='gate failed'):
-        with gate.boundary():
-            pytest.fail('must not enter weight sync')
+        gate.run_exclusive(
+            lambda: pytest.fail('must not enter weight sync'),
+            blocking=True,
+        )

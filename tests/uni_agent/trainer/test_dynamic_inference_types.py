@@ -53,7 +53,6 @@ class TestParseSchedulingConfig:
         assert cfg.resource_usage.ema_alpha == 0.3
         assert cfg.metrics_scrape_interval_s == 1.0
         assert cfg.poll_interval_s == cfg.metrics_scrape_interval_s
-        assert cfg.bottleneck_confirm_polls == 10
         assert cfg.rebalance_confirm_polls == 2
         assert cfg.rebalance_settle_polls == 3
         assert cfg.min_lend_polls == 2
@@ -65,9 +64,9 @@ class TestParseSchedulingConfig:
     def test_plain_dict_and_omegaconf_agree(self):
         if OmegaConf is None:
             pytest.skip("omegaconf is not installed")
-        from_dict = parse_scheduling_config({"enable": True, "bottleneck_confirm_polls": 3})
-        from_oc = parse_scheduling_config(_cfg(bottleneck_confirm_polls=3))
-        assert from_dict.bottleneck_confirm_polls == from_oc.bottleneck_confirm_polls == 3
+        from_dict = parse_scheduling_config({"enable": True, "rebalance_confirm_polls": 3})
+        from_oc = parse_scheduling_config(_cfg(rebalance_confirm_polls=3))
+        assert from_dict.rebalance_confirm_polls == from_oc.rebalance_confirm_polls == 3
 
     def test_lb_poll_interval_is_normalized_to_metrics_interval(self):
         cfg = parse_scheduling_config(_cfg(
@@ -175,11 +174,9 @@ class TestParseSchedulingConfig:
 
     def test_legacy_step_confirmation_names_are_mapped_to_polls(self):
         cfg = parse_scheduling_config(_cfg(
-            bottleneck_confirm_steps=3,
             rebalance_confirm_steps=4,
             min_lend_steps=5,
         ))
-        assert cfg.bottleneck_confirm_polls == 3
         assert cfg.rebalance_confirm_polls == 4
         assert cfg.min_lend_polls == 5
 
@@ -190,8 +187,8 @@ class TestParseSchedulingConfig:
     def test_legacy_and_poll_confirmation_names_cannot_be_mixed(self):
         with pytest.raises(ValueError, match="only one"):
             parse_scheduling_config(_cfg(
-                bottleneck_confirm_steps=2,
-                bottleneck_confirm_polls=2,
+                rebalance_confirm_steps=2,
+                rebalance_confirm_polls=2,
             ))
 
     @pytest.mark.parametrize(

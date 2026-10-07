@@ -13,9 +13,10 @@ def test_trace_preserves_event_load_and_marks_stale_measurements(tmp_path):
     store = SignalStore(['p1', 'p2'])
     for policy, kv in [('p1', .12), ('p2', .01)]:
         store.record(policy, PolicySample(t=time.monotonic() - 2, total_inflight=8,
-            kv_cache_usage={policy + ':8000': kv}, metrics_fresh=True))
+            kv_cache_usage={policy + ':8000': kv}))
     scheduler = SimpleNamespace(signals=store, policies=['p1', 'p2'],
-        capacity_cards=lambda p: 4, ema_kv={'p1': .1, 'p2': .02}, active_lends=[])
+        capacity_cards=lambda p: 4, ema_kv={'p1': .1, 'p2': .02}, active_lends=[],
+        _pending_borrow_pair=('p2', 'p1'), _pending_borrow_polls=1)
     trace.emit(scheduler, 'sample', 1)
     trace.emit(scheduler, 'sample', 1)  # throttled; events must never be throttled
     trace.emit(scheduler, 'borrow_start', 1, lender='p2', borrower='p1')
@@ -23,6 +24,9 @@ def test_trace_preserves_event_load_and_marks_stale_measurements(tmp_path):
     trace.emit(scheduler, 'borrow_complete', 1, execution_s=3)
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert [r['kind'] for r in records] == ['sample', 'borrow_start', 'borrow_complete']
+    assert records[0]['decision_state']['pending_borrow_pair'] == ['p2', 'p1']
+    assert records[0]['decision_state']['borrow_confirmations'] == 1
+    assert 'bottleneck' not in records[0]['decision_state']
     assert records[1]['policies']['p1']['replica_kv'] == {'p1:8000': .12}
     assert records[1]['policies']['p1']['sample_age_s'] >= 2
     assert records[2]['policies']['p1']['replica_kv'] == {'p1:8000': .06}

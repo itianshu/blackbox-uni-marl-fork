@@ -1,8 +1,8 @@
 """Decision layer: composite serving-load detection and stable allocation.
 
-Quantity output is treated as a desired allocation. Target confirmation,
-post-change settling, minimum lend duration and in-place renewal prevent
-discrete replica rounding from causing repeated swaps:
+Each decision selects one safe ordinary return or one new borrow. Pair
+confirmation, post-change settling, minimum lend duration and cooldown
+prevent repeated swaps:
 
 - **Signal**: p90 over a window of per-policy replica-mean KV gauges, followed
   by an EMA. Sustained queue depth plus queue duration is an alternative entry
@@ -22,8 +22,7 @@ import itertools
 import logging
 import math
 import time
-from collections import Counter
-from typing import Any, Callable
+from typing import Any
 
 from .types import (
     BorrowPairSpec,
@@ -56,31 +55,26 @@ class MultiPolicyInferenceScheduler:
         handles: dict[str, PolicyInferenceHandles],
         signals: Any,
         guest_units: Any,
-        on_early_return: Callable[[LendRecord], None] | None = None,
     ):
         self.config = config
         self.ru = config.resource_usage
         self.handles = handles
         self.signals = signals
         self.guest_units = guest_units
-        self._on_early_return = on_early_return
         self.policies = list(handles)
         self.pairs = expand_pairs(config, self.policies)
         self._pair_by_policies: dict[tuple[str, str], BorrowPairSpec] = {
             (pair.home, pair.donor): pair for pair in self.pairs
         }
 
-        # ---- bottleneck state machine ----
-        self.bottleneck: str | None = None
-        self.confirm: dict[str, int] = {}
-        self._pending_target: tuple | None = None
-        self._pending_target_polls = 0
+        # ---- consecutive safe borrow-pair confirmation ----
+        self._pending_borrow_pair: tuple[str, str] | None = None
+        self._pending_borrow_polls = 0
         self._decision_count = 0
         self._lend_start_poll: dict[int, int] = {}
         self._settle_polls_remaining = 0
         self._borrow_cooldown_until = 0.0
         self._return_low_polls: dict[str, int] = {p: 0 for p in self.policies}
-        self._normal_return_ready_ids: set[int] = set()
 
         # ---- borrow quantity ----
         from .quantity import SingleUnitStrategy
@@ -103,7 +97,7 @@ class MultiPolicyInferenceScheduler:
         # ---- observation ----
         self.events: list[LendEvent] = []
         self._counters = {
-            "swap_episodes": 0, "renewals": 0, "early_returns": 0,
+            "swap_episodes": 0, "early_returns": 0,
             "returns": 0, "disabled_by_failures": 0,
         }
         self.disabled = False   # repeated execution failures -> behave like static
@@ -137,92 +131,80 @@ class MultiPolicyInferenceScheduler:
         }
 
     # ================================================================ polling
-    def poll(self, *, metrics_fresh: bool = True) -> bool:
-        """Continuous signal sampling (poll thread; cheap, read-only).
-
-        Refreshes the KV EMA and checks home exhaustion for early returns.
-        Early-return *execution* goes through the controller's gated callback;
-        if a boundary is active the controller defers it instead.
-
-        Returns whether every policy supplied a valid fresh KV sample. Only a
-        complete sample should drive an immediate rebalance decision.
-        """
+    def poll(self) -> bool:
+        """Refresh signals under the poll gate; return whether all policies are ready."""
         if self.disabled:
             return False
-        complete_scrape = False
-        if metrics_fresh:
-            a = self.ru.ema_alpha
-            latest_has_kv = getattr(self.signals, "latest_has_kv", None)
-            complete_scrape = True
-            for p in self.policies:
-                if callable(latest_has_kv) and not latest_has_kv(p):
-                    complete_scrape = False
-                    continue
-                kv = float(self.signals.kv_util(p, _STAT_HOW))
-                if not math.isfinite(kv) or not 0.0 <= kv <= 1.0:
-                    complete_scrape = False
-                    logger.warning(
-                        "dynamic_inference: ignoring invalid KV utilisation for %s: %r",
-                        p, kv,
-                    )
-                    continue
-                if p not in self._ema_initialized:
-                    self.ema_kv[p] = kv
-                    self._ema_initialized.add(p)
-                else:
-                    self.ema_kv[p] = a * kv + (1 - a) * self.ema_kv[p]
-                waiting_fn = getattr(self.signals, "waiting_per_replica", None)
-                self.waiting_per_replica[p] = (
-                    float(waiting_fn(p, "mean")) if callable(waiting_fn) else 0.0
-                )
-                histogram_fn = getattr(self.signals, "histogram_window_quantile", None)
-                histogram_wait = (
-                    histogram_fn(
-                        p,
-                        ("request_queue_time_seconds", "request_waiting_time_seconds"),
-                        0.9,
-                    )
-                    if callable(histogram_fn) else None
-                )
-                streak_fn = getattr(self.signals, "waiting_streak_s", None)
-                streak_wait = (
-                    float(streak_fn(p, self.ru.waiting_enter_per_replica))
-                    if callable(streak_fn) else 0.0
-                )
-                self.queue_time_s[p] = max(float(histogram_wait or 0.0), streak_wait)
-            if complete_scrape and self._settle_polls_remaining > 0:
-                self._settle_polls_remaining -= 1
-        if complete_scrape:
-            self.trace.emit(self, "sample", getattr(self, "_trace_step", 0))
-            self._check_early_return()
-            self._update_normal_return_confirmations()
-        return complete_scrape
+        metrics_ready = True
+        for policy in self.policies:
+            # Update every policy even if an earlier sample was invalid.
+            if not self._update_policy_signals(policy):
+                metrics_ready = False
+        if not metrics_ready:
+            return False
 
-    def _check_early_return(self) -> None:
-        """Return one lend when its home is persistently KV-saturated."""
-        returned_homes = set()
-        for lend in list(self.active_lends):
-            if lend.home_policy in returned_homes:
+        if self._settle_polls_remaining > 0:
+            self._settle_polls_remaining -= 1
+        self.trace.emit(self, "sample", getattr(self, "_trace_step", 0))
+        if self._settle_polls_remaining > 0:
+            return True
+        self._update_early_return_confirmations()
+        self._update_normal_return_confirmations()
+        return True
+
+    def _update_policy_signals(self, policy: str) -> bool:
+        """Update one policy's load signals when its latest sample contains valid KV data."""
+        if not self.signals.latest_has_kv(policy):
+            return False
+        kv = float(self.signals.kv_util(policy, _STAT_HOW))
+        if not math.isfinite(kv) or not 0.0 <= kv <= 1.0:
+            logger.warning(
+                "dynamic_inference: ignoring invalid KV utilisation for %s: %r",
+                policy, kv,
+            )
+            return False
+
+        if policy not in self._ema_initialized:
+            self.ema_kv[policy] = kv
+            self._ema_initialized.add(policy)
+        else:
+            a = self.ru.ema_alpha
+            self.ema_kv[policy] = a * kv + (1 - a) * self.ema_kv[policy]
+        self.waiting_per_replica[policy] = float(
+            self.signals.waiting_per_replica(policy, "mean")
+        )
+        histogram_wait = self.signals.histogram_window_quantile(
+            policy,
+            ("request_queue_time_seconds", "request_waiting_time_seconds"),
+            0.9,
+        )
+        streak_wait = self.signals.waiting_streak_s(
+            policy, self.ru.waiting_enter_per_replica,
+        )
+        self.queue_time_s[policy] = max(float(histogram_wait or 0.0), float(streak_wait))
+        return True
+
+    def _update_early_return_confirmations(self) -> None:
+        """Count overload samples, confirming at most one lend per home per poll."""
+        confirmed_homes = set()
+        for lend in self.active_lends:
+            if lend.home_policy in confirmed_homes:
                 continue
             if self._is_overloaded(lend.home_policy):
                 lend.home_kv_hot_polls += 1
                 if lend.home_kv_hot_polls >= self.config.early_return_confirm_polls:
-                    self._do_early_return(lend)
-                    returned_homes.add(lend.home_policy)
+                    confirmed_homes.add(lend.home_policy)
             else:
                 lend.home_kv_hot_polls = 0
 
-    def _do_early_return(self, lend: LendRecord) -> None:
-        self.trace.emit(self, "early_return_requested", getattr(self, "_trace_step", 0),
-                        lend_id=lend.lend_id, lender=lend.home_policy, borrower=lend.donor,
-                        reason="lender_composite_load_above_enter")
-        logger.info(
-            "dynamic_inference: early return %s->%s (home exhausted while lent out)",
-            lend.home_policy, lend.donor,
-        )
-        self._counters["early_returns"] += 1
-        if self._on_early_return is not None:
-            self._on_early_return(lend)
+    def decide_early_returns(self) -> list[LendRecord]:
+        """Select at most one confirmed safety return after the settle window."""
+        if self.disabled or self._settle_polls_remaining > 0:
+            return []
+        for lend in self.active_lends:
+            if lend.home_kv_hot_polls >= self.config.early_return_confirm_polls:
+                return [lend]
+        return []
 
     def _update_normal_return_confirmations(self) -> None:
         """Count consecutive fully-relieved samples for policies using guests."""
@@ -235,193 +217,77 @@ class MultiPolicyInferenceScheduler:
 
     # ================================================================ decide
     def decide(self, stats: StepStats) -> BoundaryPlan:
-        plan = BoundaryPlan()
+        """Select one ordinary return, otherwise one confirmed new borrow."""
         step = stats.step
         self._trace_step = step
         self._decision_count += 1
 
         if self.disabled:
-            plan.returns = list(self.active_lends)
-            return plan
-
-        # A failed return may have already removed routing or put engines to
-        # sleep. Resume it before making any allocation decision; unaffected
-        # lends stay active in their owning policy's regular weight update.
-        recovering = [lend for lend in self.active_lends if lend.return_stage > 0]
-        if recovering:
-            plan.returns = recovering
-            plan.renewals = [lend for lend in self.active_lends if lend.return_stage == 0]
-            return plan
-
-        # ---------- layer 1: bottleneck detection ----------
-        bn = self._bottleneck_fsm(self._pick_candidate(), step)
-
-        # Ignore transient post-swap samples until enough fresh scrapes arrive.
-        # Safety-driven early returns are evaluated independently in poll().
+            self._confirm_borrow(None)
+            return BoundaryPlan(returns=self.active_lends[:1])
         if self._settle_polls_remaining > 0:
-            plan.renewals = list(self.active_lends)
-            return plan
+            return BoundaryPlan()
 
-        desired = []
-        if bn is not None:
-            desired = self.quantity.plan(self, bn, step)
-        desired = self._guard_normal_returns(desired)
-        desired = self._limit_new_borrows(desired)
+        lend = self._select_normal_return()
+        if lend is not None:
+            self._confirm_borrow(None)
+            return BoundaryPlan(returns=[lend])
 
-        signature = self._target_signature(desired)
-        if signature != self._pending_target:
-            self._pending_target = signature
-            self._pending_target_polls = 1
-        else:
-            self._pending_target_polls += 1
+        if time.monotonic() < self._borrow_cooldown_until:
+            self._confirm_borrow(None)
+            return BoundaryPlan()
 
-        current = {self._lend_key(lend): lend for lend in self.active_lends}
-        if self._pending_target_polls < self.config.rebalance_confirm_polls:
-            ready = [
-                lend for lend in current.values()
-                if id(lend) in self._normal_return_ready_ids
-                and self._decision_count - self._lend_start_poll.get(id(lend), 0)
-                >= self.config.min_lend_polls
-            ]
-            plan.returns = ready
-            plan.renewals = [lend for lend in current.values() if lend not in ready]
-            return plan
+        candidate = self._pick_candidate()
+        borrow = self.quantity.select_borrow(self, candidate, step)
+        if self._confirm_borrow(borrow):
+            return BoundaryPlan(borrows=[borrow])
+        return BoundaryPlan()
 
-        desired_by_key = {self._plan_key(item): item for item in desired}
-        retained_keys = set(desired_by_key) & set(current)
+    def _select_normal_return(self) -> LendRecord | None:
+        """Return one mature, confirmed and individually safe lend.
 
-        # A new target cannot revoke a young lend. Load-driven early return is
-        # a safety path and deliberately bypasses this minimum duration. Hold
-        # the whole allocation while any undesired lend is young; mixing that
-        # forced incumbent with additions from the new target could over-assign
-        # capacity relative to the quantity calculation.
-        if any(
-            key not in retained_keys
-            and self._decision_count - self._lend_start_poll.get(id(lend), 0)
-            < self.config.min_lend_polls
-            for key, lend in current.items()
-        ):
-            plan.renewals = list(current.values())
-            return plan
-
-        for key, lend in current.items():
-            if key in retained_keys:
-                plan.renewals.append(lend)
-                retained_keys.add(key)
-            else:
-                plan.returns.append(lend)
-
-        retained_replicas = {
-            id(replica)
-            for lend in plan.renewals
-            for replica in lend.home_replicas
-        }
-        for key, borrow in desired_by_key.items():
-            if key not in retained_keys and not any(
-                id(replica) in retained_replicas for replica in borrow.home_replicas
-            ):
-                plan.borrows.append(borrow)
-        return plan
-
-    def _guard_normal_returns(self, desired: list[BorrowPlan]) -> list[BorrowPlan]:
-        """Allow only confirmed, post-return-safe ordinary returns.
-
-        Missing incumbents are proposed returns. For each donor, remove as many
-        of those units as possible while its demand divided by remaining cards
-        stays at or below ``kv_post_lend_max``. If any proposed return is held,
-        suppress additions for this decision because the quantity plan assumed
-        those cards had already moved back home.
+        Prefer smaller units, then older lends. Evaluate against current
+        capacity only; all other lends remain active until a later decision.
         """
-        desired_keys = {self._plan_key(plan) for plan in desired}
-        self._normal_return_ready_ids.clear()
-        proposed = [
-            lend for lend in self.active_lends
-            if self._lend_key(lend) not in desired_keys
-        ]
-        if not proposed:
-            return desired
-
-        allowed_ids: set[int] = set()
-        blocked = False
-        by_donor: dict[str, list[LendRecord]] = {}
-        for lend in proposed:
-            by_donor.setdefault(lend.donor, []).append(lend)
-
-        for donor, lends in by_donor.items():
-            if self._return_low_polls[donor] < self.config.return_confirm_polls:
-                blocked = True
+        ordered = sorted(
+            self.active_lends,
+            key=lambda lend: (
+                self._lend_guest_cards(lend), lend.since_step, lend.lend_id,
+            ),
+        )
+        for lend in ordered:
+            donor = lend.donor
+            if (
+                not self._is_relieved(donor)
+                or self._return_low_polls[donor] < self.config.return_confirm_polls
+            ):
+                continue
+            age = self._decision_count - self._lend_start_poll.get(id(lend), 0)
+            if age < self.config.min_lend_polls:
                 continue
             capacity = self.capacity_cards(donor)
+            capacity_after = capacity - self._lend_guest_cards(lend)
             demand = max(0.0, self.ema_kv[donor]) * capacity
-            ordered = sorted(
-                lends,
-                key=lambda lend: (
-                    self._lend_guest_cards(lend), lend.since_step, lend.lend_id,
-                ),
-            )
-            for lend in ordered:
-                capacity_after = capacity - self._lend_guest_cards(lend)
-                if (
-                    capacity_after <= 0
-                    or demand / capacity_after > self.ru.kv_post_lend_max
-                ):
-                    blocked = True
-                    continue
-                allowed_ids.add(id(lend))
-                capacity = capacity_after
-        self._normal_return_ready_ids = allowed_ids
-
-        active_keys = {self._lend_key(lend) for lend in self.active_lends}
-        result = list(desired)
-        for lend in proposed:
-            if id(lend) not in allowed_ids:
-                result.append(self._borrow_plan_for_lend(lend))
-        if blocked:
-            result = [plan for plan in result if self._plan_key(plan) in active_keys]
-        return result
+            if capacity_after > 0 and demand / capacity_after <= self.ru.kv_post_lend_max:
+                return lend
+        return None
 
     def _lend_guest_cards(self, lend: LendRecord) -> int:
         return len(lend.guests) * self.handles[lend.donor].cards_per_replica
 
-    @staticmethod
-    def _borrow_plan_for_lend(lend: LendRecord) -> BorrowPlan:
-        return BorrowPlan(
-            home_policy=lend.home_policy,
-            donor=lend.donor,
-            home_replicas=list(lend.home_replicas),
-        )
-
-    def _limit_new_borrows(self, desired: list[BorrowPlan]) -> list[BorrowPlan]:
-        """Retain incumbents but admit at most one new atomic unit.
-
-        A successful physical borrow starts a global wall-clock cooldown. While
-        it is active, no new units are admitted; desired removals still flow
-        through so normal and safety returns are never delayed by the cooldown.
-        """
-        active_keys = {self._lend_key(lend) for lend in self.active_lends}
-        additions = [plan for plan in desired if self._plan_key(plan) not in active_keys]
-        incumbents = [
-            plan for plan in desired if self._plan_key(plan) in active_keys
-        ]
-        if additions and time.monotonic() >= self._borrow_cooldown_until:
-            incumbents.append(additions[0])
-        return incumbents
-
-    @staticmethod
-    def _unit_key(home: str, donor: str, replicas: list[Any]) -> tuple:
-        return home, donor, tuple(sorted(id(replica) for replica in replicas))
-
-    def _plan_key(self, plan) -> tuple:
-        return self._unit_key(plan.home_policy, plan.donor, plan.home_replicas)
-
-    def _lend_key(self, lend: LendRecord) -> tuple:
-        return self._unit_key(lend.home_policy, lend.donor, lend.home_replicas)
-
-    @staticmethod
-    def _target_signature(plans) -> tuple:
-        """Confirm quantities, not transient replica choices within a pair."""
-        counts = Counter((plan.home_policy, plan.donor) for plan in plans)
-        return tuple(sorted((home, donor, count) for (home, donor), count in counts.items()))
+    def _confirm_borrow(self, borrow: BorrowPlan | None) -> bool:
+        """Confirm the directed pair, not a particular replica or full allocation."""
+        pair = (borrow.home_policy, borrow.donor) if borrow is not None else None
+        if pair is None:
+            self._pending_borrow_pair = None
+            self._pending_borrow_polls = 0
+            return False
+        if pair != self._pending_borrow_pair:
+            self._pending_borrow_pair = pair
+            self._pending_borrow_polls = 1
+        else:
+            self._pending_borrow_polls += 1
+        return self._pending_borrow_polls >= self.config.rebalance_confirm_polls
 
     # ------------------------------------------------- layer 1: candidates
     def _pick_candidate(self) -> str | None:
@@ -458,35 +324,6 @@ class MultiPolicyInferenceScheduler:
                 self.queue_time_s[policy] / self.ru.queue_time_enter_s,
             )
         return max(kv, queue)
-
-    def _bottleneck_fsm(self, target: str | None, step: int) -> str | None:
-        """Enter on ``bottleneck_confirm_polls`` consecutive confirmations;
-        exit once the current bottleneck reaches ``kv_exit`` or below."""
-        cur = self.bottleneck
-        if target == cur:
-            self.confirm.clear()
-            return cur
-        if target is None:
-            if cur is not None and self._is_relieved(cur):
-                self._log_bn_change(None, step)
-                self.bottleneck = None
-            self.confirm.clear()
-            return self.bottleneck
-        # candidate differs from the current bottleneck
-        for k in list(self.confirm):
-            if k != target:
-                del self.confirm[k]
-        self.confirm[target] = self.confirm.get(target, 0) + 1
-        if self.confirm[target] >= self.config.bottleneck_confirm_polls:
-            self._log_bn_change(target, step)
-            self.bottleneck = target
-            self.confirm.clear()
-        return self.bottleneck
-
-    def _log_bn_change(self, new_bn, step):
-        if new_bn != self.bottleneck:
-            self._log_event("bottleneck_change", step, "", new_bn or "",
-                            {"from": self.bottleneck, "to": new_bn})
 
     def _available_home_units(
         self,
@@ -563,8 +400,7 @@ class MultiPolicyInferenceScheduler:
             self._borrow_cooldown_until,
             time.monotonic() + self.config.borrow_cooldown_s,
         )
-        self._return_low_polls[lend.donor] = 0
-        self._settle_polls_remaining = self.config.rebalance_settle_polls
+        self._start_settle()
         self._counters["swap_episodes"] += 1
         self._log_event("borrow", lend.since_step, lend.home_policy, lend.donor,
                         {"lend_id": lend.lend_id})
@@ -575,20 +411,25 @@ class MultiPolicyInferenceScheduler:
         if lend in self.active_lends:
             self.active_lends.remove(lend)
         self._lend_start_poll.pop(id(lend), None)
-        self._return_low_polls[lend.donor] = 0
-        self._settle_polls_remaining = self.config.rebalance_settle_polls
+        self._start_settle()
         if not early:
             self._counters["returns"] += 1
+        else:
+            self._counters["early_returns"] += 1
         self._log_event("early_return" if early else "return", step,
                         lend.home_policy, lend.donor,
                         {"lend_id": lend.lend_id,
                          "held_s": time.monotonic() - self.trace.started.pop(lend.lend_id)
                          if lend.lend_id in self.trace.started else None})
 
-    def note_lend_renewed(self, lend: LendRecord, step: int) -> None:
-        self._counters["renewals"] += 1
-        self._log_event("renew", step, lend.home_policy, lend.donor,
-                        {"lend_id": lend.lend_id})
+    def _start_settle(self) -> None:
+        """Discard pre-change confirmations and observe the new allocation."""
+        self._settle_polls_remaining = self.config.rebalance_settle_polls
+        self._pending_borrow_pair = None
+        self._pending_borrow_polls = 0
+        self._return_low_polls = dict.fromkeys(self.policies, 0)
+        for lend in self.active_lends:
+            lend.home_kv_hot_polls = 0
 
     def next_lend_id(self) -> int:
         return next(self._lend_seq)
@@ -610,7 +451,8 @@ class MultiPolicyInferenceScheduler:
     def metrics_snapshot(self) -> dict:
         snap = dict(self._counters)
         snap["active_lends"] = len(self.active_lends)
-        snap["bottleneck"] = self.bottleneck or ""
+        snap["pending_borrow_pair"] = self._pending_borrow_pair
+        snap["borrow_confirmations"] = self._pending_borrow_polls
         snap["disabled"] = self.disabled
         snap["kv_util"] = {p: round(self.ema_kv[p], 3) for p in self.policies}
         snap["waiting_per_replica"] = {

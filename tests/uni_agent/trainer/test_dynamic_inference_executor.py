@@ -202,6 +202,41 @@ def test_membership_roundtrip(clone_stub):
     assert len(clone_stub.instances) == 2  # initial guest + home refresh only
 
 
+def test_borrow_commits_scheduler_only_after_inner_execution(clone_stub, monkeypatch):
+    env = Env()
+    inner_borrow = env.executor._borrow
+
+    async def checked_inner_borrow(plan, step):
+        lend = await inner_borrow(plan, step)
+        assert "lb:a:add" in env.ops()
+        assert env.scheduler.active_lends == []
+        assert env.scheduler.metrics_snapshot()["swap_episodes"] == 0
+        return lend
+
+    monkeypatch.setattr(env.executor, "_borrow", checked_inner_borrow)
+    lend = borrow(env)
+    assert env.scheduler.active_lends == [lend]
+    assert env.scheduler.metrics_snapshot()["swap_episodes"] == 1
+    assert env.scheduler._settle_polls_remaining == env.config.rebalance_settle_polls
+
+
+def test_borrow_bookkeeping_failure_also_poisons_executor(clone_stub, monkeypatch):
+    env = Env()
+
+    def fail(lend):
+        assert "lb:a:add" in env.ops()
+        raise RuntimeError("bookkeeping failed")
+
+    monkeypatch.setattr(env.scheduler, "note_borrow_started", fail)
+    with pytest.raises(RuntimeError, match="bookkeeping failed"):
+        borrow(env)
+    assert env.executor.failure is not None
+    before = list(env.log)
+    with pytest.raises(RuntimeError, match="restart required"):
+        borrow(env)
+    assert env.log == before
+
+
 @pytest.mark.parametrize("operation", ["abort_all_requests", "sleep", "wake_up"])
 def test_borrow_failure_stops_transaction(clone_stub, operation):
     env = Env()
@@ -225,9 +260,9 @@ def test_return_failure_never_advances_or_retries_unknown_work(clone_stub, opera
     lend = borrow(env)
     target = lend.home_replicas[0] if operation == "wake_up" else lend.guests[0]
     target._fail[operation] = TimeoutError("injected")
-    with pytest.raises(RuntimeError, match="TimeoutError"):
+    with pytest.raises(RuntimeError, match=f"stage {stage}: TimeoutError"):
         env.executor.return_(lend, 8)
-    assert lend.return_stage == stage
+    assert not hasattr(lend, "return_stage")
     assert lend in env.scheduler.active_lends
     before = list(env.log)
     with pytest.raises(RuntimeError, match="restart required"):
@@ -264,7 +299,11 @@ def test_borrow_return_order_keeps_home_and_guest_exclusive(clone_stub):
     clone_stub.log = env.log
     lend = borrow(env)
     ops = env.ops()
+    assert ops.index('lb:b:remove') < ops.index('abort:b:0')
+    assert ops.index('abort:b:0') < ops.index('scm:b:remove')
+    assert ops.index('scm:b:remove') < ops.index('sleep:b:0')
     assert ops.index('sleep:b:0') < ops.index('wake:guest-ba:0')
+    assert ops.index('wake:guest-ba:0') < ops.index('clone') < ops.index('scm:a:add')
     assert ops.index('scm:a:add') < ops.index('lb:a:add')
     env.log.clear()
     env.executor.return_(lend, 8)
@@ -272,7 +311,71 @@ def test_borrow_return_order_keeps_home_and_guest_exclusive(clone_stub):
     assert ops.index('lb:a:remove') < ops.index('abort:guest-ba:0')
     assert ops.index('scm:a:remove') < ops.index('sleep:guest-ba:0')
     assert ops.index('sleep:guest-ba:0') < ops.index('wake:b:0')
+    assert ops.index('wake:b:0') < ops.index('clone') < ops.index('scm:b:add')
     assert ops.index('scm:b:add') < ops.index('lb:b:add')
+    assert ops.index('lb:b:add') < ops.index('guest_release')
+
+
+@pytest.mark.parametrize("operation,stage", [
+    ("remove_route", 0), ("clone", 4), ("add_membership", 5), ("add_route", 6),
+])
+def test_return_failure_keeps_reservation_and_blocks_all_further_work(
+    clone_stub, monkeypatch, operation, stage,
+):
+    from uni_agent.trainer.dynamic_inference.controller import BoundaryGate
+
+    env = Env()
+    gate = BoundaryGate()
+    lend = borrow(env)
+    env.log.clear()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    if operation == "clone":
+        clone_stub.fail_next = True
+    elif operation == "add_membership":
+        monkeypatch.setattr(env.handles["b"].standalone_checkpoint_manager, "add_replicas", fail)
+    else:
+        policy, method = ("a", "remove_servers") if operation == "remove_route" else ("b", "add_servers")
+        monkeypatch.setattr(getattr(env.handles[policy].lb_handle, method), "remote", fail)
+    with pytest.raises(RuntimeError, match=f"stage {stage}:"):
+        gate.run_exclusive(lambda: env.executor.return_(lend, 8))
+
+    assert env.executor.failure is not None
+    assert gate.failure is not None
+    assert "guest_release" not in env.ops()
+    assert "lb:b:add" not in env.ops()
+    assert lend in env.scheduler.active_lends
+    assert env.scheduler.metrics_snapshot()["returns"] == 0
+    if operation == "remove_route":
+        assert not env.log
+    before = list(env.log)
+    with pytest.raises(RuntimeError, match="gate failed"):
+        gate.run_exclusive(lambda: env.executor.return_(lend, 9))
+    with pytest.raises(RuntimeError, match="restart required"):
+        env.executor.return_(lend, 9)
+    with pytest.raises(RuntimeError, match="restart required"):
+        borrow(env)
+    with pytest.raises(RuntimeError, match="restart required"):
+        env.executor.validate_membership()
+    assert env.log == before
+
+
+def test_return_bookkeeping_failure_also_poisons_executor(clone_stub, monkeypatch):
+    env = Env()
+    lend = borrow(env)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("bookkeeping failed")
+
+    monkeypatch.setattr(env.scheduler, "note_lend_returned", fail)
+    with pytest.raises(RuntimeError, match="bookkeeping failed"):
+        env.executor.return_(lend, 8)
+    before = list(env.log)
+    with pytest.raises(RuntimeError, match="restart required"):
+        env.executor.return_(lend, 9)
+    assert env.log == before
 
 
 def test_boundary_uses_donor_manager_once_with_guest(clone_stub):

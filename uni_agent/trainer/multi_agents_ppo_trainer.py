@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import nullcontext
 from uuid import uuid4
 import posixpath
 from collections import defaultdict
@@ -630,13 +629,23 @@ class MultiAgentsPPOTrainer:
             self._sync_policy_runtime_context()
             self.on_step_begin()
             batch = self.step(metrics=metrics, timing_raw=self.timing_raw)
-            # Saving uses the same actor group as dynamic weight transfer.
-            boundary = self._dynamic_inference.gate.boundary() if self._dynamic_inference else nullcontext()
-            with boundary:
+
+            def _finish_step():
                 if self._should_save_checkpoint():
                     with marked_timer("save_checkpoint", self.timing_raw, color="green"):
                         self._save_checkpoint()
                 self.on_step_end()
+
+            # Saving uses the same actor group as dynamic weight transfer. One
+            # outer transaction owns the sole topology lock; callees do not
+            # reacquire it.
+            if self._dynamic_inference is not None:
+                self._dynamic_inference.gate.run_exclusive(
+                    _finish_step,
+                    blocking=True,
+                )
+            else:
+                _finish_step()
             # Collect separate_async weight-sync metrics from the policy trainers.
             metrics.update(self._consume_sync_metrics())
             if self._dynamic_inference is not None:

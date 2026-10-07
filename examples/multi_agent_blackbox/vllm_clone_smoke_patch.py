@@ -59,7 +59,7 @@ def apply_patch():
         times = {}
         def topology():
             try:
-                with controller.gate.boundary():
+                def _replace_lend():
                     times['topology_start'] = time.monotonic()
                     entered.set()
                     lend = controller._smoke_lend
@@ -68,6 +68,10 @@ def apply_patch():
                         BorrowPlan(lend.home_policy, lend.donor, lend.home_replicas), self.global_steps)
                     controller.executor.validate_membership()
                     times['topology_end'] = time.monotonic()
+                controller.gate.run_exclusive(
+                    _replace_lend,
+                    blocking=True,
+                )
             except BaseException as exc:
                 errors.append(exc)
                 entered.set()

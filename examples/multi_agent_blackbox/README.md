@@ -258,14 +258,14 @@ borrowing:
 ### 运行时安全与降级
 
 - 借还与 `update_weights` 严格串行（边界顺序：删减归还 → 各 policy
-  `update_weights` → 续借 guest 定向同步 → 增量借入）；
+  `update_weights`（包含已借入的 guest）→ 增量借入）；
 - 借用失败自动回滚并屏蔽该 pair 一个 swap 窗口；重复失败触发熔断，
   调度器降级为 static（只归还不再借用）；
 - 瓶颈/目标连续确认、稳定观察窗口、最短持有期和全局冷却共同限制换手；
 - 训练 cleanup 时先归还全部活跃借出、kill 全部 guest actor，再走
   per-policy 清理。
 - 指标以 `dynamic_inference/*` 前缀合并进 trainer metrics
-  （swap_episodes / renewals / returns / bottleneck / kv_util / disabled 等）。
+  （swap_episodes / returns / kv_util / disabled 等）。
 
 ### 三 policy 长时间借还卡实验
 

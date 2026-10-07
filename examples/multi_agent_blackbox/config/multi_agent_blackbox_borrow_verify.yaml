@@ -95,7 +95,6 @@ dynamic_inference_scheduling:
     queue_time_enter_s: 2.0
     queue_time_exit_s: 0.5
     ema_alpha: 0.3
-  bottleneck_confirm_polls: 10
   rebalance_confirm_polls: 5
   rebalance_settle_polls: 10
   min_lend_polls: 60

@@ -4,7 +4,6 @@ import functools
 import importlib
 import logging
 import sys
-from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace as NS
 
 import pytest
@@ -46,7 +45,12 @@ def test_smoke_driver_uses_executor_handles_and_verifies_boundaries(monkeypatch,
             self.scheduler = NS(active_lends=[])
             self.config = NS(borrow_drain_timeout_s=60)
             self.poll_loop = NS(stop=lambda: None, join=lambda **kw: None, is_alive=lambda: False)
-            self.gate = NS(boundary=nullcontext)
+
+            def run_exclusive(fn, **kwargs):
+                fn()
+                return True
+
+            self.gate = NS(run_exclusive=run_exclusive)
 
             def borrow(plan, step):
                 home = handles[plan.home_policy].standalone_checkpoint_manager

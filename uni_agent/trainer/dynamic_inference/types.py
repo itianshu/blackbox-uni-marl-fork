@@ -50,7 +50,7 @@ class ResourceUsageConfig:
 
     queue_signal_enabled: bool = True
     kv_enter: float = 0.85                # KV utilisation above which a policy may be judged bottleneck
-    kv_exit: float = 0.6                  # bottleneck state exits at or below this
+    kv_exit: float = 0.6                  # normal return requires KV at or below this
     kv_post_lend_max: float = 0.7         # predicted post-lend lender cap; below kv_enter for hysteresis
     waiting_enter_per_replica: float = 8.0
     waiting_exit_per_replica: float = 1.0
@@ -86,10 +86,8 @@ class SchedulingConfig:
     """Top-level dynamic-inference-scheduling configuration."""
 
     enable: bool = False
-    # --- bottleneck detection (KV cache utilisation or sustained queueing) ---
-    bottleneck_confirm_polls: int = 10
     # --- rebalance anti-jitter ---
-    rebalance_confirm_polls: int = 2
+    rebalance_confirm_polls: int = 2       # consecutive safe candidates for the same borrow pair
     rebalance_settle_polls: int = 3
     min_lend_polls: int = 2
     borrow_cooldown_s: float = 10.0        # no new borrow event during this wall-clock interval
@@ -169,9 +167,6 @@ class LendRecord:
     since_step: int
     # early-return bookkeeping
     home_kv_hot_polls: int = 0
-    # Last completed return stage, retained for failure diagnosis. A failed
-    # executor is terminal; this does not authorize retry after remote timeout.
-    return_stage: int = 0
 
 
 @dataclass
@@ -179,9 +174,6 @@ class BoundaryPlan:
     """Incremental allocation changes for one scheduling decision."""
 
     returns: list[LendRecord] = field(default_factory=list)
-    # Legacy name for retained allocations in the scheduler's plan; these do
-    # not execute a separate weight transfer or renewal operation.
-    renewals: list[LendRecord] = field(default_factory=list)
     borrows: list[BorrowPlan] = field(default_factory=list)
 
 
@@ -196,7 +188,7 @@ class StepStats:
 class LendEvent:
     """A scheduling event for the metrics/log stream."""
 
-    kind: str                                    # borrow | renew | return | early_return | bottleneck_change | disable
+    kind: str                                    # borrow | return | early_return | disable
     step: int
     t: float
     home: str = ""
@@ -259,7 +251,6 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
     # Compatibility for configs written before scheduling moved from step
     # boundaries to complete metrics polls.
     for old, new in {
-        "bottleneck_confirm_steps": "bottleneck_confirm_polls",
         "rebalance_confirm_steps": "rebalance_confirm_polls",
         "min_lend_steps": "min_lend_polls",
     }.items():
@@ -351,7 +342,6 @@ def parse_scheduling_config(cfg: Any) -> SchedulingConfig | None:
         raise ValueError("resource_usage.kv_metric_names must be a non-empty list of names")
     for key in (
         "clone_bucket_megabytes",
-        "bottleneck_confirm_polls",
         "rebalance_confirm_polls",
         "rebalance_settle_polls",
         "min_lend_polls",

@@ -168,9 +168,7 @@ dynamic_inference_scheduling:
     queue_time_enter_s: 2.0
     queue_time_exit_s: 0.5
     ema_alpha: 0.3
-  # With 1 s polling, require roughly 10 s of sustained pressure before
-  # switching the bottleneck.  This avoids reacting to short rollout bursts.
-  bottleneck_confirm_polls: 10
+  # Confirm the same safe borrow pair across consecutive metrics decisions.
   rebalance_confirm_polls: 3
   rebalance_settle_polls: 5
   min_lend_polls: 10

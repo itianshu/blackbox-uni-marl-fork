@@ -37,7 +37,6 @@ class SchedulingTrace:
                     if hasattr(scheduler, '_load_score') else None
                 ),
                 'sample_age_s': now - latest.t if latest else None,
-                'metrics_fresh': latest.metrics_fresh if latest else False,
                 'inflight': latest.total_inflight if latest else None,
                 'replica_inflight': latest.inflight_per_replica if latest else {},
                 'replica_kv': latest.kv_cache_usage if latest else {},
@@ -63,9 +62,8 @@ class SchedulingTrace:
                 'time_unix_s': time.time(), 'monotonic_s': now,
                 'kind': kind, 'step': step, 'detail': detail,
                 'decision_state': {
-                    'bottleneck': getattr(scheduler, 'bottleneck', None),
-                    'bottleneck_confirmations': getattr(scheduler, 'confirm', {}),
-                    'target_confirmations': getattr(scheduler, '_pending_target_polls', 0),
+                    'pending_borrow_pair': getattr(scheduler, '_pending_borrow_pair', None),
+                    'borrow_confirmations': getattr(scheduler, '_pending_borrow_polls', 0),
                     'settle_polls_remaining': getattr(scheduler, '_settle_polls_remaining', 0),
                     'return_low_polls': getattr(scheduler, '_return_low_polls', {}),
                     'borrow_cooldown_remaining_s': max(0, getattr(scheduler, '_borrow_cooldown_until', 0) - now),

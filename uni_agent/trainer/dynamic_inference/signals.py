@@ -43,7 +43,6 @@ class PolicySample:
     total_inflight: int = 0
     kv_cache_usage: dict[str, float] = field(default_factory=dict)
     vllm_metrics: dict[str, VLLMMetricsSnapshot] = field(default_factory=dict)
-    metrics_fresh: bool = False
 
 
 class SignalSource(Protocol):
@@ -56,7 +55,7 @@ class ServingSignalSource:
     def __init__(
         self,
         handles: dict[str, Any],
-        scraper: VLLMMetricsScraper | None = None,
+        scraper: VLLMMetricsScraper,
         scrape_interval_s: float = 1.0,
     ):
         self._handles = handles
@@ -72,8 +71,7 @@ class ServingSignalSource:
             policy: {str(server): int(count) for server, count in (status.get("servers") or {}).items()}
             for policy, status in statuses.items()
         }
-        scrape = self._scraper is not None
-        metrics = self._scrape_metrics(self._scrape_targets(inflight)) if scrape else {}
+        metrics = self._scrape_metrics(self._scrape_targets(inflight))
 
         samples = {}
         for policy, status in statuses.items():
@@ -90,7 +88,6 @@ class ServingSignalSource:
                 total_inflight=int(status.get("total_inflight", sum(per_replica.values()))),
                 kv_cache_usage=kv_cache,
                 vllm_metrics=policy_metrics,
-                metrics_fresh=scrape,
             )
         return samples
 
@@ -168,11 +165,6 @@ class SignalStore:
         for policy, sample in samples.items():
             if policy in self.samples:
                 self.record(policy, sample)
-
-    def refresh_now(self, source: SignalSource) -> bool:
-        samples = source.sample_all()
-        self.record_all(samples)
-        return any(sample.metrics_fresh for sample in samples.values())
 
     def latest_has_kv(self, policy: str) -> bool:
         samples = self.samples[policy]

@@ -175,34 +175,13 @@ class TestServingSignalSource:
         assert samples["a"].kv_cache_usage == {"h1:1": 0.5}
         assert samples["a"].vllm_metrics["h1:1"].aggregate(
             "num_requests_waiting") == 2
-        assert samples["a"].metrics_fresh is True
 
         # The caller owns the cadence; every tick produces an aligned sample.
         scraped.clear()
         cached = source.sample_all()
         assert sorted(scraped) == ["h1:1", "h2:2"]
-        assert cached["a"].metrics_fresh is True
+        assert cached["a"].kv_cache_usage == {"h1:1": 0.5}
         assert samples["a"].kv_cache_usage  # previous samples untouched
-
-    def test_store_reports_only_fresh_scrape_attempts(self):
-        store = SignalStore(["a"])
-
-        class Source:
-            fresh = True
-
-            def sample_all(self):
-                return {"a": PolicySample(
-                    t=time.monotonic(),
-                    kv_cache_usage={"a:0": 0.5} if self.fresh else {},
-                    metrics_fresh=self.fresh,
-                )}
-
-        source = Source()
-        assert store.refresh_now(source) is True
-        assert store.latest_has_kv("a") is True
-        source.fresh = False
-        assert store.refresh_now(source) is False
-        assert store.latest_has_kv("a") is False
 
     def test_lb_servers_included_in_scrape_targets(self, monkeypatch):
         import sys
@@ -248,12 +227,10 @@ class TestSignalStoreVLLMMetrics:
         store.record("a", PolicySample(
             t=10.0,
             vllm_metrics={"r0": start, "r1": start},
-            metrics_fresh=True,
         ))
         store.record("a", PolicySample(
             t=13.0,
             vllm_metrics={"r0": end, "r1": end},
-            metrics_fresh=True,
         ))
 
         assert store.waiting_per_replica("a") == pytest.approx(12.0)
@@ -291,12 +268,10 @@ class TestSignalStoreVLLMMetrics:
         store.record("a", PolicySample(
             t=10.0,
             vllm_metrics={"replica-0": previous},
-            metrics_fresh=True,
         ))
         store.record("a", PolicySample(
             t=12.0,
             vllm_metrics={"replica-0": metrics},
-            metrics_fresh=True,
         ))
 
         observed = store.vllm_observability("a")
@@ -319,7 +294,6 @@ class TestSignalStoreVLLMMetrics:
         store.record("a", PolicySample(
             t=time.monotonic(),
             vllm_metrics={"replica-0": metrics},
-            metrics_fresh=True,
         ))
         assert store.latest_vllm_snapshot("a").aggregate(
             "future_metric_from_new_version") == 12

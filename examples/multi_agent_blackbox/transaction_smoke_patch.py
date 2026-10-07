@@ -69,7 +69,8 @@ def apply_patch():
         controller._smoke_steps += 1
         sequence = controller._smoke_steps
         assert sequence <= 2, "Deterministic smoke requires exactly two steps"
-        with controller.gate.boundary():
+
+        def _prepare_transaction():
             if sequence == 1:
                 unit = [controller.executor.handles["policy_2"].replicas[0]]
                 controller._smoke_lend = controller.executor.borrow(
@@ -80,6 +81,10 @@ def apply_patch():
                 controller.executor.return_(controller._smoke_lend, self.global_steps)
                 _emit("returned", step=self.global_steps)
             controller.executor.validate_membership()
+        controller.gate.run_exclusive(
+            _prepare_transaction,
+            blocking=True,
+        )
         result = original_step(self)
         if sequence == 2:
             assert not controller.scheduler.active_lends

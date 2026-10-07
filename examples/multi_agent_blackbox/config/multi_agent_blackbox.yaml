@@ -169,10 +169,9 @@ dynamic_inference_scheduling:
     ema_alpha: 0.3                # KV 利用率 EMA 平滑；运行时滚动窗口约为 20 次抓取
 
   # ── 层 1：瓶颈确认 ─────────────────────────────────────────────
-  bottleneck_confirm_polls: 10    # 连续 N 次完整 metrics 判定同一 policy 过载才借
 
   # ── 防抖：目标分配确认和动作稳定期 ────────────────────────────
-  rebalance_confirm_polls: 2      # 同一目标分配连续出现 N 次完整 metrics 后立即执行
+  rebalance_confirm_polls: 2      # 同一借用 pair 连续 N 次安全可借后执行
   rebalance_settle_polls: 3       # 物理借还后等待 N 次 poll，再参与普通再均衡
   min_lend_polls: 2               # 普通路径至少经过 N 次完整 metrics；安全早归还不受限制
   borrow_cooldown_s: 10.0         # 成功借出后 N 秒内禁止新增借卡；普通/安全归还仍可执行
