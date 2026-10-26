@@ -488,6 +488,65 @@ class FakeMultiAgentSessionRuntime:
 
 
 class TestMultiAgentFrameworkTQ:
+    def test_partial_rollout_failure_records_actionable_diagnostics(self, caplog):
+        asyncio.run(self._run_partial_rollout_failure_records_actionable_diagnostics(caplog))
+
+    async def _run_partial_rollout_failure_records_actionable_diagnostics(self, caplog):
+        _install_dependency_stubs()
+        from uni_agent.trainer.framework import framework as framework_module
+        from uni_agent.trainer.framework.framework import MultiAgentFramework
+
+        recorded_tq = RecordingTQ()
+        original_tq = framework_module.tq
+        original_converter = framework_module._list_of_tq_fields_to_tensordict
+        framework_module.tq = recorded_tq
+        framework_module._list_of_tq_fields_to_tensordict = lambda fields: fields
+
+        async def runner(*, rollout, **_kwargs):
+            if "-1-" in rollout.rollout_id:
+                raise ValueError("min_tokens must be <= max_tokens after resume")
+            return {"reward_info": {"reward_score": 1.0}}
+
+        runtime = FakeMultiAgentSessionRuntime()
+        framework = MultiAgentFramework(
+            session_runtime=runtime,
+            multi_agent_runner=runner,
+            role_policy_mapping={"agent_1": "policy_1"},
+            rollout_config={"n": 2, "val_kwargs": {"n": 1}},
+        )
+
+        try:
+            with caplog.at_level("WARNING"):
+                result = await framework._run_prompt_rollouts_to_tq(
+                    raw_prompt=[{"role": "user", "content": "solve"}],
+                    sample_fields={"uid": "prompt-uid"},
+                    sample_index=7,
+                    global_steps=3,
+                    partition_id="train",
+                    num_rollouts=2,
+                )
+        finally:
+            framework_module.tq = original_tq
+            framework_module._list_of_tq_fields_to_tensordict = original_converter
+
+        assert result["num_success_rollouts"] == 1
+        assert result["num_failed_rollouts"] == 1
+        assert result["num_partial_failed_uids"] == 1
+        assert result["failure_category_counts"] == {"min_tokens_exceeds_remaining_max": 1}
+        assert runtime.aborted and "-1-" in runtime.aborted[0]
+        success_tag = recorded_tq.batch_puts[0]["tags"][0]
+        assert success_tag["num_requested_rollouts"] == 2
+        assert success_tag["num_success_rollouts"] == 1
+        assert success_tag["num_failed_rollouts"] == 1
+        assert success_tag["rollout_failure_reason__min_tokens_exceeds_remaining_max"] == 1
+        failure_log = next(
+            record.message for record in caplog.records if record.message.startswith("MAS_ROLLOUT_FAILURE")
+        )
+        assert '"failure_stage": "agent_runner"' in failure_log
+        assert '"sample_index": 7' in failure_log
+        assert '"sample_idx": 1' in failure_log
+        assert '"uid": "prompt-uid"' in failure_log
+
     def test_from_config_loads_mas_config_for_multi_agent_runner(self):
         asyncio.run(self._run_from_config_loads_mas_config_for_multi_agent_runner())
 

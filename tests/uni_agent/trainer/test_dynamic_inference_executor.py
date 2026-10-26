@@ -202,6 +202,26 @@ def test_membership_roundtrip(clone_stub):
     assert len(clone_stub.instances) == 2  # initial guest + home refresh only
 
 
+def test_borrow_and_return_record_stage_timings(clone_stub):
+    env = Env()
+    events = []
+    env.scheduler.trace.emit = lambda _scheduler, kind, step, **detail: events.append((kind, step, detail))
+
+    lend = borrow(env)
+    env.executor.return_(lend, 8)
+
+    borrow_complete = next(detail for kind, _, detail in events if kind == "borrow_complete")
+    return_complete = next(detail for kind, _, detail in events if kind == "return_complete")
+    assert borrow_complete["transaction_id"]
+    assert borrow_complete["trigger_to_routing_ready_s"] >= 0
+    assert borrow_complete["stage_timings_s"]["weight_sync"] >= 0
+    assert borrow_complete["guest_servers"] == ["guest-ba:0"]
+    assert return_complete["transaction_id"]
+    assert return_complete["trigger_to_routing_ready_s"] >= 0
+    assert return_complete["stage_timings_s"]["weight_sync"] >= 0
+    assert return_complete["home_servers"] == ["b:0"]
+
+
 def test_borrow_commits_scheduler_only_after_inner_execution(clone_stub, monkeypatch):
     env = Env()
     inner_borrow = env.executor._borrow

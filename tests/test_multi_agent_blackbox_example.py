@@ -9,6 +9,7 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 
@@ -266,22 +267,13 @@ def test_chat_completion_forwards_deterministic_length_options(monkeypatch):
     assert captured["payload"]["ignore_eos"] is True
 
 
-def test_chat_completion_retries_interrupted_dynamic_inference_request(monkeypatch):
+def test_chat_completion_does_not_restart_interrupted_turn(monkeypatch):
     from examples.multi_agent_blackbox import multi_agent_runner as runner_module
 
     attempts = []
 
     class FakeTransportError(Exception):
         pass
-
-    class FakeResponse:
-        status_code = 200
-
-        def raise_for_status(self):
-            return None
-
-        def json(self):
-            return {"choices": [{"message": {"content": "recovered"}}]}
 
     class FakeClient:
         def __init__(self, *, timeout):
@@ -295,9 +287,7 @@ def test_chat_completion_retries_interrupted_dynamic_inference_request(monkeypat
 
         async def post(self, url, *, json):
             attempts.append((url, json))
-            if len(attempts) == 1:
-                raise FakeTransportError("replica was reconfigured")
-            return FakeResponse()
+            raise FakeTransportError("gateway connection failed")
 
     monkeypatch.setitem(
         sys.modules,
@@ -309,19 +299,19 @@ def test_chat_completion_retries_interrupted_dynamic_inference_request(monkeypat
         ),
     )
 
-    result = asyncio.run(
-        runner_module._chat_completion(
-            base_url="http://gateway/v1",
-            role="agent_2",
-            messages=[{"role": "user", "content": "load"}],
-            agent_cfg={"request_max_retries": 2, "request_retry_backoff_seconds": 0},
-            max_tokens=32,
-            request_timeout_seconds=12.0,
+    with pytest.raises(FakeTransportError, match="gateway connection failed"):
+        asyncio.run(
+            runner_module._chat_completion(
+                base_url="http://gateway/v1",
+                role="agent_2",
+                messages=[{"role": "user", "content": "load"}],
+                agent_cfg={},
+                max_tokens=32,
+                request_timeout_seconds=12.0,
+            )
         )
-    )
 
-    assert result == "recovered"
-    assert len(attempts) == 2
+    assert len(attempts) == 1
 
 
 def test_borrow_verify_recipe_forces_asymmetric_load_and_lends_to_both_busy_policies():

@@ -129,6 +129,90 @@ def counter_events(serving):
     return events
 
 
+def _first_server_work_time(serving, *, ready_time, addresses):
+    """Return the first monitor sample showing useful work on a newly routed replica.
+
+    The serving monitor samples every five seconds, so this is an upper-bound
+    observation with roughly one sampling interval of positive error.
+    """
+    addresses = set(addresses or [])
+    if not addresses:
+        return None
+    counter_names = ("prompt_tokens_total", "generation_tokens_total", "requests_success_total")
+    baseline = {address: {name: 0.0 for name in counter_names} for address in addresses}
+    for sample in serving:
+        if sample.get("time_unix_s", 0) > ready_time:
+            break
+        for server in sample.get("servers", []):
+            address = server.get("address")
+            metrics = server.get("metrics") or {}
+            if address in addresses:
+                baseline[address] = {
+                    name: float(metrics.get(name, 0) or 0)
+                    for name in counter_names
+                }
+    for sample in serving:
+        timestamp = sample.get("time_unix_s", 0)
+        if timestamp < ready_time:
+            continue
+        for server in sample.get("servers", []):
+            address = server.get("address")
+            metrics = server.get("metrics") or {}
+            if address not in addresses:
+                continue
+            if float(metrics.get("requests_running", 0) or 0) > 0:
+                return timestamp
+            if any(
+                float(metrics.get(name, 0) or 0) > baseline[address][name]
+                for name in counter_names
+            ):
+                return timestamp
+    return None
+
+
+def _activation_latencies(trace, trace_window, serving, *, operation):
+    complete_kind = f"{operation}_complete"
+    starts = {
+        row.get("detail", {}).get("transaction_id"): row
+        for row in trace
+        if row.get("kind") == f"{operation}_start"
+        and row.get("detail", {}).get("transaction_id")
+    }
+    records = []
+    for completed in trace_window:
+        if completed.get("kind") != complete_kind:
+            continue
+        detail = completed.get("detail", {})
+        # Direct handoff returns deliberately keep home asleep; they do not
+        # create a home replica that can start serving.
+        if operation == "return" and not detail.get("reactivate_home", True):
+            continue
+        started = starts.get(detail.get("transaction_id"))
+        trigger_time = started.get("time_unix_s") if started else None
+        ready_time = completed.get("time_unix_s")
+        addresses = detail.get("guest_servers" if operation == "borrow" else "home_servers", [])
+        first_work_time = _first_server_work_time(
+            serving,
+            ready_time=ready_time,
+            addresses=addresses,
+        )
+        stage_timings = detail.get("stage_timings_s") or {}
+        records.append({
+            "trigger_to_routing_ready_s": (
+                ready_time - trigger_time if trigger_time is not None else detail.get("execution_s")
+            ),
+            "weight_sync_s": stage_timings.get("weight_sync"),
+            "routing_ready_to_first_work_s": (
+                first_work_time - ready_time if first_work_time is not None else None
+            ),
+            "trigger_to_first_work_s": (
+                first_work_time - trigger_time
+                if first_work_time is not None and trigger_time is not None else None
+            ),
+        })
+    return records
+
+
 def direct_step_metrics(metrics):
     result = {
         "wall_clock_s": metrics.get("perf/time_per_step"),
@@ -336,6 +420,27 @@ def summarize_step_window(start, end, gpu, serving, events, trace, trace_times):
         row.get("detail", {}).get("seconds")
         for row in trace_window if row.get("kind") == "replica_clone"
     ]
+    borrow_activation = _activation_latencies(
+        trace, trace_window, serving, operation="borrow"
+    )
+    return_activation = _activation_latencies(
+        trace, trace_window, serving, operation="return"
+    )
+    def activation_summary(records):
+        result = {"events": len(records)}
+        for key in (
+            "trigger_to_routing_ready_s",
+            "weight_sync_s",
+            "routing_ready_to_first_work_s",
+            "trigger_to_first_work_s",
+        ):
+            values = [record.get(key) for record in records]
+            result[f"{key}_mean"] = mean(values)
+            result[f"{key}_p90"] = percentile(values, 0.9)
+        result["first_work_observed"] = sum(
+            finite(record.get("trigger_to_first_work_s")) for record in records
+        )
+        return result
     result["dynamic_scheduling"] = {
         "borrow_starts": sum(row.get("kind") == "borrow_start" for row in trace_window),
         "borrow_events": len(reconciled_borrow_ids),
@@ -363,6 +468,8 @@ def summarize_step_window(start, end, gpu, serving, events, trace, trace_times):
         "replica_clone_events": sum(row.get("kind") == "replica_clone" for row in trace_window),
         "replica_clone_s_mean": mean(clone_durations),
         "replica_clone_s_p90": percentile(clone_durations, 0.9),
+        "borrow_activation": activation_summary(borrow_activation),
+        "return_activation": activation_summary(return_activation),
         "active_lends_mean": mean(len(row.get("active_lends", [])) for row in trace_window if "active_lends" in row),
         "active_lends_max": max([len(row.get("active_lends", [])) for row in trace_window if "active_lends" in row] or [0]),
         "serving_cards_mean": {
@@ -510,9 +617,17 @@ def main():
         ("Borrow events/step", "dynamic_scheduling/borrow_events", False),
         ("Borrow events inferred from topology/step", "dynamic_scheduling/borrow_events_inferred_from_topology", False),
         ("Borrow transaction time (s)", "dynamic_scheduling/borrow_execution_s_mean", False),
+        ("Borrow trigger→routing-ready (s)", "dynamic_scheduling/borrow_activation/trigger_to_routing_ready_s_mean", False),
+        ("Borrow weight sync (s)", "dynamic_scheduling/borrow_activation/weight_sync_s_mean", False),
+        ("Borrow routing-ready→first work (s)", "dynamic_scheduling/borrow_activation/routing_ready_to_first_work_s_mean", False),
+        ("Borrow trigger→first work (s)", "dynamic_scheduling/borrow_activation/trigger_to_first_work_s_mean", False),
         ("Return events/step", "dynamic_scheduling/return_events", False),
         ("Return events inferred from topology/step", "dynamic_scheduling/return_events_inferred_from_topology", False),
         ("Return transaction time (s)", "dynamic_scheduling/return_execution_s_mean", False),
+        ("Return trigger→routing-ready (s)", "dynamic_scheduling/return_activation/trigger_to_routing_ready_s_mean", False),
+        ("Return weight sync (s)", "dynamic_scheduling/return_activation/weight_sync_s_mean", False),
+        ("Return routing-ready→first work (s)", "dynamic_scheduling/return_activation/routing_ready_to_first_work_s_mean", False),
+        ("Return trigger→first work (s)", "dynamic_scheduling/return_activation/trigger_to_first_work_s_mean", False),
         ("Replica weight-clone time (s)", "dynamic_scheduling/replica_clone_s_mean", False),
         ("Borrow failures/step", "dynamic_scheduling/borrow_failures", False),
         ("Return failures/step", "dynamic_scheduling/return_failures", False),
@@ -609,6 +724,24 @@ def main():
                 f"{fmt(row['gpu'].get('memory_used_mib_max'))} |"
             )
         lines.append("")
+        lines += [
+            "| Step | Borrow trigger→ready s | Borrow weight sync s | Borrow trigger→work s | Return trigger→ready s | Return weight sync s | Return trigger→work s |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in all_rows[mode]:
+            scheduling = row["dynamic_scheduling"]
+            borrow_activation = scheduling["borrow_activation"]
+            return_activation = scheduling["return_activation"]
+            lines.append(
+                f"| {row['step']} | "
+                f"{fmt(borrow_activation.get('trigger_to_routing_ready_s_mean'))} | "
+                f"{fmt(borrow_activation.get('weight_sync_s_mean'))} | "
+                f"{fmt(borrow_activation.get('trigger_to_first_work_s_mean'))} | "
+                f"{fmt(return_activation.get('trigger_to_routing_ready_s_mean'))} | "
+                f"{fmt(return_activation.get('weight_sync_s_mean'))} | "
+                f"{fmt(return_activation.get('trigger_to_first_work_s_mean'))} |"
+            )
+        lines.append("")
 
     reason_available = any(
         row.get("rollout", {}).get("waiting_by_reason_available")
@@ -623,6 +756,8 @@ def main():
         "- Rollout 吞吐来自所有活跃 vLLM replica 的 Prometheus token counter 增量。",
         "- GPU 空泡定义为 15 秒 NVML 样本中 GPU utilization <10% 的比例；有效利用率为同窗口平均 GPU utilization。",
         "- Policy overlap 是两个 policy 的 old-log-prob/update/update-weights 并行临界路径代理，不冒充 CUDA kernel overlap。",
+        "- 借还卡 trigger→routing-ready 来自调度 trace；其中 weight sync 是 clone_replica 完整权重传输、校验与恢复生成的耗时。",
+        "- routing-ready→first work 使用 guest/home replica 首次出现 running request 或 token/request counter 增长的监控样本；serving 采样周期为 5 秒，因此该值最多约有一个采样周期的正误差。",
         "- MFU、staleness、训推概率相关性和显存 allocated/reserved 直接来自训练 step metrics。",
         "- MultiAgentsPPOTrainer.fit() 传给 Tracking.log() 的完整字典保存在每条记录的 trainer_tracking 下；所有数值项的统计汇总见 trainer_tracking_summary.json。",
         f"- vLLM request waiting by reason：{'已按标签采集' if reason_available else '当前 vLLM 未导出带 reason 标签的 metric，报告为 N/A；总 waiting 仍已采集'}。",

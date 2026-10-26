@@ -200,9 +200,11 @@ def _dynamic_inference_set_group_name(self, group_name):
     self.world_size = None
 
 
-def _patched_nccl_init_process_group(self, rank, world_size, master_metadata):
+def _patched_nccl_init_process_group(self, rank, world_size, master_metadata, *args, **kwargs):
     """Let a fresh ZeroMQ SUB subscription reach the metadata publisher."""
-    result = _ORIG_NCCL_INIT_PROCESS_GROUP(self, rank, world_size, master_metadata)
+    result = _ORIG_NCCL_INIT_PROCESS_GROUP(
+        self, rank, world_size, master_metadata, *args, **kwargs
+    )
     if rank >= 0:
         # NCCLCheckpointEngine publishes bucket metadata immediately after
         # init. ZeroMQ PUB/SUB silently drops frames until a new SUB
@@ -467,7 +469,7 @@ def _single_rank_checkpoint_worker_env(resource_pool) -> dict[str, str] | None:
     return {"DIST_INIT_METHOD": f"file://{store_path}"}
 
 
-async def _patched_init_standalone(self):
+async def _patched_init_standalone(self, *args, **kwargs):
     """RolloutReplica.init_standalone with a guest external-pool path.
 
     - ``_guest_external_pool`` set  -> guest path: reuse a view over the home
@@ -482,6 +484,11 @@ async def _patched_init_standalone(self):
       ``apply_patch()`` ran (the example patch's policy-suffixed wrapper if the
       example patch is active, else verl's original).
     """
+    # New verl accepts a caller-owned resource pool. Preserve its placement
+    # semantics instead of rejecting the argument or allocating another pool.
+    if args or kwargs:
+        return await _ORIG_INIT_STANDALONE(self, *args, **kwargs)
+
     pool = getattr(self, "_guest_external_pool", None)
     if pool is not None:
         from verl.single_controller.ray import RayWorkerGroup

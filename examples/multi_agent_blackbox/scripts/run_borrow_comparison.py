@@ -89,7 +89,11 @@ def main():
         run_dir = output / mode
         run_dir.mkdir(exist_ok=True)
         env = os.environ.copy()
-        env.update(BORROW_LOAD_PROFILE=args.profile, PYTHON=sys.executable, PYTHONPATH=str(root),
+        inherited_pythonpath = os.environ.get('PYTHONPATH')
+        pythonpath = os.pathsep.join(
+            value for value in [inherited_pythonpath, str(root)] if value
+        )
+        env.update(BORROW_LOAD_PROFILE=args.profile, PYTHON=sys.executable, PYTHONPATH=pythonpath,
                    RAY_ADDRESS=args.ray_address,
                    RAY_DASHBOARD_ADDRESS=args.dashboard_address,
                    TOTAL_TRAINING_STEPS=str(args.steps),

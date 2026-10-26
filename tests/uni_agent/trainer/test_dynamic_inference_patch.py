@@ -133,6 +133,20 @@ def _reset_patch_module(monkeypatch):
 
 # ------------------------------------------------------- patch #2: guest pool
 class TestInitStandalonePatch:
+    def test_caller_resource_pool_reaches_original_initializer(self, monkeypatch):
+        pool = object()
+        replica = object()
+        calls = []
+
+        async def original(self, resource_pool=None):
+            calls.append((self, resource_pool))
+            return "ready"
+
+        monkeypatch.setattr(patch, "_ORIG_INIT_STANDALONE", original)
+        assert asyncio.run(patch._patched_init_standalone(replica, resource_pool=pool)) == "ready"
+        assert asyncio.run(patch._patched_init_standalone(replica, pool)) == "ready"
+        assert calls == [(replica, pool), (replica, pool)]
+
     def test_apply_and_restore_roundtrip(self, monkeypatch):
         replica_mod, calls = _install_verl_stubs(monkeypatch)
         original = replica_mod.RolloutReplica.init_standalone
@@ -381,6 +395,20 @@ def _nccl_module():
 
 
 class TestNCCLCheckpointPatch:
+    def test_new_verl_sender_count_reaches_original_engine(self, monkeypatch):
+        module = _nccl_module()
+        calls = []
+
+        def init_process_group(self, rank, world_size, master_metadata, num_senders):
+            calls.append((rank, world_size, master_metadata, num_senders))
+
+        module.NCCLCheckpointEngine.init_process_group = init_process_group
+        monkeypatch.setattr(patch.time, "sleep", lambda _: None)
+        patch._patch_nccl_checkpoint_in_module(module)
+        engine = module.NCCLCheckpointEngine(0, 3)
+        engine.init_process_group(0, 3, "metadata", num_senders=2)
+        assert calls == [(0, 3, "metadata", 2)]
+
     def test_driver_group_name_resets_worker_topology(self, monkeypatch):
         module = _nccl_module()
         monkeypatch.setitem(

@@ -49,8 +49,11 @@ class SingleAsyncPPOTrainer(PPOTrainerSeparateAsync):
             replicas=self.standalone_server_manager.get_replicas(),
         )
 
-        self.current_mode = HybridEngineMode.ROLLOUT
-        self.add_replicas_to_balancer()
+        if self._enable_hybrid_replicas:
+            self.current_mode = HybridEngineMode.ROLLOUT
+            self.add_replicas_to_balancer()
+        else:
+            self.current_mode = HybridEngineMode.TRAINER
 
     def _build_replay_buffer(self):
         """The outer trainer owns the shared async replay buffer."""
@@ -58,7 +61,41 @@ class SingleAsyncPPOTrainer(PPOTrainerSeparateAsync):
 
     def _init_dataloader(self):
         """The outer trainer owns the shared prompt stream."""
-        return None
+        from uni_agent.trainer.policy_lifecycle import initialize_policy_training_steps
+
+        initialize_policy_training_steps(self)
+
+    def get_llm_client(self):
+        """Build the Uni-Agent client that fixes min_tokens on abort resume."""
+        from uni_agent.trainer.resumable_llm_client import ResumableFullyAsyncLLMServerClient
+
+        return self.standalone_server_manager.get_client(
+            client_cls=ResumableFullyAsyncLLMServerClient
+        )
+
+    def on_sample_end(self) -> None:
+        """Release hybrid rollout memory once the outer trainer has a batch.
+
+        The outer trainer owns sampling and never runs the standalone trainer's
+        per-step sampling timers. Its sample-end hook must perform the hybrid
+        transition directly rather than enter verl's private timer lifecycle.
+        """
+        if self.current_mode == HybridEngineMode.ROLLOUT:
+            self.switch_to_trainer()
+
+    def on_step_end(self) -> None:
+        """Publish weights without entering verl's standalone fit lifecycle.
+
+        Multi-agent scheduling owns step boundaries and hybrid transitions.
+        The native hook additionally reads profiling and adaptive-switch state
+        initialized only by the standalone trainer's fit/step hooks.
+        """
+        from verl.utils.debug import marked_timer
+
+        with marked_timer("update_weights", self.timing_raw, color="red"):
+            self._pending_sync_metrics = dict(
+                self.standalone_checkpoint_manager.update_weights(self.global_steps) or {}
+            )
 
     def fit(self, agent_loop_manager):
         raise RuntimeError(

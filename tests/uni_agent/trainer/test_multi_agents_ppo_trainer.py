@@ -4055,3 +4055,44 @@ class TestMultiAgentsPPOTrainer:
         trainer._add_data_metrics(batch, metrics)
 
         assert not any("off_policy/trajectory_" in key for key in metrics)
+
+    def test_add_data_metrics_counts_partial_rollout_failures_once_per_prompt(self):
+        from uni_agent.trainer.multi_agents_ppo_trainer import MultiAgentsPPOTrainer
+
+        trainer = object.__new__(MultiAgentsPPOTrainer)
+        trainer.global_steps = 12
+        trainer.policy_trainers = {"policy_1": object(), "policy_2": object()}
+        partial = {
+            "uid": "prompt-1",
+            "num_requested_rollouts": 4,
+            "num_success_rollouts": 2,
+            "num_failed_rollouts": 2,
+            "rollout_failure_reason__timeout": 1,
+            "rollout_failure_reason__connection_error": 1,
+        }
+        batch = SimpleKVBatchMeta(
+            keys=["k1", "k2", "k3"],
+            tags=[
+                {**partial, "policy_name": "policy_1", "sample_idx": 0},
+                {**partial, "policy_name": "policy_2", "sample_idx": 0},
+                {
+                    "uid": "prompt-2",
+                    "policy_name": "policy_1",
+                    "sample_idx": 0,
+                    "num_requested_rollouts": 4,
+                    "num_success_rollouts": 4,
+                    "num_failed_rollouts": 0,
+                },
+            ],
+        )
+        metrics = {}
+
+        trainer._add_data_metrics(batch, metrics)
+
+        assert metrics["training/rollout_failure/requested_rollouts"] == 8
+        assert metrics["training/rollout_failure/successful_rollouts"] == 6
+        assert metrics["training/rollout_failure/failed_rollouts"] == 2
+        assert metrics["training/rollout_failure/partial_failed_prompts"] == 1
+        assert metrics["training/rollout_failure/failed_rollout_ratio"] == pytest.approx(0.25)
+        assert metrics["training/rollout_failure/reason/timeout"] == 1
+        assert metrics["training/rollout_failure/reason/connection_error"] == 1

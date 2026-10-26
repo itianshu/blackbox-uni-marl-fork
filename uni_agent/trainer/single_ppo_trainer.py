@@ -38,7 +38,9 @@ class SinglePPOTrainer(PPOTrainerSync):
 
     def _init_dataloader(self):
         """The outer trainer owns the shared prompt stream; skip per-policy dataset load."""
-        return None
+        from uni_agent.trainer.policy_lifecycle import initialize_policy_training_steps
+
+        initialize_policy_training_steps(self)
 
     def fit(self, agent_loop_manager):
         """Refuse to run the standalone training loop.

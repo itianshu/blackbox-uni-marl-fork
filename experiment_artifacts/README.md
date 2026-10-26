@@ -20,3 +20,19 @@ Verify the downloaded archive with the SHA-256 value stored in
 `two_policy_2b_bidir4_retry1_20260923_234357.tar.zst.sha256` before extracting
 it. This archive is committed as a regular Git object, so Git LFS is not
 required on another machine.
+
+## 2026-09-24 dynamic run
+
+`dynamic_20260924_223631.tar.zst` is a lossless snapshot of
+`experiments/dynamic_20260924_223631/`. It includes the run configuration,
+provenance, summary, and compressed raw logs. It does not include model
+checkpoint weights.
+
+Restore it from the repository root with:
+
+```bash
+tar --zstd -xf experiment_artifacts/dynamic_20260924_223631.tar.zst
+```
+
+Verify the archive with the SHA-256 value in
+`dynamic_20260924_223631.tar.zst.sha256` before extracting it.

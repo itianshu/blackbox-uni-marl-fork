@@ -202,14 +202,14 @@ def _policy_suffixed_replica(self) -> None:
         self.name_suffix = f"_{label}" + self.name_suffix
 
 
-def _patched_replica_init_colocated(self):
+def _patched_replica_init_colocated(self, *args, **kwargs):
     _policy_suffixed_replica(self)
-    return _ORIG_REPLICA_INIT_COLOCATED(self)
+    return _ORIG_REPLICA_INIT_COLOCATED(self, *args, **kwargs)
 
 
-def _patched_replica_init_standalone(self):
+def _patched_replica_init_standalone(self, *args, **kwargs):
     _policy_suffixed_replica(self)
-    return _ORIG_REPLICA_INIT_STANDALONE(self)
+    return _ORIG_REPLICA_INIT_STANDALONE(self, *args, **kwargs)
 
 
 async def _patched_vllm_replica_launch_servers(self):

@@ -96,3 +96,40 @@ def test_completed_borrow_registry_overrides_stale_load_snapshot(tmp_path):
     assert abs(serving['policy_1']['kv_replica_mean']['mean'] - .15) < 1e-9
     assert serving['policy_1']['requests_running']['mean'] == 2
     assert serving['policy_2']['kv_replica_max']['mean'] == .05
+
+
+def test_two_policy_activation_latency_tracks_weight_sync_and_first_work():
+    from examples.multi_agent_blackbox.scripts.analyze_2policy_comparison import _activation_latencies
+
+    trace = [
+        {
+            'kind': 'borrow_start', 'time_unix_s': 10,
+            'detail': {'transaction_id': 'tx-1'},
+        },
+        {
+            'kind': 'borrow_complete', 'time_unix_s': 16,
+            'detail': {
+                'transaction_id': 'tx-1',
+                'execution_s': 6,
+                'guest_servers': ['guest:1'],
+                'stage_timings_s': {'weight_sync': 4.5},
+            },
+        },
+    ]
+    serving = [
+        {'time_unix_s': 15, 'servers': [
+            {'address': 'guest:1', 'metrics': {'requests_running': 0, 'prompt_tokens_total': 0}},
+        ]},
+        {'time_unix_s': 20, 'servers': [
+            {'address': 'guest:1', 'metrics': {'requests_running': 1, 'prompt_tokens_total': 0}},
+        ]},
+    ]
+
+    records = _activation_latencies(trace, trace, serving, operation='borrow')
+
+    assert records == [{
+        'trigger_to_routing_ready_s': 6,
+        'weight_sync_s': 4.5,
+        'routing_ready_to_first_work_s': 4,
+        'trigger_to_first_work_s': 10,
+    }]

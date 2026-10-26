@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import random
 import threading
 import time
+import traceback
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
@@ -67,6 +70,81 @@ def _short_failure_reason(error: BaseException) -> str:
     return message[:512]
 
 
+class MultiAgentRolloutStageError(RuntimeError):
+    """Preserve which lifecycle stage failed without losing the original exception."""
+
+    def __init__(self, *, stage: str, rollout_id: str, error: BaseException):
+        self.stage = stage
+        self.rollout_id = rollout_id
+        self.original_error = error
+        super().__init__(f"multi-agent rollout failed at stage={stage}: {_short_failure_reason(error)}")
+
+
+def _exception_chain(error: BaseException, *, limit: int = 8) -> list[BaseException]:
+    chain = []
+    seen = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen and len(chain) < limit:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _classify_rollout_failure(error: BaseException) -> str:
+    chain = _exception_chain(error)
+    text = " ".join(f"{item.__class__.__name__}: {item}" for item in chain).lower()
+    statuses = [
+        getattr(getattr(item, "response", None), "status_code", None)
+        for item in chain
+    ]
+    if "min_tokens" in text and ("max_tokens" in text or "maximum context" in text):
+        return "min_tokens_exceeds_remaining_max"
+    if "context length" in text or "context_length" in text or "maximum context" in text:
+        return "context_length_exceeded"
+    if "out of memory" in text or "cuda oom" in text:
+        return "out_of_memory"
+    if any(status is not None and 400 <= int(status) < 500 for status in statuses):
+        return "http_4xx"
+    if any(status is not None and int(status) >= 500 for status in statuses):
+        return "http_5xx"
+    if "timeout" in text or "timed out" in text:
+        return "timeout"
+    if "connection" in text or "connecterror" in text:
+        return "connection_error"
+    if "no available" in text and "server" in text:
+        return "no_available_server"
+    if "ray" in text and ("error" in text or "task" in text):
+        return "ray_error"
+    return "other"
+
+
+def _rollout_failure_diagnostic(error: BaseException) -> dict[str, object]:
+    chain = _exception_chain(error)
+    diagnostic: dict[str, object] = {
+        "failure_stage": getattr(error, "stage", "unknown"),
+        "failure_category": _classify_rollout_failure(error),
+        "exception_type": chain[-1].__class__.__name__,
+        "exception_chain": [
+            {"type": item.__class__.__name__, "message": _short_failure_reason(item)}
+            for item in chain
+        ],
+        "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__))[-2048:],
+    }
+    if getattr(error, "rollout_id", None) is not None:
+        diagnostic["rollout_id"] = str(error.rollout_id)
+    for item in chain:
+        response = getattr(item, "response", None)
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            diagnostic["http_status"] = int(status_code)
+            response_text = getattr(response, "text", None)
+            if response_text:
+                diagnostic["http_response"] = str(response_text)[:2048]
+            break
+    return diagnostic
+
+
 _TQ_NESTED_SEQUENCE_FIELDS = {
     "prompts",
     "responses",
@@ -80,6 +158,15 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "teacher_logprobs",
     "teacher_ids",
 }
+
+_ROLLOUT_FAILURE_REASON_TAG_PREFIX = "rollout_failure_reason__"
+
+
+def _failure_reason_count_tags(counts: dict[str, int] | Counter[str]) -> dict[str, int]:
+    return {
+        f"{_ROLLOUT_FAILURE_REASON_TAG_PREFIX}{reason}": int(count)
+        for reason, count in counts.items()
+    }
 
 
 def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorDict:
@@ -797,6 +884,24 @@ class MultiAgentFramework(AgentFramework):
                 stats["num_failed_uids"],
                 stats["failure_reasons"][:3],
             )
+            if stats["num_failed_rollouts"]:
+                logger.warning(
+                    "MAS_ROLLOUT_BATCH_SUMMARY %s",
+                    json.dumps(
+                        {
+                            "global_steps": global_steps,
+                            "partition_id": partition_id,
+                            "num_input_prompts": stats["num_input_prompts"],
+                            "num_success_rollouts": stats["num_success_rollouts"],
+                            "num_failed_rollouts": stats["num_failed_rollouts"],
+                            "num_success_outputs": stats["num_success_outputs"],
+                            "num_failed_uids": stats["num_failed_uids"],
+                            "num_partial_failed_uids": stats["num_partial_failed_uids"],
+                            "failure_category_counts": stats["failure_category_counts"],
+                        },
+                        sort_keys=True,
+                    ),
+                )
             if stats["num_success_outputs"] == 0:
                 raise RuntimeError(
                     f"All multi-agent rollouts failed at global_steps={global_steps}. "
@@ -926,19 +1031,53 @@ class MultiAgentFramework(AgentFramework):
             "num_failed_rollouts": 0,
             "num_success_outputs": 0,
             "num_failed_uids": 0,
+            "num_partial_failed_uids": 0,
+            "failure_category_counts": Counter(),
             "failure_reasons": failure_reasons,
         }
-        for outcome in outcomes:
+        for sample_index, outcome in enumerate(outcomes):
             if isinstance(outcome, Exception):
                 stats["num_failed_rollouts"] += num_rollouts
                 stats["num_failed_uids"] += 1
                 failure_reasons.append(_short_failure_reason(outcome))
+                diagnostic = _rollout_failure_diagnostic(outcome)
+                stats["failure_category_counts"][diagnostic["failure_category"]] += num_rollouts
+                await tq.async_kv_put(
+                    key=str(sample_fields_by_index[sample_index]["uid"]),
+                    partition_id=partition_id,
+                    tag={
+                        "status": "failure",
+                        "num_requested_rollouts": num_rollouts,
+                        "num_success_rollouts": 0,
+                        "num_failed_rollouts": num_rollouts,
+                        **_failure_reason_count_tags(
+                            {str(diagnostic["failure_category"]): num_rollouts}
+                        ),
+                    },
+                )
+                logger.warning(
+                    "MAS_PROMPT_ROLLOUT_FAILURE %s",
+                    json.dumps(
+                        {
+                            "global_steps": global_steps,
+                            "partition_id": partition_id,
+                            "sample_index": sample_index,
+                            "uid": str(sample_fields_by_index[sample_index]["uid"]),
+                            "num_requested_rollouts": num_rollouts,
+                            **diagnostic,
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 continue
             stats["num_success_rollouts"] += outcome["num_success_rollouts"]
             stats["num_failed_rollouts"] += outcome["num_failed_rollouts"]
             stats["num_success_outputs"] += outcome["num_success_outputs"]
             stats["num_failed_uids"] += outcome["num_failed_uids"]
+            stats["num_partial_failed_uids"] += outcome["num_partial_failed_uids"]
+            stats["failure_category_counts"].update(outcome["failure_category_counts"])
             failure_reasons.extend(outcome["failure_reasons"])
+        stats["failure_category_counts"] = dict(stats["failure_category_counts"])
         return stats
 
     async def _run_prompt_rollouts_to_tq(
@@ -954,10 +1093,14 @@ class MultiAgentFramework(AgentFramework):
     ) -> dict:
         uid = str(sample_fields["uid"])
 
+        rollout_specs = [
+            (sample_idx, f"multi-agent-rollout-{sample_index}-{sample_idx}-{uuid4().hex}")
+            for sample_idx in range(num_rollouts)
+        ]
         tasks = [
             self._run_rollout_with_concurrency_limit(
                 raw_prompt=raw_prompt,
-                rollout_id=f"multi-agent-rollout-{sample_index}-{sample_idx}-{uuid4().hex}",
+                rollout_id=rollout_id,
                 sample_index=sample_index,
                 sample_fields=sample_fields,
                 sample_idx=sample_idx,
@@ -968,7 +1111,7 @@ class MultiAgentFramework(AgentFramework):
                     if key in sample_fields
                 },
             )
-            for sample_idx in range(num_rollouts)
+            for sample_idx, rollout_id in rollout_specs
         ]
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -976,18 +1119,65 @@ class MultiAgentFramework(AgentFramework):
         failed_rollouts = 0
         success_outputs = 0
         failure_reasons: list[str] = []
-        for sample_idx, outcome in enumerate(outcomes):
+        failure_category_counts: Counter[str] = Counter()
+        successful_results = []
+        for (sample_idx, rollout_id), outcome in zip(rollout_specs, outcomes, strict=True):
             if isinstance(outcome, Exception):
                 failed_rollouts += 1
                 failure_reasons.append(_short_failure_reason(outcome))
+                diagnostic = _rollout_failure_diagnostic(outcome)
+                failure_category_counts[diagnostic["failure_category"]] += 1
+                logger.warning(
+                    "MAS_ROLLOUT_FAILURE %s",
+                    json.dumps(
+                        {
+                            "global_steps": global_steps,
+                            "partition_id": partition_id,
+                            "uid": uid,
+                            "sample_index": sample_index,
+                            "sample_idx": sample_idx,
+                            "rollout_id": rollout_id,
+                            **diagnostic,
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 continue
             rollout_result, trajectories = outcome
             if not trajectories:
                 failed_rollouts += 1
                 failure_reasons.append(f"empty trajectories for uid={uid} sample_idx={sample_idx}")
+                failure_category_counts["empty_trajectories"] += 1
+                logger.warning(
+                    "MAS_ROLLOUT_FAILURE %s",
+                    json.dumps(
+                        {
+                            "global_steps": global_steps,
+                            "partition_id": partition_id,
+                            "uid": uid,
+                            "sample_index": sample_index,
+                            "sample_idx": sample_idx,
+                            "rollout_id": rollout_result.rollout_id,
+                            "failure_stage": "finalize",
+                            "failure_category": "empty_trajectories",
+                            "exception_type": None,
+                            "exception_chain": [],
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 continue
 
             success_rollouts += 1
+            successful_results.append((sample_idx, rollout_result, trajectories))
+
+        prompt_diagnostics = {
+            "num_requested_rollouts": num_rollouts,
+            "num_success_rollouts": success_rollouts,
+            "num_failed_rollouts": failed_rollouts,
+            **_failure_reason_count_tags(failure_category_counts),
+        }
+        for sample_idx, rollout_result, trajectories in successful_results:
             await self._write_multi_agent_rollout_to_tq(
                 uid=uid,
                 sample_idx=sample_idx,
@@ -996,14 +1186,34 @@ class MultiAgentFramework(AgentFramework):
                 sample_fields=sample_fields,
                 global_steps=global_steps,
                 partition_id=partition_id,
+                prompt_diagnostics=prompt_diagnostics,
             )
             success_outputs += len(trajectories)
+
+        if failed_rollouts:
+            logger.warning(
+                "MAS_PROMPT_ROLLOUT_SUMMARY %s",
+                json.dumps(
+                    {
+                        "global_steps": global_steps,
+                        "partition_id": partition_id,
+                        "uid": uid,
+                        "sample_index": sample_index,
+                        **prompt_diagnostics,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
         if success_rollouts > 0:
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
             failed_uids = 0
         else:
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+            await tq.async_kv_put(
+                key=uid,
+                partition_id=partition_id,
+                tag={"status": "failure", **prompt_diagnostics},
+            )
             failed_uids = 1
 
         return {
@@ -1011,6 +1221,8 @@ class MultiAgentFramework(AgentFramework):
             "num_failed_rollouts": failed_rollouts,
             "num_success_outputs": success_outputs,
             "num_failed_uids": failed_uids,
+            "num_partial_failed_uids": int(0 < failed_rollouts < num_rollouts),
+            "failure_category_counts": dict(failure_category_counts),
             "failure_reasons": failure_reasons,
         }
 
@@ -1035,11 +1247,20 @@ class MultiAgentFramework(AgentFramework):
             )
             if not rollout_result.trajectories:
                 return rollout_result, []
-            trajectories = await self._annotate_rollout_trajectories(
-                rollout_result=rollout_result,
-                sample_fields=sample_fields,
-                sample_idx=sample_idx,
-            )
+            try:
+                trajectories = await self._annotate_rollout_trajectories(
+                    rollout_result=rollout_result,
+                    sample_fields=sample_fields,
+                    sample_idx=sample_idx,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise MultiAgentRolloutStageError(
+                    stage="annotate_trajectories",
+                    rollout_id=rollout_id,
+                    error=exc,
+                ) from exc
             return rollout_result, trajectories
 
         if self._max_concurrent_rollouts <= 0:
@@ -1063,6 +1284,7 @@ class MultiAgentFramework(AgentFramework):
         """Run one external MAS rollout and return finalized Gateway trajectories."""
         rollout_id = rollout_id or f"multi-agent-rollout-{sample_index}-{uuid4().hex}"
         rollout = None
+        stage = "create_rollout"
         create_kwargs = {"role_policy_mapping": self.role_policy_mapping}
         if metadata is not None:
             create_kwargs["metadata"] = dict(metadata)
@@ -1076,6 +1298,7 @@ class MultiAgentFramework(AgentFramework):
             # Shield the Gateway RPC so cancellation cannot leave a remotely
             # created rollout without first recovering its manager mapping.
             rollout = await asyncio.shield(create_task)
+            stage = "agent_runner"
             runner_result = await self._execute_multi_agent_runner(
                 raw_prompt=raw_prompt,
                 rollout=rollout,
@@ -1087,12 +1310,15 @@ class MultiAgentFramework(AgentFramework):
             if isinstance(runner_result, dict):
                 reward_info = runner_result.get("reward_info")
             if reward_info is not None:
+                stage = "complete_rollout"
                 await self.session_runtime.complete_multi_agent_rollout(rollout_id, reward_info=reward_info)
             if self.wait_for_completion_after_runner:
+                stage = "wait_for_completion"
                 await self.session_runtime.wait_for_multi_agent_rollout_completion(
                     rollout_id,
                     timeout=self.completion_timeout,
                 )
+            stage = "finalize_rollout"
             return await self.session_runtime.finalize_multi_agent_rollout(rollout_id)
         except asyncio.CancelledError:
             if rollout is None and not create_task.cancelled():
@@ -1105,12 +1331,42 @@ class MultiAgentFramework(AgentFramework):
                         exc_info=True,
                     )
             if rollout is not None:
-                await self.session_runtime.abort_multi_agent_rollout(rollout_id)
+                try:
+                    await self.session_runtime.abort_multi_agent_rollout(rollout_id)
+                except Exception as abort_exc:
+                    logger.warning(
+                        "MAS_ROLLOUT_ABORT_FAILURE %s",
+                        json.dumps(
+                            {
+                                "rollout_id": rollout_id,
+                                "original_failure_stage": "cancelled",
+                                "abort_error_type": abort_exc.__class__.__name__,
+                                "abort_error": _short_failure_reason(abort_exc),
+                            },
+                            sort_keys=True,
+                        ),
+                        exc_info=True,
+                    )
             raise
-        except Exception:
+        except Exception as exc:
             if rollout is not None:
-                await self.session_runtime.abort_multi_agent_rollout(rollout_id)
-            raise
+                try:
+                    await self.session_runtime.abort_multi_agent_rollout(rollout_id)
+                except Exception as abort_exc:
+                    logger.warning(
+                        "MAS_ROLLOUT_ABORT_FAILURE %s",
+                        json.dumps(
+                            {
+                                "rollout_id": rollout_id,
+                                "original_failure_stage": stage,
+                                "abort_error_type": abort_exc.__class__.__name__,
+                                "abort_error": _short_failure_reason(abort_exc),
+                            },
+                            sort_keys=True,
+                        ),
+                        exc_info=True,
+                    )
+            raise MultiAgentRolloutStageError(stage=stage, rollout_id=rollout_id, error=exc) from exc
 
     async def _execute_multi_agent_runner(
         self,
@@ -1302,6 +1558,7 @@ class MultiAgentFramework(AgentFramework):
         sample_fields: dict[str, object],
         global_steps: int,
         partition_id: str,
+        prompt_diagnostics: dict[str, object] | None = None,
     ) -> None:
         keys = []
         fields = []
@@ -1316,6 +1573,8 @@ class MultiAgentFramework(AgentFramework):
                 uid=uid,
                 global_steps=global_steps,
             )
+            if prompt_diagnostics:
+                tag.update(prompt_diagnostics)
             keys.append(f"{uid}_{sample_idx}_{record_idx}")
             fields.append(field)
             tags.append(tag)

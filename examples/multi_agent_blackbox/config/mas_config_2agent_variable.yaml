@@ -14,21 +14,16 @@ harness:
   output_tokens_min: 8192
   output_tokens_max: 10240
   output_tokens_step: 512
-  minimum_completion_ratio: 0.90
+  # Retain a long-output floor while leaving enough resume headroom after an
+  # abort. Per-turn min_tokens is now approximately 5734..7168.
+  minimum_completion_ratio: 0.70
 
 agents:
   agent_1:
-    # A borrow/return transaction can keep a replica unavailable for 8-17s.
-    # Eight bounded retries cover the whole migration window without dropping
-    # the trajectory that happened to be routed to the draining replica.
-    request_max_retries: 8
-    request_retry_backoff_seconds: 1.0
     system_prompt: >-
       Analyze the task carefully, improve the current solution, preserve all
       information needed by the next agent, and provide a clear candidate answer.
   agent_2:
-    request_max_retries: 8
-    request_retry_backoff_seconds: 1.0
     system_prompt: >-
       Analyze the task carefully, check and improve the previous work, preserve
       all information needed by the next agent, and provide a clear candidate answer.

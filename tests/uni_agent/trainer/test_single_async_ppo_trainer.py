@@ -1,9 +1,12 @@
 import importlib.util
 import sys
 import types
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 def _load_single_async_module(monkeypatch):
@@ -11,7 +14,7 @@ def _load_single_async_module(monkeypatch):
         pass
 
     class FakePPOTrainerSeparateAsync(FakePPOTrainer):
-        pass
+        _enable_hybrid_replicas = True
 
     class FakeHybridEngineMode(Enum):
         TRAINER = "trainer"
@@ -76,7 +79,8 @@ def test_init_training_runtime_stops_before_separate_async_standalone_setup(monk
     assert events == ["base_setup", "separate_async_resource_pool"]
 
 
-def test_init_standalone_rollout_runtime_builds_native_v1_components(monkeypatch):
+@pytest.mark.parametrize("hybrid_enabled", [True, False])
+def test_init_standalone_rollout_runtime_builds_native_v1_components(monkeypatch, hybrid_enabled):
     trainer_module, _ = _load_single_async_module(monkeypatch)
 
     events = []
@@ -97,6 +101,7 @@ def test_init_standalone_rollout_runtime_builds_native_v1_components(monkeypatch
     monkeypatch.setattr(trainer_module, "omega_conf_to_dataclass", lambda config: f"resolved:{config}")
 
     trainer = object.__new__(trainer_module.SingleAsyncPPOTrainer)
+    trainer._enable_hybrid_replicas = hybrid_enabled
     trainer.config = SimpleNamespace(
         actor_rollout_ref=SimpleNamespace(
             rollout=SimpleNamespace(checkpoint_engine="checkpoint_config")
@@ -110,7 +115,10 @@ def test_init_standalone_rollout_runtime_builds_native_v1_components(monkeypatch
 
     assert trainer.standalone_server_manager is standalone_manager
     assert isinstance(trainer.standalone_checkpoint_manager, FakeCheckpointEngineManager)
-    assert trainer.current_mode is trainer_module.HybridEngineMode.ROLLOUT
+    expected_mode = (
+        trainer_module.HybridEngineMode.ROLLOUT if hybrid_enabled else trainer_module.HybridEngineMode.TRAINER
+    )
+    assert trainer.current_mode is expected_mode
     assert events == [
         ("create_standalone", trainer.config, 2),
         (
@@ -119,11 +127,88 @@ def test_init_standalone_rollout_runtime_builds_native_v1_components(monkeypatch
             "actor_wg",
             ["standalone_replica"],
         ),
-        "add_replicas_to_balancer",
-    ]
+    ] + (["add_replicas_to_balancer"] if hybrid_enabled else [])
 
 
 def test_single_async_trainer_has_no_monolithic_init_runtime(monkeypatch):
     trainer_module, _ = _load_single_async_module(monkeypatch)
 
     assert not hasattr(trainer_module.SingleAsyncPPOTrainer, "init_runtime")
+
+
+def test_outer_sample_end_switches_hybrid_without_standalone_sample_timers(monkeypatch):
+    trainer_module, _ = _load_single_async_module(monkeypatch)
+    trainer = object.__new__(trainer_module.SingleAsyncPPOTrainer)
+    trainer.current_mode = trainer_module.HybridEngineMode.ROLLOUT
+    events = []
+
+    def standalone_sample_end(self):
+        # New verl expects timers from its own step loop, which this adapter
+        # deliberately does not run.
+        self._step_sample_wait_seconds += 1
+
+    def switch_to_trainer(self):
+        events.extend(["remove_hybrid_routing", "abort_hybrid", "sleep_hybrid"])
+        self.current_mode = trainer_module.HybridEngineMode.TRAINER
+
+    monkeypatch.setattr(
+        trainer_module.PPOTrainerSeparateAsync, "on_sample_end", standalone_sample_end, raising=False
+    )
+    monkeypatch.setattr(
+        trainer_module.PPOTrainerSeparateAsync, "switch_to_trainer", switch_to_trainer, raising=False
+    )
+
+    trainer.on_sample_end()
+    trainer.on_sample_end()
+
+    assert trainer.current_mode is trainer_module.HybridEngineMode.TRAINER
+    assert events == ["remove_hybrid_routing", "abort_hybrid", "sleep_hybrid"]
+
+
+def test_get_llm_client_uses_abort_safe_adapter(monkeypatch):
+    trainer_module, _ = _load_single_async_module(monkeypatch)
+
+    adapter_module = types.ModuleType("uni_agent.trainer.resumable_llm_client")
+    adapter_cls = type("ResumableFullyAsyncLLMServerClient", (), {})
+    adapter_module.ResumableFullyAsyncLLMServerClient = adapter_cls
+    monkeypatch.setitem(sys.modules, "uni_agent.trainer.resumable_llm_client", adapter_module)
+
+    captured = {}
+    trainer = object.__new__(trainer_module.SingleAsyncPPOTrainer)
+    trainer.standalone_server_manager = SimpleNamespace(
+        get_client=lambda *, client_cls: captured.setdefault("client_cls", client_cls) or "client"
+    )
+
+    trainer.get_llm_client()
+
+    assert captured["client_cls"] is adapter_cls
+
+
+def test_outer_step_end_publishes_without_standalone_fit_state(monkeypatch):
+    trainer_module, _ = _load_single_async_module(monkeypatch)
+    trainer = object.__new__(trainer_module.SingleAsyncPPOTrainer)
+    trainer.global_steps = 2
+    trainer.timing_raw = {}
+    published = []
+
+    @contextmanager
+    def marked_timer(name, timing_raw, **kwargs):
+        yield
+        timing_raw[name] = 1.25
+
+    debug = types.ModuleType("verl.utils.debug")
+    debug.marked_timer = marked_timer
+    monkeypatch.setitem(sys.modules, "verl.utils.debug", debug)
+
+    def update_weights(step):
+        published.append(step)
+        return {"checkpoint_sync/seconds": 1.0}
+
+    trainer.standalone_checkpoint_manager = SimpleNamespace(update_weights=update_weights)
+    # No prev_step_profile, per-step timers, replay buffer, or adaptive-switch
+    # state exists when MultiAgentsPPOTrainer owns the loop.
+    trainer.on_step_end()
+
+    assert published == [2]
+    assert trainer.timing_raw == {"update_weights": 1.25}
+    assert trainer._pending_sync_metrics == {"checkpoint_sync/seconds": 1.0}

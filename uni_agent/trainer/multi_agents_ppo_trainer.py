@@ -4,7 +4,7 @@ import logging
 import os
 from uuid import uuid4
 import posixpath
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor, wait
 from functools import lru_cache
@@ -1015,6 +1015,36 @@ class MultiAgentsPPOTrainer:
         metrics["training/mas_rollout_count"] = len(rollout_ids)
         for policy_name, mask in policy_masks.items():
             metrics[f"{policy_name}/trajectory_count"] = int(mask.sum())
+
+        # One prompt can have n MAS samples, and the prompt remains consumable
+        # when only some samples fail.  Framework tags carry the prompt-level
+        # result on every successful trajectory; de-duplicate by uid here so a
+        # two-agent trajectory does not double-count its rollout failures.
+        prompt_rollout_diagnostics: dict[str, dict[str, Any]] = {}
+        for tag, keep in zip(batch.tags, non_padding_mask, strict=True):
+            if not keep or "num_requested_rollouts" not in tag:
+                continue
+            prompt_rollout_diagnostics.setdefault(str(tag.get("uid", "")), tag)
+        if prompt_rollout_diagnostics:
+            requested = sum(int(tag.get("num_requested_rollouts", 0)) for tag in prompt_rollout_diagnostics.values())
+            succeeded = sum(int(tag.get("num_success_rollouts", 0)) for tag in prompt_rollout_diagnostics.values())
+            failed = sum(int(tag.get("num_failed_rollouts", 0)) for tag in prompt_rollout_diagnostics.values())
+            partial_prompts = sum(
+                0 < int(tag.get("num_failed_rollouts", 0)) < int(tag.get("num_requested_rollouts", 0))
+                for tag in prompt_rollout_diagnostics.values()
+            )
+            metrics["training/rollout_failure/requested_rollouts"] = requested
+            metrics["training/rollout_failure/successful_rollouts"] = succeeded
+            metrics["training/rollout_failure/failed_rollouts"] = failed
+            metrics["training/rollout_failure/partial_failed_prompts"] = partial_prompts
+            metrics["training/rollout_failure/failed_rollout_ratio"] = failed / requested if requested else 0.0
+            reason_counts: Counter[str] = Counter()
+            for tag in prompt_rollout_diagnostics.values():
+                for key, value in tag.items():
+                    if key.startswith("rollout_failure_reason__"):
+                        reason_counts[key.removeprefix("rollout_failure_reason__")] += int(value)
+            for reason, count in reason_counts.items():
+                metrics[f"training/rollout_failure/reason/{reason}"] = int(count)
 
         if all(
             tag.get("is_padding", False)

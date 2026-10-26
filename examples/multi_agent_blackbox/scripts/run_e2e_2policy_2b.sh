@@ -5,12 +5,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-# The container injects /opt/tiger/bi_verl ahead of site-packages, but that
-# checkout is newer than the v1 trainer API used by this repository.  Pin the
-# same verl tree as the established experiments.
-VERL_SOURCE_ROOT="${VERL_SOURCE_ROOT:-/mnt/bn/chenghao1026/zzh/zzh_0813/verl}"
-export PYTHONPATH="${REPO_ROOT}:${VERL_SOURCE_ROOT}"
 export PYTHON="${PYTHON:-/mnt/bn/chenghao1026/resouces/libs/zzh_env/bin/python3}"
+
+# Load verl from the selected Python environment's site-packages. Keep only
+# this repository on PYTHONPATH so injected system paths cannot shadow it.
+export PYTHONPATH="${REPO_ROOT}"
 
 # The default fixture has only eight rows. Generate enough distinct indices for
 # warmup plus eight 128-prompt steps without depending on dataloader cycling.

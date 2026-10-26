@@ -23,7 +23,11 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: 16
-        max_concurrent_rollouts: 512
+        # Keep the per-step sample volume (train_batch_size=128, rollout.n=4)
+        # while dispatching it in smaller waves. retry1 saturated individual
+        # replicas (KV p90 98-99%, max 100%) and caused heavy preemption even
+        # though fleet-wide mean KV usage was moderate.
+        max_concurrent_rollouts: 288
         completion_timeout_seconds: 10800
         multi_agent_runner_fqn: examples.multi_agent_blackbox.random_routing_harness.random_routing_agent_runner
         multi_agent_runner_kwargs:
@@ -190,8 +194,9 @@ dynamic_inference_scheduling:
     guest_init_retry_jitter_s: 2.0
     pairs:
     # `home` lends physical rollout replicas; `donor` receives guest replicas.
-    # Allow up to four atomic replica units in either direction. Runtime
-    # safety checks still retain a home seed and enforce kv_post_lend_max.
+    # Cap each receiver at half of its configured inference allocation:
+    # policy_2 may borrow up to 4 replicas and policy_1 up to 6. Runtime safety
+    # checks still retain a home seed and enforce kv_post_lend_max.
     - home: policy_1
       donor: policy_2
       home_replicas_per_unit: 1
@@ -201,4 +206,4 @@ dynamic_inference_scheduling:
       donor: policy_1
       home_replicas_per_unit: 1
       guest_replicas_per_unit: 1
-      max_units: 4
+      max_units: 6

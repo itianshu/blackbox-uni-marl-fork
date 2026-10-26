@@ -12,6 +12,24 @@ import pytest
 PATCH_PATH = Path("examples/multi_agent_blackbox/verl_patch.py")
 
 
+@pytest.mark.parametrize("mode", ["colocated", "standalone"])
+def test_replica_initializers_forward_resource_pool(monkeypatch, mode):
+    loaded = _load_patch_module(monkeypatch)
+    replica = types.SimpleNamespace(config=None, name_suffix="")
+    pool = object()
+    calls = []
+
+    def original(self, resource_pool):
+        calls.append((self, resource_pool))
+        return "ready"
+
+    monkeypatch.setattr(loaded.module, "_ORIG_REPLICA_INIT_" + mode.upper(), original)
+    wrapper = getattr(loaded.module, "_patched_replica_init_" + mode)
+    assert wrapper(replica, resource_pool=pool) == "ready"
+    assert wrapper(replica, pool) == "ready"
+    assert calls == [(replica, pool), (replica, pool)]
+
+
 class AttrDict(dict):
     __getattr__ = dict.__getitem__
 
@@ -68,13 +86,32 @@ def _load_patch_module(monkeypatch, *, install_vllm_targets: bool = True):
         def _init_reward_loop_workers(self):
             return None
 
-    class FakeVLLMReplica:
+    class FakeRolloutReplica:
+        async def init_colocated(self, resource_pool):
+            self.resource_pool = resource_pool
+
+        async def init_standalone(self, resource_pool=None):
+            self.resource_pool = resource_pool
+
+    class FakeVLLMReplica(FakeRolloutReplica):
         def _get_server_name_prefix(self):
             return "original_creator_"
+
+        async def launch_servers(self):
+            return None
 
     class FakeServerAdapter:
         def _get_server_name_prefix(self):
             return "original_lookup_"
+
+        async def update_weights(self, weights, global_steps=None, **kwargs):
+            return None
+
+    class FakeVLLMHttpServer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    _install_module(monkeypatch, "verl.workers.rollout.replica", RolloutReplica=FakeRolloutReplica)
 
     _install_module(
         monkeypatch,
@@ -97,6 +134,7 @@ def _load_patch_module(monkeypatch, *, install_vllm_targets: bool = True):
             monkeypatch,
             "verl.workers.rollout.vllm_rollout.vllm_async_server",
             vLLMReplica=FakeVLLMReplica,
+            vLLMHttpServer=FakeVLLMHttpServer,
         )
         _install_module(
             monkeypatch,
@@ -151,13 +189,25 @@ def test_worker_patch_is_idempotent_and_restorable(monkeypatch):
     assert loaded.module._WORKER_PATCHED is False
 
 
-def test_worker_patch_import_failure_leaves_unpatched_state(monkeypatch):
+def test_worker_patch_defers_import_until_worker_loads_target(monkeypatch):
     loaded = _load_patch_module(monkeypatch, install_vllm_targets=False)
+    import threading
 
-    with pytest.raises(ModuleNotFoundError):
-        loaded.module.apply_worker_patch()
+    started = []
 
-    assert loaded.module._WORKER_PATCHED is False
+    class DeferredThread:
+        def __init__(self, **kwargs):
+            self.target = kwargs["target"]
+
+        def start(self):
+            started.append(self.target)
+
+    monkeypatch.setattr(threading, "Thread", DeferredThread)
+    loaded.module.apply_worker_patch()
+
+    assert len(started) == 1
+    assert loaded.module._WORKER_PATCHED is True
+    assert loaded.module._LOOKUP_PATCHED is False
     assert loaded.module._ORIG_SERVER_ADAPTER_NAME_PREFIX is None
 
 
